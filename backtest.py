@@ -1,15 +1,17 @@
 """
 ================================================================================
-BACKTEST.PY - v6.1 ADX-DI Confluence Scalper (15m), 30-coin universe
+BACKTEST.PY - v6.2 ADX-EMA Scalper (Fill-Price Fixed), 15m, 30-coin universe
 ================================================================================
 Pure Python 3.11 stdlib only. No numpy/pandas/requests.
 Data source: https://data-api.binance.vision/api/v3/klines (public, spot proxy)
 
-All 30 core coins share ONE portfolio balance (as in the live bot - no hard cap
-on concurrent positions). Symbols are scanned in a fixed order at every 15m
-tick, exactly mirroring the pseudocode's sequential for-loop, so position
-sizing on each new entry reflects whatever the running balance is at that
-moment (including PnL from other symbols closed earlier that same tick).
+KEY FIX vs v6.1: signal fires on candle CLOSE, but the trade FILLS at the NEXT
+candle's OPEN + per-coin slippage. TP/SL are computed from fill_price, not the
+signal candle's close. TP = fixed 5% ROI on margin (price move = 5%/leverage).
+SL = 2x ATR14 (from the signal candle) measured from fill_price.
+
+All 30 core coins share ONE portfolio balance, scanned in a fixed order each
+15m tick (same event-driven design as v6.1).
 
 Outputs: backtest_report.json (full data), backtest_summary.txt (human readable)
 ================================================================================
@@ -25,10 +27,8 @@ import datetime
 from collections import defaultdict
 
 # ================================================================================
-# 1. ASSET UNIVERSE  (spec name -> actual spot symbol to fetch)
+# 1. ASSET UNIVERSE (spec name -> actual spot symbol to fetch)
 # ================================================================================
-# 1000-prefixed futures notation has no spot equivalent; spot lists the base
-# token directly. Established project rule: strip the 1000 prefix for spot data.
 SYMBOL_MAP = {
     "1000BONKUSDT": "BONKUSDT",
     "1000PEPEUSDT": "PEPEUSDT",
@@ -44,16 +44,25 @@ CORE_COINS_SPEC = [
     "HBARUSDT", "TRUMPUSDT", "BOMEUSDT", "WLDUSDT", "NEIROUSDT",
 ]
 
-# ordered list of (spec_name, fetch_symbol) - scan order matches spec order
 SYMBOLS = [(s, SYMBOL_MAP.get(s, s)) for s in CORE_COINS_SPEC]
+
+# per-coin slippage tier (Section 4 of spec)
+MEME_TIER = {"BONKUSDT", "PEPEUSDT", "SHIBUSDT", "FLOKIUSDT", "WIFUSDT", "BOMEUSDT", "NEIROUSDT"}
+BTC_ETH_TIER = {"BTCUSDT", "ETHUSDT"}
+
+def slippage_for(fetch_sym):
+    if fetch_sym in BTC_ETH_TIER:
+        return 0.0001   # 0.01%
+    if fetch_sym in MEME_TIER:
+        return 0.0005   # 0.05%
+    return 0.0002       # 0.02% - major alts (default tier)
 
 # ================================================================================
 # 2. CONFIG
 # ================================================================================
-FEE_TAKER = 0.0005      # 0.05% - ALL orders are MARKET type per spec (entry/TP/SL)
-SLIPPAGE = 0.0002       # 0.02% per side, per spec notes section 12
-INITIAL_CAP = 10000.0   # project-standard default (keeps results comparable to prior rounds)
-COOLDOWN_MS = 5 * 60 * 1000   # 5 minutes, per-symbol
+FEE_TAKER = 0.0005      # 0.05% per side, all orders MARKET
+INITIAL_CAP = 10000.0
+COOLDOWN_MS = 5 * 60 * 1000
 
 INTERVAL = "15m"
 INTERVAL_MS = 15 * 60 * 1000
@@ -61,22 +70,13 @@ BASE_URL = "https://data-api.binance.vision/api/v3/klines"
 MAX_RETRIES = 5
 
 YEARS_BACK = 2
-WARMUP_BARS = 400  # extra candles before official window for EMA50/ADX/RSI convergence
+WARMUP_BARS = 400
 
 ADX_MIN = 22
-SLOPE_LOOKBACK = 20
-SLOPE_THRESHOLD = 0.15
-RSI_LONG_MIN = 52
-RSI_SHORT_MAX = 48
-ATR_PCT_MIN = 0.08
-
-def get_atr_multipliers(adx_val):
-    if adx_val > 30:
-        return 4.0, 2.0
-    elif adx_val > 25:
-        return 3.0, 1.8
-    else:  # 22 <= adx <= 25 (also covers the 25<adx<=30... handled above)
-        return 2.5, 1.6
+SLOPE_LOOKBACK = 10
+SLOPE_THRESHOLD = 0.05
+SL_ATR_MULT = 2.0
+TP_ROI = 0.05  # 5% ROI on margin
 
 def get_leverage_and_pct(balance):
     if balance < 10:
@@ -157,33 +157,6 @@ def ema(values, period):
     return out
 
 
-def sma(values, period):
-    out = [None] * len(values)
-    for i in range(period - 1, len(values)):
-        out[i] = sum(values[i - period + 1:i + 1]) / period
-    return out
-
-
-def rsi(closes, period=14):
-    out = [None] * len(closes)
-    if len(closes) < period + 1:
-        return out
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    out[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        out_idx = i + 1
-        out[out_idx] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
-    return out
-
-
 def atr(highs, lows, closes, period=14):
     n = len(closes)
     out = [None] * n
@@ -213,7 +186,6 @@ def first_valid_index(lst):
 
 
 def wilder_sum_smooth(raw, period):
-    """Wilder's running-SUM smoothing (used for TR, +DM, -DM)."""
     n = len(raw)
     out = [None] * n
     fi = first_valid_index(raw)
@@ -229,7 +201,6 @@ def wilder_sum_smooth(raw, period):
 
 
 def wilder_avg_smooth(raw, period):
-    """Wilder's running-AVERAGE smoothing (used for ADX itself)."""
     n = len(raw)
     out = [None] * n
     fi = first_valid_index(raw)
@@ -260,27 +231,22 @@ def adx_dmi(highs, lows, closes, period=14):
     sm_pdm = wilder_sum_smooth(plus_dm, period)
     sm_mdm = wilder_sum_smooth(minus_dm, period)
 
-    pdi = [None] * n
-    mdi = [None] * n
     dx = [None] * n
     for i in range(n):
         if sm_tr[i] is not None and sm_tr[i] > 0:
-            pdi[i] = 100.0 * sm_pdm[i] / sm_tr[i]
-            mdi[i] = 100.0 * sm_mdm[i] / sm_tr[i]
-            s = pdi[i] + mdi[i]
-            dx[i] = 100.0 * abs(pdi[i] - mdi[i]) / s if s > 0 else 0.0
+            pdi = 100.0 * sm_pdm[i] / sm_tr[i]
+            mdi = 100.0 * sm_mdm[i] / sm_tr[i]
+            s = pdi + mdi
+            dx[i] = 100.0 * abs(pdi - mdi) / s if s > 0 else 0.0
 
     adx = wilder_avg_smooth(dx, period)
-    return adx, pdi, mdi
+    return adx
 
 
 # ================================================================================
-# 5. TIME-GRID ALIGNMENT (for the shared multi-symbol simulation)
+# 5. TIME-GRID ALIGNMENT
 # ================================================================================
 def align_to_grid(times, series_dict, grid_index):
-    """Map each series (keyed by name -> list aligned to native `times`) onto
-    the global grid_index (dict: timestamp -> global slot). Returns dict of
-    name -> list[None]*grid_len with values placed at matching slots."""
     grid_len = len(grid_index)
     out = {name: [None] * grid_len for name in series_dict}
     for local_i, t in enumerate(times):
@@ -304,13 +270,11 @@ def main():
     fetch_start_ms = official_start_ms - WARMUP_BARS * INTERVAL_MS
 
     print("=" * 80)
-    print("BACKTEST START - ADX-DI Confluence Scalper v6.1 (15m, 30-coin shared portfolio)")
+    print("BACKTEST START - v6.2 ADX-EMA Scalper (Fill-Price Fixed), 15m, 30 coins")
     print(f"Window: {start_dt.isoformat()} -> {end_dt.isoformat()} UTC")
-    print(f"Symbols ({len(SYMBOLS)}): {[s[1] for s in SYMBOLS]}")
     print("=" * 80)
 
-    # ---- 6.1 fetch + compute indicators per symbol ----
-    per_symbol = {}  # spec_name -> dict of aligned arrays + raw meta
+    per_symbol = {}
     global_time_set = set()
 
     for spec_name, fetch_sym in SYMBOLS:
@@ -326,29 +290,18 @@ def main():
         ema9 = ema(closes, 9)
         ema21 = ema(closes, 21)
         ema50 = ema(closes, 50)
-        rsi14 = rsi(closes, 14)
         atr14 = atr(highs, lows, closes, 14)
-        vol_sma20 = sma(volumes, 20)
-        adx14, pdi14, mdi14 = adx_dmi(highs, lows, closes, 14)
+        adx14 = adx_dmi(highs, lows, closes, 14)
 
         per_symbol[spec_name] = {
-            "fetch_sym": fetch_sym,
-            "times": times,
-            "closes": closes,
-            "highs": highs,
-            "lows": lows,
-            "volumes": volumes,
-            "ema9": ema9,
-            "ema21": ema21,
-            "ema50": ema50,
-            "rsi": rsi14,
-            "atr": atr14,
-            "vol_sma": vol_sma20,
-            "adx": adx14,
-            "pdi": pdi14,
-            "mdi": mdi14,
+            "fetch_sym": fetch_sym, "times": times, "opens": opens, "closes": closes,
+            "highs": highs, "lows": lows, "volumes": volumes,
+            "ema9": ema9, "ema21": ema21, "ema50": ema50, "atr": atr14, "adx": adx14,
+            "slippage": slippage_for(fetch_sym),
         }
-        global_time_set.update(t for t in times if t >= official_start_ms)
+        global_time_set.update(t for t in times if t >= official_start_ms - INTERVAL_MS)
+        # include one tick before official start so slot i+1 (fill candle) can
+        # land exactly on the official start boundary for signals right at the edge
 
     valid_symbols = [s for s in CORE_COINS_SPEC if per_symbol.get(s) is not None]
     if not valid_symbols:
@@ -358,30 +311,27 @@ def main():
     global_times = sorted(global_time_set)
     grid_index = {t: i for i, t in enumerate(global_times)}
     grid_len = len(global_times)
-    print(f"\nGlobal 15m grid: {grid_len} ticks from official window across {len(valid_symbols)} usable symbols")
+    print(f"\nGlobal 15m grid: {grid_len} ticks across {len(valid_symbols)} usable symbols")
 
-    # ---- 6.2 align each symbol's arrays onto the global grid ----
     for spec_name in valid_symbols:
         d = per_symbol[spec_name]
         aligned = align_to_grid(d["times"], {
-            "close": d["closes"], "high": d["highs"], "low": d["lows"], "volume": d["volumes"],
-            "ema9": d["ema9"], "ema21": d["ema21"], "ema50": d["ema50"], "rsi": d["rsi"],
-            "atr": d["atr"], "vol_sma": d["vol_sma"], "adx": d["adx"], "pdi": d["pdi"], "mdi": d["mdi"],
+            "open": d["opens"], "close": d["closes"], "high": d["highs"], "low": d["lows"],
+            "ema9": d["ema9"], "ema21": d["ema21"], "ema50": d["ema50"], "atr": d["atr"], "adx": d["adx"],
         }, grid_index)
         d["grid"] = aligned
 
-    # ---- 6.3 event-driven simulation ----
     balance = INITIAL_CAP
     positions = {s: None for s in valid_symbols}
     cooldown_until = {s: -1 for s in valid_symbols}
     trades = []
     filter_counts = defaultdict(int)
-    scans = defaultdict(int)
+    fill_drifts = []
 
     for slot in range(grid_len):
         t = global_times[slot]
 
-        # ---- Step A: manage exits first (all symbols) ----
+        # ---- Step A: exits ----
         for spec_name in valid_symbols:
             pos = positions[spec_name]
             if pos is None:
@@ -391,20 +341,28 @@ def main():
             if h is None or l is None:
                 continue
 
-            exit_price = None
             hit_tp = False
+            hit_sl = False
             if pos["dir"] == "long":
-                if l <= pos["sl"]:
-                    exit_price = pos["sl"] * (1 - SLIPPAGE)
-                elif h >= pos["tp"]:
-                    exit_price = pos["tp"] * (1 - SLIPPAGE)
-                    hit_tp = True
+                hit_tp = h >= pos["tp"]
+                hit_sl = l <= pos["sl"]
             else:
-                if h >= pos["sl"]:
-                    exit_price = pos["sl"] * (1 + SLIPPAGE)
-                elif l <= pos["tp"]:
-                    exit_price = pos["tp"] * (1 + SLIPPAGE)
-                    hit_tp = True
+                hit_tp = l <= pos["tp"]
+                hit_sl = h >= pos["sl"]
+
+            if hit_tp and hit_sl:
+                # both hit same candle -> per spec, count as LOSS at SL price
+                exit_price = pos["sl"]
+                is_win = False
+            elif hit_sl:
+                exit_price = pos["sl"]
+                is_win = False
+            elif hit_tp:
+                exit_price = pos["tp"]
+                is_win = True
+            else:
+                exit_price = None
+                is_win = None
 
             if exit_price is not None:
                 size = pos["size"]
@@ -415,16 +373,19 @@ def main():
                 exit_fee = size * exit_price * FEE_TAKER
                 net_pnl = raw_pnl - exit_fee - pos["entry_fee"]
                 balance += net_pnl
+                margin_used = (size * pos["entry"]) / pos["leverage"]
                 trades.append({
                     "symbol": spec_name, "dir": pos["dir"], "entry": pos["entry"],
                     "exit": exit_price, "entry_t": pos["entry_t"], "exit_t": t,
-                    "pnl": net_pnl, "win": net_pnl > 0, "hit_tp": hit_tp,
+                    "pnl": net_pnl, "win": net_pnl > 0, "hit_tp": is_win,
                     "dur": (t - pos["entry_t"]) / 60000.0,
+                    "margin_used": margin_used,
+                    "margin_pct": (net_pnl / margin_used * 100.0) if margin_used > 0 else 0.0,
                 })
                 positions[spec_name] = None
                 cooldown_until[spec_name] = t + COOLDOWN_MS
 
-        # ---- Step B: look for new entries (fixed scan order) ----
+        # ---- Step B: signal detection (fires on THIS candle's close, fills NEXT candle) ----
         for spec_name in valid_symbols:
             if positions[spec_name] is not None:
                 continue
@@ -434,42 +395,24 @@ def main():
             close = g["close"][slot]
             if close is None:
                 continue
+            if slot < SLOPE_LOOKBACK or slot + 1 >= grid_len:
+                continue
 
             adx_v = g["adx"][slot]
-            pdi_v = g["pdi"][slot]
-            mdi_v = g["mdi"][slot]
-            rsi_v = g["rsi"][slot]
             atr_v = g["atr"][slot]
-            vol_v = g["volume"][slot]
-            vsma_v = g["vol_sma"][slot]
             ema9_v = g["ema9"][slot]
             ema21_v = g["ema21"][slot]
             ema50_v = g["ema50"][slot]
-
-            if slot < SLOPE_LOOKBACK:
-                continue
             ema9_p = g["ema9"][slot - 1]
             ema21_p = g["ema21"][slot - 1]
             ema50_lb = g["ema50"][slot - SLOPE_LOOKBACK]
 
-            required = [adx_v, pdi_v, mdi_v, rsi_v, atr_v, vol_v, vsma_v, ema9_v, ema21_v,
-                        ema50_v, ema9_p, ema21_p, ema50_lb]
+            required = [adx_v, atr_v, ema9_v, ema21_v, ema50_v, ema9_p, ema21_p, ema50_lb]
             if any(v is None for v in required):
                 continue
 
-            scans[spec_name] += 1
-
             if adx_v < ADX_MIN:
                 filter_counts["ADX_LOW"] += 1
-                continue
-
-            atr_pct = atr_v / close * 100.0
-            if atr_pct < ATR_PCT_MIN:
-                filter_counts["LOW_ATR"] += 1
-                continue
-
-            if vol_v <= vsma_v:
-                filter_counts["LOW_VOL"] += 1
                 continue
 
             slope_pct = (ema50_v - ema50_lb) / ema50_lb * 100.0 if ema50_lb != 0 else 0.0
@@ -481,26 +424,20 @@ def main():
                 if not bullish_cross:
                     filter_counts["WAIT_UP"] += 1
                     continue
-                if not (pdi_v > mdi_v):
-                    filter_counts["DI_MISALIGN_LONG"] += 1
-                    continue
-                if not (rsi_v > RSI_LONG_MIN):
-                    filter_counts["RSI_LOW"] += 1
-                    continue
                 direction = "long"
             elif slope_pct < -SLOPE_THRESHOLD:
                 if not bearish_cross:
                     filter_counts["WAIT_DOWN"] += 1
                     continue
-                if not (mdi_v > pdi_v):
-                    filter_counts["DI_MISALIGN_SHORT"] += 1
-                    continue
-                if not (rsi_v < RSI_SHORT_MAX):
-                    filter_counts["RSI_HIGH"] += 1
-                    continue
                 direction = "short"
             else:
                 filter_counts["NO_TREND"] += 1
+                continue
+
+            # ---- fill on NEXT candle's open ----
+            next_open = g["open"][slot + 1]
+            if next_open is None:
+                filter_counts["NO_NEXT_CANDLE_SKIP"] += 1
                 continue
 
             filter_counts["SIGNALS_GENERATED"] += 1
@@ -510,42 +447,50 @@ def main():
                 continue
             leverage, pct = get_leverage_and_pct(balance)
 
-            entry_raw = close
-            entry_price = entry_raw * (1 + SLIPPAGE) if direction == "long" else entry_raw * (1 - SLIPPAGE)
-            raw_qty = (balance * pct * leverage) / entry_price
+            slip = per_symbol[spec_name]["slippage"]
+            fill_price = next_open * (1 + slip) if direction == "long" else next_open * (1 - slip)
+
+            signal_price = close
+            fill_drifts.append(abs(fill_price - signal_price) / signal_price * 100.0)
+
+            raw_qty = (balance * pct * leverage) / fill_price
             if raw_qty <= 0:
                 filter_counts["ZERO_QTY_SKIP"] += 1
                 continue
 
-            tp_mult, sl_mult = get_atr_multipliers(adx_v)
             if direction == "long":
-                sl = entry_price - atr_v * sl_mult
-                tp = entry_price + atr_v * tp_mult
+                tp = fill_price * (1 + TP_ROI / leverage)
+                sl = fill_price - (SL_ATR_MULT * atr_v)
             else:
-                sl = entry_price + atr_v * sl_mult
-                tp = entry_price - atr_v * tp_mult
+                tp = fill_price * (1 - TP_ROI / leverage)
+                sl = fill_price + (SL_ATR_MULT * atr_v)
 
-            entry_fee = raw_qty * entry_price * FEE_TAKER
+            entry_fee = raw_qty * fill_price * FEE_TAKER
+            fill_t = global_times[slot + 1]
 
             positions[spec_name] = {
-                "dir": direction, "entry": entry_price, "sl": sl, "tp": tp,
-                "entry_t": t, "size": raw_qty, "entry_fee": entry_fee,
+                "dir": direction, "entry": fill_price, "sl": sl, "tp": tp,
+                "entry_t": fill_t, "size": raw_qty, "entry_fee": entry_fee,
                 "leverage": leverage, "pct": pct,
             }
+            cooldown_until[spec_name] = fill_t + COOLDOWN_MS
 
-    # ---- 6.4 metrics ----
+    # ================================================================================
+    # 7. METRICS
+    # ================================================================================
     def compute_metrics(trade_list, label):
         n = len(trade_list)
         if n == 0:
             return {"label": label, "n": 0, "wr": 0.0, "pf": 0.0, "net": 0.0, "net_pct": 0.0,
-                    "mdd": 0.0, "sharpe": 0.0, "aw": 0.0, "al": 0.0, "exp": 0.0, "dur": 0.0,
-                    "nlongs": 0, "nshorts": 0, "lwr": 0.0, "swr": 0.0, "monthly": {},
-                    "maxcw": 0, "maxcl": 0, "gp": 0.0, "gl": 0.0, "trades_per_day": 0.0}
-        wins = [t for t in trade_list if t["win"]]
-        losses = [t for t in trade_list if not t["win"]]
-        gp = sum(t["pnl"] for t in wins)
-        gl = abs(sum(t["pnl"] for t in losses))
-        net = sum(t["pnl"] for t in trade_list)
+                     "mdd": 0.0, "sharpe": 0.0, "aw": 0.0, "al": 0.0, "aw_margin_pct": 0.0,
+                     "al_margin_pct": 0.0, "exp": 0.0, "dur": 0.0, "nlongs": 0, "nshorts": 0,
+                     "lwr": 0.0, "swr": 0.0, "monthly": {}, "maxcw": 0, "maxcl": 0, "gp": 0.0,
+                     "gl": 0.0, "trades_per_day": 0.0}
+        wins = [tr for tr in trade_list if tr["win"]]
+        losses = [tr for tr in trade_list if not tr["win"]]
+        gp = sum(tr["pnl"] for tr in wins)
+        gl = abs(sum(tr["pnl"] for tr in losses))
+        net = sum(tr["pnl"] for tr in trade_list)
         pf = (gp / gl) if gl > 0 else (999.0 if gp > 0 else 0.0)
         wr = 100.0 * len(wins) / n
 
@@ -560,15 +505,17 @@ def main():
 
         aw = (gp / len(wins)) if wins else 0.0
         al = (gl / len(losses)) if losses else 0.0
-        exp = net / n
-        rets = [t["pnl"] / INITIAL_CAP for t in trade_list]
+        aw_m = statistics.mean([tr["margin_pct"] for tr in wins]) if wins else 0.0
+        al_m = statistics.mean([tr["margin_pct"] for tr in losses]) if losses else 0.0
+        expct = net / n
+        rets = [tr["pnl"] / INITIAL_CAP for tr in trade_list]
         sharpe = (statistics.mean(rets) / statistics.pstdev(rets) * math.sqrt(n)) if len(rets) > 1 and statistics.pstdev(rets) > 0 else 0.0
-        durs = [t["dur"] for t in trade_list]
+        durs = [tr["dur"] for tr in trade_list]
         avg_dur = statistics.mean(durs) if durs else 0.0
-        longs = [t for t in trade_list if t["dir"] == "long"]
-        shorts = [t for t in trade_list if t["dir"] == "short"]
-        lwr = 100.0 * sum(1 for t in longs if t["win"]) / len(longs) if longs else 0.0
-        swr = 100.0 * sum(1 for t in shorts if t["win"]) / len(shorts) if shorts else 0.0
+        longs = [tr for tr in trade_list if tr["dir"] == "long"]
+        shorts = [tr for tr in trade_list if tr["dir"] == "short"]
+        lwr = 100.0 * sum(1 for tr in longs if tr["win"]) / len(longs) if longs else 0.0
+        swr = 100.0 * sum(1 for tr in shorts if tr["win"]) / len(shorts) if shorts else 0.0
 
         monthly = defaultdict(float)
         for tr in trade_list:
@@ -591,50 +538,54 @@ def main():
             "pf": round(pf, 4) if pf != 999.0 else 999.0,
             "net": round(net, 2), "net_pct": round(100.0 * net / INITIAL_CAP, 2),
             "mdd": round(mdd, 2), "sharpe": round(sharpe, 3),
-            "aw": round(aw, 2), "al": round(al, 2), "exp": round(exp, 2),
-            "dur": round(avg_dur, 1), "nlongs": len(longs), "nshorts": len(shorts),
-            "lwr": round(lwr, 2), "swr": round(swr, 2), "monthly": dict(sorted(monthly.items())),
-            "maxcw": maxcw, "maxcl": maxcl, "gp": round(gp, 2), "gl": round(gl, 2),
-            "trades_per_day": round(n / span_days, 2),
+            "aw": round(aw, 2), "al": round(al, 2),
+            "aw_margin_pct": round(aw_m, 2), "al_margin_pct": round(al_m, 2),
+            "exp": round(expct, 2), "dur": round(avg_dur, 1),
+            "nlongs": len(longs), "nshorts": len(shorts), "lwr": round(lwr, 2), "swr": round(swr, 2),
+            "monthly": dict(sorted(monthly.items())), "maxcw": maxcw, "maxcl": maxcl,
+            "gp": round(gp, 2), "gl": round(gl, 2), "trades_per_day": round(n / span_days, 2),
         }
 
     per_coin_metrics = []
     for spec_name in valid_symbols:
-        coin_trades = [t for t in trades if t["symbol"] == spec_name]
+        coin_trades = [tr for tr in trades if tr["symbol"] == spec_name]
         per_coin_metrics.append(compute_metrics(coin_trades, spec_name))
     per_coin_metrics.sort(key=lambda x: x["pf"], reverse=True)
     aggregate = compute_metrics(trades, "AGGREGATE")
+    avg_drift = statistics.mean(fill_drifts) if fill_drifts else 0.0
 
-    pf_pass = sum(1 for c in per_coin_metrics if c["pf"] >= 1.60)
-    wr_pass = sum(1 for c in per_coin_metrics if c["wr"] >= 50)
+    pf_pass = sum(1 for c in per_coin_metrics if c["pf"] >= 1.40)
+    wr_pass = sum(1 for c in per_coin_metrics if c["wr"] >= 65)
 
-    # ---- 6.5 write report ----
     report = {
         "generated": now.isoformat(),
         "config": {
-            "initial_cap": INITIAL_CAP, "fee_taker": FEE_TAKER, "slippage": SLIPPAGE,
-            "years_back": YEARS_BACK, "window_start": start_dt.isoformat(), "window_end": end_dt.isoformat(),
+            "initial_cap": INITIAL_CAP, "fee_taker": FEE_TAKER, "years_back": YEARS_BACK,
+            "window_start": start_dt.isoformat(), "window_end": end_dt.isoformat(),
             "symbols_used": valid_symbols, "symbols_skipped": [s for s in CORE_COINS_SPEC if s not in valid_symbols],
+            "tp_roi": TP_ROI, "sl_atr_mult": SL_ATR_MULT, "avg_signal_to_fill_drift_pct": round(avg_drift, 4),
         },
         "aggregate": aggregate,
         "per_coin": per_coin_metrics,
         "filters": dict(filter_counts),
-        "scans_per_symbol": dict(scans),
         "final_balance": round(balance, 2),
-        "validation": {"pf_target": 1.60, "wr_target": 50, "pf_pass_count": pf_pass, "wr_pass_count": wr_pass,
-                       "total_coins": len(per_coin_metrics), "baseline_v60_pf": 1.01, "baseline_v60_wr": 42},
+        "validation": {"pf_target": 1.40, "wr_target": 65, "pf_pass_count": pf_pass, "wr_pass_count": wr_pass,
+                       "total_coins": len(per_coin_metrics),
+                       "baseline_v60_pf": 1.01, "baseline_v60_wr": 42,
+                       "baseline_v61_pf": 0.81, "baseline_v61_wr": 37},
     }
     with open("backtest_report.json", "w") as f:
         json.dump(report, f, indent=2, default=str)
 
     lines = []
     lines.append("=" * 80)
-    lines.append("BACKTEST SUMMARY - ADX-DI Confluence Scalper v6.1 (shared portfolio, 30 coins)")
+    lines.append("BACKTEST SUMMARY - v6.2 ADX-EMA Scalper (Fill-Price Fixed, shared portfolio, 30 coins)")
     lines.append(f"Generated: {now.isoformat()} UTC")
     lines.append(f"Window: {start_dt.date()} -> {end_dt.date()} ({YEARS_BACK} years)")
     lines.append(f"Initial Capital: ${INITIAL_CAP:,.2f} (single shared balance across all symbols)")
-    lines.append(f"Fees: Taker {FEE_TAKER*100:.2f}% (all orders are MARKET) | Slippage: {SLIPPAGE*100:.2f}%")
-    lines.append(f"Leverage/position tiers: <$10=10x/30% | $10-50=10x/10% | >$50=5x/10%")
+    lines.append(f"Fees: Taker {FEE_TAKER*100:.2f}% per side | Slippage: 0.01% BTC/ETH, 0.02% majors, 0.05% memes")
+    lines.append(f"TP: 5% ROI on margin | SL: 2x ATR14 from fill price")
+    lines.append(f"Fill model: signal at candle close -> filled at NEXT candle's open + slippage")
     lines.append("=" * 80)
     lines.append("")
     lines.append(f"Symbols used ({len(valid_symbols)}/30): {', '.join(valid_symbols)}")
@@ -643,16 +594,18 @@ def main():
         lines.append(f"Symbols skipped (insufficient data): {', '.join(skipped)}")
     lines.append("")
     lines.append(f"FINAL BALANCE: ${balance:,.2f} (started at ${INITIAL_CAP:,.2f})")
+    lines.append(f"Avg signal-to-fill drift: {avg_drift:.4f}%")
     lines.append("")
     lines.append(f"AGGREGATE: trades={aggregate['n']} | WR={aggregate['wr']}% | PF={aggregate['pf']} | "
                   f"Net={aggregate['net_pct']}% (${aggregate['net']:,.2f}) | MaxDD={aggregate['mdd']}% | "
                   f"Trades/day={aggregate['trades_per_day']}")
-    lines.append(f"VALIDATION: PF>=1.60 on {pf_pass}/{len(per_coin_metrics)} coins | WR>=50% on {wr_pass}/{len(per_coin_metrics)} coins")
-    lines.append(f"COMPARISON BASELINE (v6.0 live): WR~42% | PF~1.01")
+    lines.append(f"Avg Win: ${aggregate['aw']} ({aggregate['aw_margin_pct']}% margin) | "
+                  f"Avg Loss: ${aggregate['al']} ({aggregate['al_margin_pct']}% margin)")
+    lines.append(f"VALIDATION: PF>=1.40 on {pf_pass}/{len(per_coin_metrics)} coins | WR>=65% on {wr_pass}/{len(per_coin_metrics)} coins")
+    lines.append(f"COMPARISON: v6.0 live WR~42%/PF~1.01 | v6.1 backtest WR~37%/PF~0.81")
     lines.append("")
     lines.append("FILTER / REJECTION STATS (aggregate across all symbols):")
-    for k in ["ADX_LOW", "LOW_ATR", "LOW_VOL", "NO_TREND", "WAIT_UP", "WAIT_DOWN",
-              "DI_MISALIGN_LONG", "DI_MISALIGN_SHORT", "RSI_LOW", "RSI_HIGH",
+    for k in ["ADX_LOW", "NO_TREND", "WAIT_UP", "WAIT_DOWN", "NO_NEXT_CANDLE_SKIP",
               "BALANCE_FLOOR_SKIP", "ZERO_QTY_SKIP", "SIGNALS_GENERATED"]:
         lines.append(f"  {k}: {filter_counts.get(k, 0)}")
     lines.append("")
@@ -669,9 +622,10 @@ def main():
     lines.append("DESIRED OUTPUTS RECAP")
     lines.append("=" * 80)
     lines.append(f"AGGREGATE: NetPnL={aggregate['net_pct']}% | WR={aggregate['wr']}% | PF={aggregate['pf']} | "
-                  f"AvgWin=${aggregate['aw']} | AvgLoss=${aggregate['al']} | Expectancy=${aggregate['exp']} | "
+                  f"AvgWin=${aggregate['aw']} ({aggregate['aw_margin_pct']}%) | "
+                  f"AvgLoss=${aggregate['al']} ({aggregate['al_margin_pct']}%) | Expectancy=${aggregate['exp']} | "
                   f"MaxDD={aggregate['mdd']}% | Sharpe={aggregate['sharpe']} | Trades={aggregate['n']} | "
-                  f"Trades/day={aggregate['trades_per_day']}")
+                  f"Trades/day={aggregate['trades_per_day']} | AvgFillDrift={avg_drift:.4f}%")
     lines.append("=" * 80)
     lines.append("END OF SUMMARY")
     lines.append("=" * 80)
@@ -684,4 +638,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
