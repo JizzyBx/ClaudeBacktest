@@ -1,720 +1,543 @@
 """
-Backtest Engine V4 — Kimi AI Strategies
-Strategy A: Liquidity Sweep + Volume (all 13 coins)
-Strategy B: Session Open Momentum (majors only)
-Strategy C: Hybrid Sweep + Session (BTC/ETH/SOL only)
-Data: data-api.binance.vision | 2 Years | stdlib only
+TRIPLE LOCK CONFLUENCE STRATEGY — BACKTEST V5
+==============================================
+Strategy : EMA200 + Daily VWAP + MACD(12,26,9) + ATR(14)
+Timeframe : 30M | Period: 2 Years | ~28 Coins
+R:R       : 1:2.5 | SL = 1.5x ATR | TP = 3.75x ATR
+Fee       : 0.05% per side | Slippage: 0.02% per side
+stdlib ONLY — zero pip installs
+Data      : data-api.binance.vision (public, no auth)
 """
 
-import json, time, math, statistics
-from datetime import datetime, timezone
-from collections import defaultdict
+import json
+import time
+import statistics
 import urllib.request
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
-# ── Coins ─────────────────────────────────────────────────────────────────────
-TIER1 = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT']
-TIER2 = ['ADAUSDT','DOGEUSDT','LINKUSDT','LTCUSDT','POLUSDT']
-MEMES = ['1000BONKUSDT','1000PEPEUSDT','1000SHIBUSDT']
-ALL_COINS = TIER1 + TIER2 + MEMES
+# ─────────────────────────────────────────────
+# COINS
+# ─────────────────────────────────────────────
+COINS = [
+    # Majors
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    # Layer 1s & 2s  (MATIC renamed to POL in 2024)
+    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "POLUSDT",
+    "ARBUSDT", "OPUSDT", "SUIUSDT", "APTUSDT", "NEARUSDT",
+    # High-Volume Utility
+    "FETUSDT", "RNDRUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT",
+    # Memes  (1000 prefix required on Binance for these)
+    "DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "WIFUSDT", "1000BONKUSDT",
+    # Volume-Heavy Memes
+    "BOMEUSDT", "MEMEUSDT", "NEIROUSDT",
+    # SKIP: 1000FLOKIUSDT (HTTP 400), DOGSUSDT (unlisted)
+]
 
-SA_COINS = ALL_COINS
-SB_COINS = TIER1
-SC_COINS = ['BTCUSDT','ETHUSDT','SOLUSDT']
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+INTERVAL     = "30m"
+YEARS        = 2
+FEE_RATE     = 0.0005   # 0.05% per side
+SLIPPAGE     = 0.0002   # 0.02% per side
+ROUND_TRIP   = (FEE_RATE + SLIPPAGE) * 2   # 0.14% total
 
-def is_meme(s): return s in MEMES
+EMA_PERIOD   = 200
+ATR_PERIOD   = 14
+MACD_FAST    = 12
+MACD_SLOW    = 26
+MACD_SIG     = 9
+ATR_SL       = 1.5
+ATR_TP       = 3.75     # gives 2.5:1 R:R
 
-# ── Risk config ───────────────────────────────────────────────────────────────
-FEE_RATE    = 0.0005
-SLIPPAGE    = 0.0002
-TOTAL_FEE   = FEE_RATE + SLIPPAGE  # per side
-INITIAL_CAP = 10000.0
+BINANCE_URL  = "https://data-api.binance.vision/api/v3/klines"
+BATCH        = 1000
+SLEEP        = 0.13     # seconds between requests
 
-def risk(s):   return 0.0025 if is_meme(s) else (0.004 if s in TIER2 else 0.005)
-def wick_t(s): return 0.005  if is_meme(s) else 0.003   # wick threshold
-def vol_m(s):  return 2.0    if is_meme(s) else 1.5     # volume multiplier
-def sl_pct(s): return 0.010  if is_meme(s) else 0.005   # SL % below sweep
-def rr():      return 2.0                                 # R:R for A and C
+# ─────────────────────────────────────────────
+# DATA FETCH
+# ─────────────────────────────────────────────
 
-# ── Fetch ─────────────────────────────────────────────────────────────────────
-BASE = "https://data-api.binance.vision"
+def fetch_klines(symbol, interval, start_ms, end_ms):
+    all_data  = []
+    cur_start = start_ms
 
-def fetch(sym, interval, start_ms, end_ms):
-    out, cur, retries = [], start_ms, 0
-    while cur < end_ms:
-        url = (f"{BASE}/api/v3/klines?symbol={sym}&interval={interval}"
-               f"&startTime={cur}&endTime={end_ms}&limit=1000")
-        try:
-            with urllib.request.urlopen(url, timeout=20) as r:
-                data = json.loads(r.read())
-            if not data: break
-            out.extend(data)
-            last = data[-1][0]
-            if last == cur: break
-            cur = last + 1
-            retries = 0
-            time.sleep(0.12)
-        except Exception as e:
-            retries += 1
-            if retries > 5: print(f"  [!] {sym} {interval}: {e}"); break
-            time.sleep(2 * retries)
-    return out
+    while cur_start < end_ms:
+        url = (f"{BINANCE_URL}?symbol={symbol}&interval={interval}"
+               f"&startTime={cur_start}&endTime={end_ms}&limit={BATCH}")
+
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(url, timeout=20) as r:
+                    batch = json.loads(r.read().decode())
+                break
+            except Exception as e:
+                wait = 2 ** attempt
+                print(f"    retry {attempt+1}/5 ({e}) — wait {wait}s")
+                time.sleep(wait)
+        else:
+            print(f"    SKIP {symbol} — all retries failed")
+            return None
+
+        if not batch:
+            break
+
+        all_data.extend(batch)
+        cur_start = batch[-1][0] + 1
+
+        if len(batch) < BATCH:
+            break
+        time.sleep(SLEEP)
+
+    return all_data
+
 
 def parse(raw):
-    o=[float(k[1]) for k in raw]; h=[float(k[2]) for k in raw]
-    l=[float(k[3]) for k in raw]; c=[float(k[4]) for k in raw]
-    v=[float(k[5]) for k in raw]; t=[int(k[0])   for k in raw]
-    return o,h,l,c,v,t
+    times, opens, highs, lows, closes, vols = [], [], [], [], [], []
+    for c in raw:
+        times.append(int(c[0]))
+        opens.append(float(c[1]))
+        highs.append(float(c[2]))
+        lows.append(float(c[3]))
+        closes.append(float(c[4]))
+        vols.append(float(c[5]))
+    return opens, highs, lows, closes, vols, times
 
-# ── Indicators ────────────────────────────────────────────────────────────────
-def vsma(v, p=20):
-    r = [None]*(p-1)
-    for i in range(p-1, len(v)):
-        r.append(sum(v[i-p+1:i+1])/p)
-    return r
+# ─────────────────────────────────────────────
+# INDICATORS — pure Python, no numpy
+# ─────────────────────────────────────────────
 
-# ── Session helpers ───────────────────────────────────────────────────────────
-def session_of(ts_ms):
-    """Returns session name or None. London=07-12, NY=13:30-17."""
-    dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
-    h = dt.hour; m = dt.minute
-    mins = h*60 + m
-    if 7*60 <= mins < 12*60:   return 'LONDON'
-    if 13*60+30 <= mins < 17*60: return 'NY'
-    return None
-
-def in_kill_zone(ts_ms):
-    """London 07-10, NY 13:30-16:30 — tighter for Strategy C."""
-    dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
-    mins = dt.hour*60 + dt.minute
-    if 7*60 <= mins < 10*60:    return True
-    if 13*60+30 <= mins < 16*60+30: return True
-    return False
-
-def is_session_open_candle(ts_ms):
-    """Returns (is_first_or_second, session) for Strategy B."""
-    dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc)
-    mins = dt.hour*60 + dt.minute
-    # London: 08:00-10:00 (first 2 candles of 08:00 session)
-    if mins in (8*60, 8*60+30, 9*60, 9*60+30):
-        return True, 'LONDON'
-    # NY: 13:30-15:30
-    if mins in (13*60+30, 14*60, 14*60+30, 15*60):
-        return True, 'NY'
-    return False, None
-
-# ── PDH/PDL calculator ────────────────────────────────────────────────────────
-def calc_pdh_pdl(times, highs, lows):
-    """For each candle index, return the PDH and PDL (previous calendar day)."""
-    pdh = [None]*len(times)
-    pdl = [None]*len(times)
-    # Group by UTC date
-    day_h = {}; day_l = {}
-    for i, ts in enumerate(times):
-        dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
-        d = dt.date()
-        day_h[d] = max(day_h.get(d, highs[i]), highs[i])
-        day_l[d] = min(day_l.get(d, lows[i]),  lows[i])
-    sorted_days = sorted(day_h.keys())
-    day_to_prev = {}
-    for i, d in enumerate(sorted_days):
-        if i > 0:
-            day_to_prev[d] = sorted_days[i-1]
-    for i, ts in enumerate(times):
-        dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
-        d = dt.date()
-        prev = day_to_prev.get(d)
-        if prev:
-            pdh[i] = day_h[prev]
-            pdl[i] = day_l[prev]
-    return pdh, pdl
-
-# ── Swing high/low ────────────────────────────────────────────────────────────
-def get_recent_swing(highs, lows, idx, lookback=48, n=3):
-    """
-    Find most recent unbroken swing high and swing low
-    within last `lookback` candles before idx.
-    Swing high: candle high > n candles before AND n candles after.
-    We scan backwards so we need confirmed swings (n bars after exist).
-    """
-    sh = None; sl_val = None
-    start = max(n, idx - lookback)
-    # scan from most recent backwards
-    for j in range(idx - n - 1, start - 1, -1):
-        if j < n: continue
-        # swing high
-        if sh is None:
-            is_sh = all(highs[j] > highs[j-k] for k in range(1, n+1)) and \
-                    all(highs[j] > highs[j+k] for k in range(1, min(n+1, idx-j+1)))
-            if is_sh:
-                # check not broken (no candle after j up to idx exceeded it)
-                if all(highs[k] <= highs[j] for k in range(j+1, idx+1)):
-                    sh = highs[j]
-        # swing low
-        if sl_val is None:
-            is_sl = all(lows[j] < lows[j-k] for k in range(1, n+1)) and \
-                    all(lows[j] < lows[j+k] for k in range(1, min(n+1, idx-j+1)))
-            if is_sl:
-                if all(lows[k] >= lows[j] for k in range(j+1, idx+1)):
-                    sl_val = lows[j]
-        if sh is not None and sl_val is not None:
-            break
-    return sh, sl_val
-
-# ── Metrics ───────────────────────────────────────────────────────────────────
-def calc_metrics(trades, sym):
-    if not trades: return None
-    wins  = [t for t in trades if t['win']]
-    loss  = [t for t in trades if not t['win']]
-    n = len(trades); nw = len(wins)
-    gp = sum(t['pnl'] for t in wins)        if wins else 0
-    gl = abs(sum(t['pnl'] for t in loss))   if loss else 0
-    pf = gp/gl if gl > 0 else float('inf')
-    wr = nw/n
-    net = sum(t['pnl'] for t in trades)*100
-    aw  = statistics.mean(t['pnl'] for t in wins)*100  if wins else 0
-    al  = statistics.mean(t['pnl'] for t in loss)*100  if loss else 0
-    exp = wr*aw + (1-wr)*al
-    dur = statistics.mean(t['dur'] for t in trades)
-    # drawdown
-    eq=INITIAL_CAP; pk=eq; mdd=0
-    for t in trades:
-        r=t.get('risk',0.005)
-        eq += t['pnl']/r * eq * r
-        if eq>pk: pk=eq
-        dd=(pk-eq)/pk
-        if dd>mdd: mdd=dd
-    pnls=[t['pnl'] for t in trades]
-    if len(pnls)>1:
-        mr=statistics.mean(pnls); sr=statistics.stdev(pnls)
-        sharpe=mr/sr*math.sqrt(252*48) if sr>0 else 0
-        neg=[p for p in pnls if p<0]
-        ds=statistics.stdev(neg) if len(neg)>1 else sr
-        sortino=mr/ds*math.sqrt(252*48) if ds>0 else 0
-    else: sharpe=sortino=0
-    longs  = [t for t in trades if t['dir']=='LONG']
-    shorts = [t for t in trades if t['dir']=='SHORT']
-    lwr = sum(1 for t in longs  if t['win'])/len(longs)*100  if longs  else 0
-    swr = sum(1 for t in shorts if t['win'])/len(shorts)*100 if shorts else 0
-    monthly=defaultdict(float)
-    for t in trades:
-        dt=datetime.fromtimestamp(t['exit_t']/1000,tz=timezone.utc)
-        monthly[dt.strftime('%Y-%m')]+=t['pnl']*100
-    maxcw=maxcl=cw=cl=0
-    for t in trades:
-        if t['win']: cw+=1; cl=0; maxcw=max(maxcw,cw)
-        else: cl+=1; cw=0; maxcl=max(maxcl,cl)
-    return dict(
-        symbol=sym, n=n, wr=round(wr*100,2), pf=round(pf,4),
-        net=round(net,4), mdd=round(mdd*100,2),
-        sharpe=round(sharpe,4), sortino=round(sortino,4),
-        aw=round(aw,4), al=round(al,4), exp=round(exp,4),
-        dur=round(dur,1), nlongs=len(longs), nshorts=len(shorts),
-        lwr=round(lwr,2), swr=round(swr,2),
-        monthly=dict(sorted(monthly.items())),
-        maxcw=maxcw, maxcl=maxcl,
-        gp=round(gp*100,4), gl=round(gl*100,4)
-    )
-
-def agg(all_trades):
-    return calc_metrics(all_trades,'ALL') if all_trades else None
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGY A — Liquidity Sweep + Volume
-# ══════════════════════════════════════════════════════════════════════════════
-def run_A(sym, raw):
-    if len(raw) < 300: return None, {}
-    o,h,l,c,v,t = parse(raw)
-    vs = vsma(v, 20)
-    pdh_arr, pdl_arr = calc_pdh_pdl(t, h, l)
-    wt   = wick_t(sym)
-    vm   = vol_m(sym)
-    slp  = sl_pct(sym)
-    rsk  = risk(sym)
-    timeout = 8
-    cooldown_bars = 4
-
-    flt = defaultdict(int)
-    trades = []; in_pos = False
-    ep=sl=tp=d=eb=None; cooldown=0
-    # State: waiting for reclaim after a confirmed sweep
-    sweep_pending = None  # dict with sweep info
-
-    for i in range(50, len(c)):
-        flt['total'] += 1
-
-        # ── Exit ──
-        if in_pos:
-            hit_sl=hit_tp=False
-            if d=='LONG':
-                if l[i]<=sl: hit_sl=True
-                if h[i]>=tp: hit_tp=True
-            else:
-                if h[i]>=sl: hit_sl=True
-                if l[i]<=tp: hit_tp=True
-            timeout_hit = (i - eb) >= timeout
-            if hit_sl or hit_tp or timeout_hit:
-                xp = tp if hit_tp else (sl if hit_sl else c[i])
-                raw_pnl = (xp-ep)/ep if d=='LONG' else (ep-xp)/ep
-                net = raw_pnl - 2*TOTAL_FEE
-                trades.append(dict(dir=d,entry=ep,exit=xp,
-                    entry_t=t[eb],exit_t=t[i],pnl=net,win=net>0,
-                    hit_tp=hit_tp,dur=i-eb,risk=rsk))
-                in_pos=False; cooldown=cooldown_bars; sweep_pending=None
-            else:
-                flt['in_pos']+=1; continue
-
-        if cooldown>0: cooldown-=1; flt['cooldown']+=1; continue
-
-        vs_i = vs[i]
-        if vs_i is None: continue
-
-        # ── Check reclaim from previous sweep ──
-        if sweep_pending is not None:
-            sp = sweep_pending
-            # Must be the NEXT candle after sweep
-            if i == sp['sweep_bar'] + 1:
-                reclaimed = False
-                if sp['dir']=='LONG'  and c[i] > sp['level']:  reclaimed=True
-                if sp['dir']=='SHORT' and c[i] < sp['level']:  reclaimed=True
-                if reclaimed:
-                    ep = c[i]*(1+SLIPPAGE if sp['dir']=='LONG' else 1-SLIPPAGE)
-                    if sp['dir']=='LONG':
-                        sl_price = sp['sweep_low']  * (1 - slp)
-                        tp_price = ep + rr() * (ep - sl_price)
-                    else:
-                        sl_price = sp['sweep_high'] * (1 + slp)
-                        tp_price = ep - rr() * (sl_price - ep)
-                    d=sp['dir']; eb=i; ep=ep; sl=sl_price; tp=tp_price
-                    in_pos=True; flt['signals']+=1
-                else:
-                    flt['no_reclaim']+=1
-                sweep_pending=None
-                if in_pos: continue
-
-            else:
-                # stale — void it
-                sweep_pending=None
-
-        # ── Session filter ──
-        sess = session_of(t[i])
-        if sess is None: flt['no_session']+=1; continue
-
-        # ── Get levels ──
-        pdh_i = pdh_arr[i]; pdl_i = pdl_arr[i]
-        sh_i, sl_i_level = get_recent_swing(h, l, i, lookback=48, n=3)
-
-        # closest resistance (lower of PDH vs SH)
-        res_levels = [x for x in [pdh_i, sh_i] if x is not None]
-        sup_levels = [x for x in [pdl_i, sl_i_level] if x is not None]
-        if not res_levels and not sup_levels: flt['no_levels']+=1; continue
-
-        res = min(res_levels) if res_levels else None
-        sup = max(sup_levels) if sup_levels else None
-
-        # ── LONG sweep: low breaks below support ──
-        if sup is not None:
-            if l[i] < sup:
-                # wick extension
-                wick_ext = (sup - l[i]) / sup
-                if wick_ext >= wt:
-                    # volume
-                    if v[i] >= vm * vs_i:
-                        # wick: lower wick must exist (low below body)
-                        body_low = min(o[i], c[i])
-                        if l[i] < body_low:
-                            sweep_pending = dict(
-                                dir='LONG', level=sup,
-                                sweep_bar=i, sweep_low=l[i],
-                                sweep_high=h[i]
-                            )
-                            flt['sweep_long']+=1
-                            continue
-                        else: flt['no_wick_body']+=1
-                    else: flt['vol_long']+=1
-                else: flt['wick_ext_long']+=1
-
-        # ── SHORT sweep: high breaks above resistance ──
-        if res is not None:
-            if h[i] > res:
-                wick_ext = (h[i] - res) / res
-                if wick_ext >= wt:
-                    if v[i] >= vm * vs_i:
-                        body_high = max(o[i], c[i])
-                        if h[i] > body_high:
-                            sweep_pending = dict(
-                                dir='SHORT', level=res,
-                                sweep_bar=i, sweep_low=l[i],
-                                sweep_high=h[i]
-                            )
-                            flt['sweep_short']+=1
-                            continue
-                        else: flt['no_wick_body']+=1
-                    else: flt['vol_short']+=1
-                else: flt['wick_ext_short']+=1
-
-        flt['no_setup']+=1
-
-    return trades, dict(flt)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGY B — Session Open Momentum
-# ══════════════════════════════════════════════════════════════════════════════
-def run_B(sym, raw):
-    if len(raw) < 100: return None, {}
-    o,h,l,c,v,t = parse(raw)
-    vs = vsma(v, 20)
-    rsk = risk(sym)
-    timeout_bars = 4  # ~2 hours = end of session window
-
-    flt = defaultdict(int)
-    trades = []; in_pos = False
-    ep=sl=tp=d=eb=None; cooldown=0
-    # Track session first candle
-    session_first = {}   # session_key -> candle index
-
-    for i in range(20, len(c)):
-        flt['total']+=1
-
-        # ── Exit ──
-        if in_pos:
-            hit_sl=hit_tp=False
-            if d=='LONG':
-                if l[i]<=sl: hit_sl=True
-                if h[i]>=tp: hit_tp=True
-            else:
-                if h[i]>=sl: hit_sl=True
-                if l[i]<=tp: hit_tp=True
-            # Time stop: end of session window
-            timeout_hit = (i - eb) >= timeout_bars
-            if hit_sl or hit_tp or timeout_hit:
-                xp = tp if hit_tp else (sl if hit_sl else c[i])
-                raw_pnl = (xp-ep)/ep if d=='LONG' else (ep-xp)/ep
-                net = raw_pnl - 2*TOTAL_FEE
-                trades.append(dict(dir=d,entry=ep,exit=xp,
-                    entry_t=t[eb],exit_t=t[i],pnl=net,win=net>0,
-                    hit_tp=hit_tp,dur=i-eb,risk=rsk))
-                in_pos=False; cooldown=6
-            else: flt['in_pos']+=1; continue
-
-        if cooldown>0: cooldown-=1; flt['cooldown']+=1; continue
-
-        vs_i = vs[i]
-        if vs_i is None: continue
-
-        is_open, sess = is_session_open_candle(t[i])
-        if not is_open: flt['no_session']+=1; continue
-
-        dt = datetime.fromtimestamp(t[i]/1000, tz=timezone.utc)
-        sess_key = f"{dt.date()}_{sess}"
-
-        # First candle of session
-        if sess_key not in session_first:
-            session_first[sess_key] = i
-            flt['first_candle']+=1
-            continue  # just record it, don't trade yet
-
-        first_i = session_first[sess_key]
-        # Make sure this is second or third candle of session
-        candle_num = i - first_i
-        if candle_num > 3: flt['too_late']+=1; continue
-
-        # First candle must be directional + volume
-        fc_body = abs(c[first_i] - o[first_i])
-        fc_range = h[first_i] - l[first_i]
-        if fc_range == 0: flt['no_range']+=1; continue
-        if fc_body / fc_range < 0.50: flt['weak_body']+=1; continue
-        if v[first_i] < 2.0 * vs_i: flt['vol_weak']+=1; continue
-
-        bullish_first = c[first_i] > o[first_i]
-        fc_low = l[first_i]; fc_high = h[first_i]
-        fc_range_val = fc_high - fc_low
-        midpoint = (fc_high + fc_low) / 2
-
-        sig = None
-        if bullish_first:
-            # Pullback candle: retraces to 50% but doesn't close below low
-            if l[i] <= midpoint and c[i] >= fc_low:
-                sig = 'LONG'
-            else: flt['no_pullback']+=1; continue
+def ema(values, period):
+    result = [None] * len(values)
+    k = 2.0 / (period + 1)
+    last = None
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        if last is None:
+            last = v
         else:
-            # Bearish first candle
-            if h[i] >= midpoint and c[i] <= fc_high:
-                sig = 'SHORT'
-            else: flt['no_pullback']+=1; continue
+            last = v * k + last * (1 - k)
+        result[i] = last
+    return result
 
-        if sig:
-            flt['signals']+=1
-            ep = c[i]*(1+SLIPPAGE if sig=='LONG' else 1-SLIPPAGE)
-            if sig=='LONG':
-                sl = fc_low * (1 - 0.001)
-                tp = ep + 1.5 * fc_range_val
+
+def calc_atr(highs, lows, closes, period=14):
+    trs = [None]
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i]  - closes[i-1]))
+        trs.append(tr)
+    return ema(trs, period)
+
+
+def calc_macd_hist(closes):
+    ef  = ema(closes, MACD_FAST)
+    es  = ema(closes, MACD_SLOW)
+    ml  = [f - s if f and s else None for f, s in zip(ef, es)]
+    sig = ema(ml, MACD_SIG)
+    return [m - s if m is not None and s is not None else None
+            for m, s in zip(ml, sig)]
+
+
+def calc_vwap(highs, lows, closes, vols, times):
+    """Daily VWAP anchored to 00:00 UTC — resets each day."""
+    vwap    = [None] * len(closes)
+    cum_pv  = 0.0
+    cum_vol = 0.0
+    cur_day = None
+
+    for i in range(len(closes)):
+        dt  = datetime.fromtimestamp(times[i] / 1000, tz=timezone.utc)
+        day = dt.date()
+        if day != cur_day:
+            cur_day = day
+            cum_pv  = 0.0
+            cum_vol = 0.0
+        tp       = (highs[i] + lows[i] + closes[i]) / 3.0
+        cum_pv  += tp * vols[i]
+        cum_vol += vols[i]
+        if cum_vol > 0:
+            vwap[i] = cum_pv / cum_vol
+    return vwap
+
+# ─────────────────────────────────────────────
+# STRATEGY
+# ─────────────────────────────────────────────
+
+def run_triple_lock(symbol, raw):
+    opens, highs, lows, closes, vols, times = parse(raw)
+    n = len(closes)
+
+    e200  = ema(closes, EMA_PERIOD)
+    atr_v = calc_atr(highs, lows, closes, ATR_PERIOD)
+    hist  = calc_macd_hist(closes)
+    vwap  = calc_vwap(highs, lows, closes, vols, times)
+
+    trades  = []
+    filters = defaultdict(int)
+    filters["total_candles"] = n
+
+    in_trade  = False
+    direction = None
+    entry_px  = 0.0
+    sl_px     = 0.0
+    tp_px     = 0.0
+    entry_idx = 0
+    entry_t   = 0
+
+    warmup = max(EMA_PERIOD, MACD_SLOW + MACD_SIG) + 5
+
+    for i in range(warmup, n - 1):
+        # ── EXIT ────────────────────────────────────
+        if in_trade:
+            h, l = highs[i], lows[i]
+            ep, et = None, None
+
+            if direction == "LONG":
+                if l <= sl_px:
+                    ep, et = sl_px, "SL"
+                elif h >= tp_px:
+                    ep, et = tp_px, "TP"
             else:
-                sl = fc_high * (1 + 0.001)
-                tp = ep - 1.5 * fc_range_val
-            d=sig; eb=i; in_pos=True
+                if h >= sl_px:
+                    ep, et = sl_px, "SL"
+                elif l <= tp_px:
+                    ep, et = tp_px, "TP"
 
-    return trades, dict(flt)
+            if ep is not None:
+                raw_pnl = ((ep - entry_px) / entry_px if direction == "LONG"
+                           else (entry_px - ep) / entry_px)
+                net_pnl = raw_pnl - ROUND_TRIP
+                trades.append({
+                    "dir":     direction,
+                    "entry":   entry_px,
+                    "exit":    ep,
+                    "entry_t": entry_t,
+                    "exit_t":  times[i],
+                    "pnl":     net_pnl * 100,
+                    "win":     net_pnl > 0,
+                    "hit_tp":  et == "TP",
+                    "dur":     i - entry_idx,
+                })
+                in_trade = False
+            continue
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGY C — Hybrid Sweep + Session (Kill Zone only)
-# ══════════════════════════════════════════════════════════════════════════════
-def run_C(sym, raw):
-    """Same as Strategy A but ONLY takes sweeps inside kill zones."""
-    if len(raw) < 300: return None, {}
-    o,h,l,c,v,t = parse(raw)
-    vs = vsma(v, 20)
-    pdh_arr, pdl_arr = calc_pdh_pdl(t, h, l)
-    wt   = wick_t(sym)
-    vm   = vol_m(sym)
-    slp  = sl_pct(sym)
-    rsk  = risk(sym)
-    timeout = 6
-    cooldown_bars = 8
+        # ── SIGNAL ──────────────────────────────────
+        e   = e200[i]
+        a   = atr_v[i]
+        vw  = vwap[i]
+        h_c = hist[i]
+        h_p = hist[i-1]
+        cl  = closes[i]
+        lo  = lows[i]
+        hi  = highs[i]
+        lp  = lows[i-1]
+        hp  = highs[i-1]
 
-    flt = defaultdict(int)
-    trades = []; in_pos = False
-    ep=sl=tp=d=eb=None; cooldown=0
-    sweep_pending = None
+        if any(v is None for v in [e, a, vw, h_c, h_p]):
+            filters["warmup"] += 1
+            continue
 
-    for i in range(50, len(c)):
-        flt['total']+=1
-        if in_pos:
-            hit_sl=hit_tp=False
-            if d=='LONG':
-                if l[i]<=sl: hit_sl=True
-                if h[i]>=tp: hit_tp=True
-            else:
-                if h[i]>=sl: hit_sl=True
-                if l[i]<=tp: hit_tp=True
-            timeout_hit = (i - eb) >= timeout
-            if hit_sl or hit_tp or timeout_hit:
-                xp = tp if hit_tp else (sl if hit_sl else c[i])
-                raw_pnl = (xp-ep)/ep if d=='LONG' else (ep-xp)/ep
-                net = raw_pnl - 2*TOTAL_FEE
-                trades.append(dict(dir=d,entry=ep,exit=xp,
-                    entry_t=t[eb],exit_t=t[i],pnl=net,win=net>0,
-                    hit_tp=hit_tp,dur=i-eb,risk=rsk))
-                in_pos=False; cooldown=cooldown_bars; sweep_pending=None
-            else: flt['in_pos']+=1; continue
+        # LONG: all 4 locks
+        long_ok = (
+            cl > e                          # 1. Trend Lock
+            and (lo <= vw or lp <= vw)      # 2. Value Lock
+            and h_p < 0 and h_c > 0        # 3. Momentum Lock (cross up)
+            and cl > vw                    # 4. Confirmation
+        )
 
-        if cooldown>0: cooldown-=1; flt['cooldown']+=1; continue
+        # SHORT: all 4 locks
+        short_ok = (
+            cl < e                          # 1. Trend Lock
+            and (hi >= vw or hp >= vw)      # 2. Value Lock
+            and h_p > 0 and h_c < 0        # 3. Momentum Lock (cross down)
+            and cl < vw                    # 4. Confirmation
+        )
 
-        vs_i = vs[i]
-        if vs_i is None: continue
+        # Filter counting (for rejected candles)
+        if not long_ok and not short_ok:
+            if cl <= e:   filters["long_trend_fail"] += 1
+            if hi < vw:   filters["short_value_fail"] += 1
+            filters["no_signal"] += 1
+            continue
 
-        # reclaim check
-        if sweep_pending is not None:
-            sp = sweep_pending
-            if i == sp['sweep_bar'] + 1:
-                reclaimed = False
-                if sp['dir']=='LONG'  and c[i] > sp['level']: reclaimed=True
-                if sp['dir']=='SHORT' and c[i] < sp['level']: reclaimed=True
-                if reclaimed:
-                    ep2 = c[i]*(1+SLIPPAGE if sp['dir']=='LONG' else 1-SLIPPAGE)
-                    if sp['dir']=='LONG':
-                        sl_p = sp['sweep_low']  * (1 - slp)
-                        tp_p = ep2 + rr() * (ep2 - sl_p)
-                    else:
-                        sl_p = sp['sweep_high'] * (1 + slp)
-                        tp_p = ep2 - rr() * (sl_p - ep2)
-                    d=sp['dir']; eb=i; ep=ep2; sl=sl_p; tp=tp_p
-                    in_pos=True; flt['signals']+=1
-                else: flt['no_reclaim']+=1
-                sweep_pending=None
-                if in_pos: continue
-            else:
-                sweep_pending=None
+        if long_ok:
+            ep        = opens[i+1] * (1 + SLIPPAGE)
+            sl_px     = ep - ATR_SL * a
+            tp_px     = ep + ATR_TP * a
+            in_trade  = True
+            direction = "LONG"
+            entry_px  = ep
+            entry_idx = i + 1
+            entry_t   = times[i+1]
+            filters["long_signals"] += 1
 
-        # KILL ZONE filter — stricter than Strategy A
-        if not in_kill_zone(t[i]): flt['no_killzone']+=1; continue
+        elif short_ok:
+            ep        = opens[i+1] * (1 - SLIPPAGE)
+            sl_px     = ep + ATR_SL * a
+            tp_px     = ep - ATR_TP * a
+            in_trade  = True
+            direction = "SHORT"
+            entry_px  = ep
+            entry_idx = i + 1
+            entry_t   = times[i+1]
+            filters["short_signals"] += 1
 
-        pdh_i = pdh_arr[i]; pdl_i = pdl_arr[i]
-        sh_i, sl_i_level = get_recent_swing(h, l, i, lookback=48, n=3)
+    return trades, dict(filters)
 
-        res_levels = [x for x in [pdh_i, sh_i] if x is not None]
-        sup_levels = [x for x in [pdl_i, sl_i_level] if x is not None]
-        if not res_levels and not sup_levels: flt['no_levels']+=1; continue
+# ─────────────────────────────────────────────
+# METRICS
+# ─────────────────────────────────────────────
 
-        res = min(res_levels) if res_levels else None
-        sup = max(sup_levels) if sup_levels else None
+def metrics(trades, symbol):
+    if not trades:
+        return {"symbol": symbol, "n": 0, "wr": 0, "pf": 0, "net": 0,
+                "mdd": 0, "aw": 0, "al": 0, "exp": 0, "dur": 0,
+                "nlongs": 0, "nshorts": 0, "lwr": 0, "swr": 0,
+                "tp_cnt": 0, "sl_cnt": 0, "gp": 0, "gl": 0,
+                "maxcw": 0, "maxcl": 0, "monthly": {}}
 
-        if sup is not None and l[i] < sup:
-            wick_ext = (sup - l[i]) / sup
-            if wick_ext >= wt and v[i] >= vm * vs_i:
-                body_low = min(o[i], c[i])
-                if l[i] < body_low:
-                    sweep_pending=dict(dir='LONG',level=sup,
-                        sweep_bar=i,sweep_low=l[i],sweep_high=h[i])
-                    flt['sweep_long']+=1; continue
+    pnls  = [t["pnl"] for t in trades]
+    wins  = [p for p in pnls if p > 0]
+    loses = [p for p in pnls if p <= 0]
 
-        if res is not None and h[i] > res:
-            wick_ext = (h[i] - res) / res
-            if wick_ext >= wt and v[i] >= vm * vs_i:
-                body_high = max(o[i], c[i])
-                if h[i] > body_high:
-                    sweep_pending=dict(dir='SHORT',level=res,
-                        sweep_bar=i,sweep_low=l[i],sweep_high=h[i])
-                    flt['sweep_short']+=1; continue
+    gp = sum(wins)
+    gl = abs(sum(loses)) if loses else 0
+    pf = round(gp / gl, 4) if gl > 0 else float("inf")
+    wr = round(len(wins) / len(pnls) * 100, 2)
 
-        flt['no_setup']+=1
+    equity = 100.0
+    peak   = 100.0
+    mdd    = 0.0
+    for p in pnls:
+        equity *= (1 + p / 100)
+        if equity > peak:
+            peak = equity
+        dd = (peak - equity) / peak * 100
+        if dd > mdd:
+            mdd = dd
 
-    return trades, dict(flt)
+    aw  = round(statistics.mean(wins),  4) if wins  else 0
+    al  = round(statistics.mean(loses), 4) if loses else 0
+    exp = round((wr/100 * aw) + ((1 - wr/100) * al), 4)
 
-# ── Summary writer ────────────────────────────────────────────────────────────
-def write_summary(results, path='backtest_summary.txt'):
-    L=[]
-    L.append("="*72)
-    L.append("BACKTEST REPORT V4 — Kimi AI Strategies | 2 Years")
-    L.append(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    L.append(f"Fee: {FEE_RATE*100}% + {SLIPPAGE*100}% slippage per side")
-    L.append("="*72)
+    longs  = [t for t in trades if t["dir"] == "LONG"]
+    shorts = [t for t in trades if t["dir"] == "SHORT"]
+    lwr    = round(sum(1 for t in longs  if t["win"]) / max(len(longs),1)  * 100, 2)
+    swr    = round(sum(1 for t in shorts if t["win"]) / max(len(shorts),1) * 100, 2)
+    tp_cnt = sum(1 for t in trades if t["hit_tp"])
 
-    for sk, sd in results.items():
-        L.append(f"\n{'─'*72}")
-        L.append(f"  {sd['name']}")
-        L.append(f"{'─'*72}")
-        ag = sd.get('aggregate')
-        if ag:
-            pf_ok=ag['pf']>=1.5; wr_ok=ag['wr']>=42
-            L.append(f"  AGGREGATE")
-            L.append(f"  Total Trades      : {ag['n']}")
-            L.append(f"  Profit Factor     : {ag['pf']}  {'✅ TARGET MET' if pf_ok else '❌ BELOW 1.5'}")
-            L.append(f"  Win Rate          : {ag['wr']}%  {'✅' if wr_ok else '❌ BELOW 42%'}")
-            L.append(f"  Net PnL           : {ag['net']}%")
-            L.append(f"  Max Drawdown      : {ag['mdd']}%")
-            L.append(f"  Sharpe            : {ag['sharpe']}")
-            L.append(f"  Sortino           : {ag['sortino']}")
-            L.append(f"  Avg Winner        : {ag['aw']}%")
-            L.append(f"  Avg Loser         : {ag['al']}%")
-            L.append(f"  Expectancy/Trade  : {ag['exp']}%")
-            L.append(f"  Avg Duration(bars): {ag['dur']}")
-            L.append(f"  Long WR           : {ag['lwr']}% ({ag['nlongs']} trades)")
-            L.append(f"  Short WR          : {ag['swr']}% ({ag['nshorts']} trades)")
-            L.append(f"  Max Consec Wins   : {ag['maxcw']}")
-            L.append(f"  Max Consec Losses : {ag['maxcl']}")
+    monthly = defaultdict(float)
+    for t in trades:
+        key = datetime.fromtimestamp(t["entry_t"]/1000, tz=timezone.utc).strftime("%Y-%m")
+        monthly[key] += t["pnl"]
 
-            # validation
-            coins=[d for d in sd['by_symbol'].values() if isinstance(d,dict) and 'pf' in d]
-            pp=sum(1 for d in coins if d['pf']>=1.5)
-            pw=sum(1 for d in coins if d['wr']>=42)
-            tc=len(coins)
-            btc=sd['by_symbol'].get('BTCUSDT',{})
-            btc_ok=isinstance(btc,dict) and btc.get('pf',0)>=1.3
-            L.append(f"\n  VALIDATION (need 8+ coins)")
-            L.append(f"  Coins PF>=1.5 : {pp}/{tc}")
-            L.append(f"  Coins WR>=42% : {pw}/{tc}")
-            L.append(f"  BTC PF>=1.3   : {'✅' if btc_ok else '❌'}")
-            valid=pp>=8 and pw>=8 and btc_ok
-            L.append(f"  OVERALL VALID : {'✅ CONSIDER LIVE' if valid else '❌ NOT READY'}")
+    maxcw = maxcl = cw = cl_cnt = 0
+    for t in trades:
+        if t["win"]: cw += 1; cl_cnt = 0
+        else:        cl_cnt += 1; cw = 0
+        maxcw = max(maxcw, cw)
+        maxcl = max(maxcl, cl_cnt)
 
-        fs=sd.get('filter_stats',{})
-        if fs:
-            L.append(f"\n  FILTER STATS")
-            for k,v2 in sorted(fs.items(),key=lambda x:-x[1]):
-                L.append(f"    {k:<22}: {v2}")
+    return {
+        "symbol":  symbol,
+        "n":       len(trades),
+        "wr":      wr,
+        "pf":      pf,
+        "net":     round(sum(pnls), 2),
+        "mdd":     round(mdd, 2),
+        "aw":      aw,
+        "al":      al,
+        "exp":     exp,
+        "dur":     round(statistics.mean([t["dur"] for t in trades]), 1),
+        "nlongs":  len(longs),
+        "nshorts": len(shorts),
+        "lwr":     lwr,
+        "swr":     swr,
+        "tp_cnt":  tp_cnt,
+        "sl_cnt":  len(trades) - tp_cnt,
+        "gp":      round(gp, 2),
+        "gl":      round(gl, 2),
+        "maxcw":   maxcw,
+        "maxcl":   maxcl,
+        "monthly": dict(sorted(monthly.items())),
+    }
 
-        L.append(f"\n  {'Symbol':<16}{'Trades':>7}{'PF':>8}{'WR%':>7}"
-                 f"{'Net%':>9}{'DD%':>7}{'Longs':>7}{'Shorts':>8}")
-        L.append(f"  {'─'*68}")
-        by=sd.get('by_symbol',{})
-        rows=[(s,d) for s,d in by.items() if isinstance(d,dict) and 'pf' in d]
-        rows.sort(key=lambda x:x[1]['pf'],reverse=True)
-        for s,d in rows:
-            L.append(f"  {s:<16}{d['n']:>7}{d['pf']:>8.3f}{d['wr']:>7.1f}"
-                     f"{d['net']:>9.2f}{d['mdd']:>7.2f}{d['nlongs']:>7}{d['nshorts']:>8}")
-        for s,d in by.items():
-            if isinstance(d,dict) and 'error' in d:
-                L.append(f"  {s:<16}  SKIP — {d['error']}")
 
-    L.append(f"\n{'='*72}\nEND OF REPORT\n{'='*72}")
-    with open(path,'w') as f: f.write('\n'.join(L))
-    print(f"✅ {path} written")
+def aggregate(results):
+    valid = [r for r in results if r.get("n", 0) >= 10]
+    if not valid:
+        return {}
+    nt  = sum(r["n"] for r in valid)
+    nw  = sum(int(r["wr"] / 100 * r["n"]) for r in valid)
+    tgp = sum(r["gp"] for r in valid)
+    tgl = sum(r["gl"] for r in valid)
+    return {
+        "coins_tested":     len(valid),
+        "total_trades":     nt,
+        "overall_wr":       round(nw / nt * 100, 2) if nt else 0,
+        "overall_pf":       round(tgp / tgl, 4) if tgl else float("inf"),
+        "avg_max_dd":       round(statistics.mean([r["mdd"] for r in valid]), 2),
+        "coins_pf_ge_1_5":  sum(1 for r in valid if r["pf"] >= 1.5),
+        "coins_pf_ge_1_0":  sum(1 for r in valid if r["pf"] >= 1.0),
+        "coins_wr_ge_42":   sum(1 for r in valid if r["wr"] >= 42),
+    }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SUMMARY WRITER
+# ─────────────────────────────────────────────
+
+def write_summary(results, agg, all_filters, skipped):
+    lines = []
+    sep   = "=" * 70
+
+    lines += [sep,
+              "TRIPLE LOCK CONFLUENCE — BACKTEST RESULTS",
+              f"Generated : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+              "Strategy  : EMA200 + Daily VWAP + MACD(12,26,9) + ATR(14)",
+              "Period    : 2 Years | 30M | SL=1.5xATR TP=3.75xATR Fee=0.14%",
+              sep, ""]
+
+    lines += ["AGGREGATE", "-" * 40]
+    for k, v in agg.items():
+        lines.append(f"  {k:<28}: {v}")
+
+    lines += ["", sep, "VALIDATION", "-" * 40]
+    checks = [
+        ("PF >= 1.5 on 8+ coins",  agg.get("coins_pf_ge_1_5", 0) >= 8),
+        ("WR >= 42% on 8+ coins",  agg.get("coins_wr_ge_42",  0) >= 8),
+        ("Avg max DD < 20%",        agg.get("avg_max_dd", 99)    <  20),
+        ("Overall PF >= 1.5",       agg.get("overall_pf", 0)     >= 1.5),
+    ]
+    for label, passed in checks:
+        lines.append(f"  {'PASS' if passed else 'FAIL'}  {label}")
+    verdict = all(p for _, p in checks)
+    lines += ["", f"  VERDICT: {'STRATEGY VIABLE' if verdict else 'NEEDS REVISION'}"]
+
+    lines += ["", sep, "PER-COIN (sorted by PF)", "-" * 70,
+              f"{'Coin':<16}{'Trades':>7}{'WR%':>7}{'PF':>8}{'Net%':>9}{'DD%':>7}{'TP%':>6}{'Dur':>6}",
+              "-" * 70]
+
+    valid = sorted([r for r in results if r.get("n", 0) >= 1],
+                   key=lambda x: x["pf"], reverse=True)
+    for r in valid:
+        tp_r = round(r["tp_cnt"] / r["n"] * 100, 1) if r["n"] else 0
+        flag = "+" if r["pf"] >= 1.5 else " "
+        lines.append(
+            f"{flag}{r['symbol']:<15}{r['n']:>7}{r['wr']:>7.1f}"
+            f"{r['pf']:>8.4f}{r['net']:>9.2f}{r['mdd']:>7.2f}"
+            f"{tp_r:>5.1f}%{r['dur']:>6.1f}"
+        )
+
+    lines += ["", sep, "LONG vs SHORT", "-" * 55,
+              f"{'Coin':<16}{'L.Trades':>9}{'L.WR%':>8}{'S.Trades':>10}{'S.WR%':>8}",
+              "-" * 55]
+    for r in valid:
+        lines.append(f"{r['symbol']:<16}{r['nlongs']:>9}{r['lwr']:>8.1f}"
+                     f"{r['nshorts']:>10}{r['swr']:>8.1f}")
+
+    lines += ["", sep, "FILTER STATS (all coins combined)", "-" * 50]
+    combined = defaultdict(int)
+    for f in all_filters.values():
+        for k, v in f.items():
+            combined[k] += v
+    for k, v in sorted(combined.items(), key=lambda x: -x[1]):
+        lines.append(f"  {k:<35}: {v:>8,}")
+
+    if skipped:
+        lines += ["", f"SKIPPED: {', '.join(skipped)}"]
+
+    lines += ["", sep, "MONTHLY PnL — BTCUSDT (reference)", "-" * 50]
+    btc = next((r for r in results if r["symbol"] == "BTCUSDT"), None)
+    if btc and btc.get("monthly"):
+        for mo, pnl in btc["monthly"].items():
+            bar = ("+" if pnl > 0 else "-") * min(int(abs(pnl)), 40)
+            lines.append(f"  {mo}  {pnl:>8.2f}%  {bar}")
+
+    lines += ["", sep, "END OF REPORT", sep]
+
+    with open("backtest_summary.txt", "w") as f:
+        f.write("\n".join(lines))
+    print("Written → backtest_summary.txt")
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
 def main():
-    now_ms   = int(time.time()*1000)
-    start_ms = now_ms - 2*365*24*3600*1000
+    print("=" * 65)
+    print("TRIPLE LOCK BACKTEST | 2yr | 30M | stdlib only")
+    print("=" * 65)
 
-    # Fetch all data first
-    print("📥 Fetching data...")
-    d30={}
-    needed=list(dict.fromkeys(SA_COINS+SB_COINS+SC_COINS))
-    for sym in needed:
-        print(f"  {sym} 30m...", end=' ', flush=True)
-        d30[sym]=fetch(sym,'30m',start_ms,now_ms)
-        print(f"{len(d30[sym])} candles")
+    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=365 * YEARS)).timestamp() * 1000)
 
-    results={}
+    print(f"Range: {datetime.fromtimestamp(start_ms/1000, tz=timezone.utc).date()} "
+          f"to {datetime.fromtimestamp(end_ms/1000, tz=timezone.utc).date()}")
+    print(f"Coins: {len(COINS)}")
 
-    # ══ STRATEGY A ══
-    print(f"\n{'='*60}\n  STRATEGY A — Liquidity Sweep + Volume\n{'='*60}")
-    sa_by={}; sa_all=[]; sa_flt=defaultdict(int)
-    for sym in SA_COINS:
-        print(f"  {sym}...", end=' ', flush=True)
-        tr,flt=run_A(sym, d30.get(sym,[]))
-        if tr is None: print("SKIP"); sa_by[sym]={'error':'insufficient_data'}; continue
-        m=calc_metrics(tr,sym)
-        if m:
-            print(f"Trades:{m['n']} PF:{m['pf']} WR:{m['wr']}%")
-            m['filter_stats']=flt; sa_by[sym]=m; sa_all.extend(tr)
-        else: print("no trades"); sa_by[sym]={'error':'no_trades','fs':flt}
-        for k,v2 in flt.items(): sa_flt[k]+=v2
-    ag_a=agg(sa_all)
-    if ag_a:
-        print(f"\n  ── AGGREGATE A ──")
-        print(f"  Trades:{ag_a['n']} PF:{ag_a['pf']} WR:{ag_a['wr']}% "
-              f"Net:{ag_a['net']}% DD:{ag_a['mdd']}%")
-    results['A']=dict(name='Strategy A — Liquidity Sweep + Volume',
-                      aggregate=ag_a,by_symbol=sa_by,filter_stats=dict(sa_flt))
+    all_results = []
+    all_filters = {}
+    skipped     = []
 
-    # ══ STRATEGY B ══
-    print(f"\n{'='*60}\n  STRATEGY B — Session Open Momentum\n{'='*60}")
-    sb_by={}; sb_all=[]; sb_flt=defaultdict(int)
-    for sym in SB_COINS:
-        print(f"  {sym}...", end=' ', flush=True)
-        tr,flt=run_B(sym, d30.get(sym,[]))
-        if tr is None: print("SKIP"); sb_by[sym]={'error':'insufficient_data'}; continue
-        m=calc_metrics(tr,sym)
-        if m:
-            print(f"Trades:{m['n']} PF:{m['pf']} WR:{m['wr']}%")
-            m['filter_stats']=flt; sb_by[sym]=m; sb_all.extend(tr)
-        else: print("no trades"); sb_by[sym]={'error':'no_trades','fs':flt}
-        for k,v2 in flt.items(): sb_flt[k]+=v2
-    ag_b=agg(sb_all)
-    if ag_b:
-        print(f"\n  ── AGGREGATE B ──")
-        print(f"  Trades:{ag_b['n']} PF:{ag_b['pf']} WR:{ag_b['wr']}% "
-              f"Net:{ag_b['net']}% DD:{ag_b['mdd']}%")
-    results['B']=dict(name='Strategy B — Session Open Momentum',
-                      aggregate=ag_b,by_symbol=sb_by,filter_stats=dict(sb_flt))
+    for idx, symbol in enumerate(COINS, 1):
+        print(f"\n[{idx:02d}/{len(COINS)}] {symbol} fetching...", flush=True)
+        raw = fetch_klines(symbol, INTERVAL, start_ms, end_ms)
 
-    # ══ STRATEGY C ══
-    print(f"\n{'='*60}\n  STRATEGY C — Hybrid Sweep + Kill Zone\n{'='*60}")
-    sc_by={}; sc_all=[]; sc_flt=defaultdict(int)
-    for sym in SC_COINS:
-        print(f"  {sym}...", end=' ', flush=True)
-        tr,flt=run_C(sym, d30.get(sym,[]))
-        if tr is None: print("SKIP"); sc_by[sym]={'error':'insufficient_data'}; continue
-        m=calc_metrics(tr,sym)
-        if m:
-            print(f"Trades:{m['n']} PF:{m['pf']} WR:{m['wr']}%")
-            m['filter_stats']=flt; sc_by[sym]=m; sc_all.extend(tr)
-        else: print("no trades"); sc_by[sym]={'error':'no_trades','fs':flt}
-        for k,v2 in flt.items(): sc_flt[k]+=v2
-    ag_c=agg(sc_all)
-    if ag_c:
-        print(f"\n  ── AGGREGATE C ──")
-        print(f"  Trades:{ag_c['n']} PF:{ag_c['pf']} WR:{ag_c['wr']}% "
-              f"Net:{ag_c['net']}% DD:{ag_c['mdd']}%")
-    results['C']=dict(name='Strategy C — Hybrid Sweep + Kill Zone',
-                      aggregate=ag_c,by_symbol=sc_by,filter_stats=dict(sc_flt))
+        if not raw or len(raw) < EMA_PERIOD + 100:
+            cnt = len(raw) if raw else 0
+            print(f"         SKIP — only {cnt} candles")
+            skipped.append(symbol)
+            continue
 
-    # ── Write outputs ──
-    with open('backtest_report.json','w') as f: json.dump(results,f,indent=2)
-    print("\n✅ backtest_report.json written")
-    write_summary(results)
-    print("\n🏁 Done. Share backtest_report.json + backtest_summary.txt")
+        print(f"         {len(raw):,} candles — running strategy...", flush=True)
+        trades, filters = run_triple_lock(symbol, raw)
+        all_filters[symbol] = filters
 
-if __name__=='__main__':
-    print("🔍 Backtest V4 | Kimi Strategies | 13 Coins | 2 Years")
+        r = metrics(trades, symbol)
+        all_results.append(r)
+
+        if r["n"] == 0:
+            print(f"         No trades (L={filters.get('long_signals',0)} S={filters.get('short_signals',0)} signals)")
+        else:
+            flag = "PASS" if r["pf"] >= 1.5 else "FAIL"
+            print(f"         [{flag}] PF={r['pf']:.4f} WR={r['wr']:.1f}% "
+                  f"Trades={r['n']} DD={r['mdd']:.1f}% "
+                  f"TP={r['tp_cnt']} SL={r['sl_cnt']}")
+
+    agg = aggregate(all_results)
+
+    print("\n" + "=" * 65)
+    print("AGGREGATE")
+    for k, v in agg.items():
+        print(f"  {k}: {v}")
+
+    write_summary(all_results, agg, all_filters, skipped)
+
+    report = {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "strategy":  "Triple Lock Confluence",
+        "period":    f"{YEARS} years | 30M",
+        "params": {
+            "ema": EMA_PERIOD, "atr": ATR_PERIOD,
+            "macd": f"{MACD_FAST}/{MACD_SLOW}/{MACD_SIG}",
+            "sl_mult": ATR_SL, "tp_mult": ATR_TP,
+            "round_trip_cost": ROUND_TRIP,
+        },
+        "aggregate":  agg,
+        "per_coin":   all_results,
+        "filters":    all_filters,
+        "skipped":    skipped,
+    }
+
+    with open("backtest_report.json", "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    print("Written → backtest_report.json")
+    print("=" * 65)
+
+
+if __name__ == "__main__":
     main()
