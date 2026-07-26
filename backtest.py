@@ -1,17 +1,28 @@
 """
 ================================================================================
-BACKTEST.PY - v6.2 ADX-EMA Scalper (Fill-Price Fixed), 15m, 30-coin universe
+BACKTEST.PY - Live Bot Strategy (v6 base entry), 3 TP/SL ATR-multiplier variants
 ================================================================================
 Pure Python 3.11 stdlib only. No numpy/pandas/requests.
 Data source: https://data-api.binance.vision/api/v3/klines (public, spot proxy)
 
-KEY FIX vs v6.1: signal fires on candle CLOSE, but the trade FILLS at the NEXT
-candle's OPEN + per-coin slippage. TP/SL are computed from fill_price, not the
-signal candle's close. TP = fixed 5% ROI on margin (price move = 5%/leverage).
-SL = 2x ATR14 (from the signal candle) measured from fill_price.
+Entry logic replicated EXACTLY from trading_bot.py (get_signal()):
+  - ADX(14) >= 22
+  - 50EMA slope over 10 bars (2.5h) > +0.05% (long) or < -0.05% (short)
+  - EMA9/21 crossover on the current candle
+  - NO RSI / DI / Volume filters (matches the live bot - none exist there)
+  - Entry executes at the SAME candle's close (matches the live bot: it places
+    the market order immediately on signal, using closes[-1] as the reference
+    price for TP/SL calc) - no next-candle-open deferral this time.
 
-All 30 core coins share ONE portfolio balance, scanned in a fixed order each
-15m tick (same event-driven design as v6.1).
+Three independent strategies (same entry, different TP/SL ATR multipliers),
+each run as its own full 30-coin shared-portfolio simulation:
+  S1: TP = 2.0x ATR | SL = 4.0x ATR
+  S2: TP = 1.5x ATR | SL = 2.5x ATR
+  S3: TP = 4.0x ATR | SL = 3.0x ATR
+
+Fees/slippage are NOT modeled in the live bot's own code, but real fills always
+incur them - this backtest adds a standard 0.05% taker fee/side + 0.02%
+slippage for realism, flagged clearly in the report.
 
 Outputs: backtest_report.json (full data), backtest_summary.txt (human readable)
 ================================================================================
@@ -46,23 +57,13 @@ CORE_COINS_SPEC = [
 
 SYMBOLS = [(s, SYMBOL_MAP.get(s, s)) for s in CORE_COINS_SPEC]
 
-# per-coin slippage tier (Section 4 of spec)
-MEME_TIER = {"BONKUSDT", "PEPEUSDT", "SHIBUSDT", "FLOKIUSDT", "WIFUSDT", "BOMEUSDT", "NEIROUSDT"}
-BTC_ETH_TIER = {"BTCUSDT", "ETHUSDT"}
-
-def slippage_for(fetch_sym):
-    if fetch_sym in BTC_ETH_TIER:
-        return 0.0001   # 0.01%
-    if fetch_sym in MEME_TIER:
-        return 0.0005   # 0.05%
-    return 0.0002       # 0.02% - major alts (default tier)
-
 # ================================================================================
 # 2. CONFIG
 # ================================================================================
-FEE_TAKER = 0.0005      # 0.05% per side, all orders MARKET
+FEE_TAKER = 0.0005      # 0.05% per side - realistic addition, not modeled in live bot
+SLIPPAGE = 0.0002       # 0.02% - realistic addition, not modeled in live bot
 INITIAL_CAP = 10000.0
-COOLDOWN_MS = 5 * 60 * 1000
+COOLDOWN_MS = 5 * 60 * 1000   # matches live bot's default cooldown_min=5
 
 INTERVAL = "15m"
 INTERVAL_MS = 15 * 60 * 1000
@@ -73,10 +74,14 @@ YEARS_BACK = 2
 WARMUP_BARS = 400
 
 ADX_MIN = 22
-SLOPE_LOOKBACK = 10
-SLOPE_THRESHOLD = 0.05
-SL_ATR_MULT = 2.0
-TP_ROI = 0.05  # 5% ROI on margin
+SLOPE_LOOKBACK = 10     # matches live bot: e50[-1] vs e50[-10]
+SLOPE_THRESHOLD = 0.05  # matches live bot: slope_pct > 0.05 / < -0.05
+
+STRATEGIES = {
+    "S1_TP2x_SL4x": {"tp_mult": 2.0, "sl_mult": 4.0},
+    "S2_TP1.5x_SL2.5x": {"tp_mult": 1.5, "sl_mult": 2.5},
+    "S3_TP4x_SL3x": {"tp_mult": 4.0, "sl_mult": 3.0},
+}
 
 def get_leverage_and_pct(balance):
     if balance < 10:
@@ -140,7 +145,7 @@ def parse(raw):
 
 
 # ================================================================================
-# 4. INDICATORS
+# 4. INDICATORS (mirrors trading_bot.py's ema/atr_calc/adx_calc exactly in spirit)
 # ================================================================================
 def ema(values, period):
     out = [None] * len(values)
@@ -259,74 +264,15 @@ def align_to_grid(times, series_dict, grid_index):
 
 
 # ================================================================================
-# 6. MAIN SIMULATION
+# 6. ONE STRATEGY SIMULATION (shared 30-coin portfolio)
 # ================================================================================
-def main():
-    now = datetime.datetime.utcnow()
-    end_dt = now
-    start_dt = end_dt - datetime.timedelta(days=365 * YEARS_BACK)
-    official_start_ms = int(start_dt.timestamp() * 1000)
-    end_ms = int(end_dt.timestamp() * 1000)
-    fetch_start_ms = official_start_ms - WARMUP_BARS * INTERVAL_MS
-
-    print("=" * 80)
-    print("BACKTEST START - v6.2 ADX-EMA Scalper (Fill-Price Fixed), 15m, 30 coins")
-    print(f"Window: {start_dt.isoformat()} -> {end_dt.isoformat()} UTC")
-    print("=" * 80)
-
-    per_symbol = {}
-    global_time_set = set()
-
-    for spec_name, fetch_sym in SYMBOLS:
-        print(f"\nFetching {fetch_sym} ({spec_name}) ...")
-        raw = fetch(fetch_sym, fetch_start_ms, end_ms)
-        print(f"  -> {len(raw)} candles")
-        if len(raw) < 250:
-            print(f"  [SKIP] {spec_name}: insufficient data")
-            per_symbol[spec_name] = None
-            continue
-        opens, highs, lows, closes, volumes, times = parse(raw)
-
-        ema9 = ema(closes, 9)
-        ema21 = ema(closes, 21)
-        ema50 = ema(closes, 50)
-        atr14 = atr(highs, lows, closes, 14)
-        adx14 = adx_dmi(highs, lows, closes, 14)
-
-        per_symbol[spec_name] = {
-            "fetch_sym": fetch_sym, "times": times, "opens": opens, "closes": closes,
-            "highs": highs, "lows": lows, "volumes": volumes,
-            "ema9": ema9, "ema21": ema21, "ema50": ema50, "atr": atr14, "adx": adx14,
-            "slippage": slippage_for(fetch_sym),
-        }
-        global_time_set.update(t for t in times if t >= official_start_ms - INTERVAL_MS)
-        # include one tick before official start so slot i+1 (fill candle) can
-        # land exactly on the official start boundary for signals right at the edge
-
-    valid_symbols = [s for s in CORE_COINS_SPEC if per_symbol.get(s) is not None]
-    if not valid_symbols:
-        print("No symbols had usable data. Aborting.")
-        return
-
-    global_times = sorted(global_time_set)
-    grid_index = {t: i for i, t in enumerate(global_times)}
+def run_strategy_sim(per_symbol, valid_symbols, global_times, official_start_ms, end_ms, tp_mult, sl_mult):
     grid_len = len(global_times)
-    print(f"\nGlobal 15m grid: {grid_len} ticks across {len(valid_symbols)} usable symbols")
-
-    for spec_name in valid_symbols:
-        d = per_symbol[spec_name]
-        aligned = align_to_grid(d["times"], {
-            "open": d["opens"], "close": d["closes"], "high": d["highs"], "low": d["lows"],
-            "ema9": d["ema9"], "ema21": d["ema21"], "ema50": d["ema50"], "atr": d["atr"], "adx": d["adx"],
-        }, grid_index)
-        d["grid"] = aligned
-
     balance = INITIAL_CAP
     positions = {s: None for s in valid_symbols}
     cooldown_until = {s: -1 for s in valid_symbols}
     trades = []
     filter_counts = defaultdict(int)
-    fill_drifts = []
 
     for slot in range(grid_len):
         t = global_times[slot]
@@ -341,28 +287,17 @@ def main():
             if h is None or l is None:
                 continue
 
-            hit_tp = False
-            hit_sl = False
+            exit_price = None
             if pos["dir"] == "long":
-                hit_tp = h >= pos["tp"]
-                hit_sl = l <= pos["sl"]
+                if l <= pos["sl"]:
+                    exit_price = pos["sl"] * (1 - SLIPPAGE)
+                elif h >= pos["tp"]:
+                    exit_price = pos["tp"] * (1 - SLIPPAGE)
             else:
-                hit_tp = l <= pos["tp"]
-                hit_sl = h >= pos["sl"]
-
-            if hit_tp and hit_sl:
-                # both hit same candle -> per spec, count as LOSS at SL price
-                exit_price = pos["sl"]
-                is_win = False
-            elif hit_sl:
-                exit_price = pos["sl"]
-                is_win = False
-            elif hit_tp:
-                exit_price = pos["tp"]
-                is_win = True
-            else:
-                exit_price = None
-                is_win = None
+                if h >= pos["sl"]:
+                    exit_price = pos["sl"] * (1 + SLIPPAGE)
+                elif l <= pos["tp"]:
+                    exit_price = pos["tp"] * (1 + SLIPPAGE)
 
             if exit_price is not None:
                 size = pos["size"]
@@ -373,19 +308,16 @@ def main():
                 exit_fee = size * exit_price * FEE_TAKER
                 net_pnl = raw_pnl - exit_fee - pos["entry_fee"]
                 balance += net_pnl
-                margin_used = (size * pos["entry"]) / pos["leverage"]
                 trades.append({
                     "symbol": spec_name, "dir": pos["dir"], "entry": pos["entry"],
                     "exit": exit_price, "entry_t": pos["entry_t"], "exit_t": t,
-                    "pnl": net_pnl, "win": net_pnl > 0, "hit_tp": is_win,
+                    "pnl": net_pnl, "win": net_pnl > 0,
                     "dur": (t - pos["entry_t"]) / 60000.0,
-                    "margin_used": margin_used,
-                    "margin_pct": (net_pnl / margin_used * 100.0) if margin_used > 0 else 0.0,
                 })
                 positions[spec_name] = None
                 cooldown_until[spec_name] = t + COOLDOWN_MS
 
-        # ---- Step B: signal detection (fires on THIS candle's close, fills NEXT candle) ----
+        # ---- Step B: entries (same-candle execution, matches live bot) ----
         for spec_name in valid_symbols:
             if positions[spec_name] is not None:
                 continue
@@ -395,7 +327,7 @@ def main():
             close = g["close"][slot]
             if close is None:
                 continue
-            if slot < SLOPE_LOOKBACK or slot + 1 >= grid_len:
+            if slot < SLOPE_LOOKBACK:
                 continue
 
             adx_v = g["adx"][slot]
@@ -418,26 +350,24 @@ def main():
             slope_pct = (ema50_v - ema50_lb) / ema50_lb * 100.0 if ema50_lb != 0 else 0.0
             bullish_cross = ema9_p <= ema21_p and ema9_v > ema21_v
             bearish_cross = ema9_p >= ema21_p and ema9_v < ema21_v
+            trend_up = slope_pct > SLOPE_THRESHOLD
+            trend_down = slope_pct < -SLOPE_THRESHOLD
 
             direction = None
-            if slope_pct > SLOPE_THRESHOLD:
-                if not bullish_cross:
-                    filter_counts["WAIT_UP"] += 1
-                    continue
-                direction = "long"
-            elif slope_pct < -SLOPE_THRESHOLD:
-                if not bearish_cross:
-                    filter_counts["WAIT_DOWN"] += 1
-                    continue
-                direction = "short"
-            else:
+            if not (trend_up or trend_down):
                 filter_counts["NO_TREND"] += 1
                 continue
-
-            # ---- fill on NEXT candle's open ----
-            next_open = g["open"][slot + 1]
-            if next_open is None:
-                filter_counts["NO_NEXT_CANDLE_SKIP"] += 1
+            elif trend_up and not bullish_cross:
+                filter_counts["WAIT_UP"] += 1
+                continue
+            elif trend_down and not bearish_cross:
+                filter_counts["WAIT_DOWN"] += 1
+                continue
+            elif trend_up and bullish_cross:
+                direction = "long"
+            elif trend_down and bearish_cross:
+                direction = "short"
+            else:
                 continue
 
             filter_counts["SIGNALS_GENERATED"] += 1
@@ -447,145 +377,211 @@ def main():
                 continue
             leverage, pct = get_leverage_and_pct(balance)
 
-            slip = per_symbol[spec_name]["slippage"]
-            fill_price = next_open * (1 + slip) if direction == "long" else next_open * (1 - slip)
-
-            signal_price = close
-            fill_drifts.append(abs(fill_price - signal_price) / signal_price * 100.0)
-
-            raw_qty = (balance * pct * leverage) / fill_price
+            entry_raw = close
+            entry_price = entry_raw * (1 + SLIPPAGE) if direction == "long" else entry_raw * (1 - SLIPPAGE)
+            raw_qty = (balance * pct * leverage) / entry_price
             if raw_qty <= 0:
                 filter_counts["ZERO_QTY_SKIP"] += 1
                 continue
 
+            tp_dist = tp_mult * atr_v
+            sl_dist = sl_mult * atr_v
             if direction == "long":
-                tp = fill_price * (1 + TP_ROI / leverage)
-                sl = fill_price - (SL_ATR_MULT * atr_v)
+                tp = entry_price + tp_dist
+                sl = entry_price - sl_dist
             else:
-                tp = fill_price * (1 - TP_ROI / leverage)
-                sl = fill_price + (SL_ATR_MULT * atr_v)
+                tp = entry_price - tp_dist
+                sl = entry_price + sl_dist
 
-            entry_fee = raw_qty * fill_price * FEE_TAKER
-            fill_t = global_times[slot + 1]
+            entry_fee = raw_qty * entry_price * FEE_TAKER
 
             positions[spec_name] = {
-                "dir": direction, "entry": fill_price, "sl": sl, "tp": tp,
-                "entry_t": fill_t, "size": raw_qty, "entry_fee": entry_fee,
+                "dir": direction, "entry": entry_price, "sl": sl, "tp": tp,
+                "entry_t": t, "size": raw_qty, "entry_fee": entry_fee,
                 "leverage": leverage, "pct": pct,
             }
-            cooldown_until[spec_name] = fill_t + COOLDOWN_MS
 
-    # ================================================================================
-    # 7. METRICS
-    # ================================================================================
-    def compute_metrics(trade_list, label):
-        n = len(trade_list)
-        if n == 0:
-            return {"label": label, "n": 0, "wr": 0.0, "pf": 0.0, "net": 0.0, "net_pct": 0.0,
-                     "mdd": 0.0, "sharpe": 0.0, "aw": 0.0, "al": 0.0, "aw_margin_pct": 0.0,
-                     "al_margin_pct": 0.0, "exp": 0.0, "dur": 0.0, "nlongs": 0, "nshorts": 0,
-                     "lwr": 0.0, "swr": 0.0, "monthly": {}, "maxcw": 0, "maxcl": 0, "gp": 0.0,
-                     "gl": 0.0, "trades_per_day": 0.0}
-        wins = [tr for tr in trade_list if tr["win"]]
-        losses = [tr for tr in trade_list if not tr["win"]]
-        gp = sum(tr["pnl"] for tr in wins)
-        gl = abs(sum(tr["pnl"] for tr in losses))
-        net = sum(tr["pnl"] for tr in trade_list)
-        pf = (gp / gl) if gl > 0 else (999.0 if gp > 0 else 0.0)
-        wr = 100.0 * len(wins) / n
+    return trades, filter_counts, balance
 
-        eq = INITIAL_CAP
-        peak = eq
-        mdd = 0.0
-        for tr in sorted(trade_list, key=lambda x: x["exit_t"]):
-            eq += tr["pnl"]
-            peak = max(peak, eq)
-            dd = (peak - eq) / peak * 100.0 if peak > 0 else 0.0
-            mdd = max(mdd, dd)
 
-        aw = (gp / len(wins)) if wins else 0.0
-        al = (gl / len(losses)) if losses else 0.0
-        aw_m = statistics.mean([tr["margin_pct"] for tr in wins]) if wins else 0.0
-        al_m = statistics.mean([tr["margin_pct"] for tr in losses]) if losses else 0.0
-        expct = net / n
-        rets = [tr["pnl"] / INITIAL_CAP for tr in trade_list]
-        sharpe = (statistics.mean(rets) / statistics.pstdev(rets) * math.sqrt(n)) if len(rets) > 1 and statistics.pstdev(rets) > 0 else 0.0
-        durs = [tr["dur"] for tr in trade_list]
-        avg_dur = statistics.mean(durs) if durs else 0.0
-        longs = [tr for tr in trade_list if tr["dir"] == "long"]
-        shorts = [tr for tr in trade_list if tr["dir"] == "short"]
-        lwr = 100.0 * sum(1 for tr in longs if tr["win"]) / len(longs) if longs else 0.0
-        swr = 100.0 * sum(1 for tr in shorts if tr["win"]) / len(shorts) if shorts else 0.0
+# ================================================================================
+# 7. METRICS
+# ================================================================================
+def compute_metrics(trade_list, label, official_start_ms, end_ms):
+    n = len(trade_list)
+    if n == 0:
+        return {"label": label, "n": 0, "wr": 0.0, "pf": 0.0, "net": 0.0, "net_pct": 0.0,
+                "mdd": 0.0, "sharpe": 0.0, "aw": 0.0, "al": 0.0, "exp": 0.0, "dur": 0.0,
+                "nlongs": 0, "nshorts": 0, "lwr": 0.0, "swr": 0.0, "monthly": {},
+                "maxcw": 0, "maxcl": 0, "gp": 0.0, "gl": 0.0, "trades_per_day": 0.0}
+    wins = [tr for tr in trade_list if tr["win"]]
+    losses = [tr for tr in trade_list if not tr["win"]]
+    gp = sum(tr["pnl"] for tr in wins)
+    gl = abs(sum(tr["pnl"] for tr in losses))
+    net = sum(tr["pnl"] for tr in trade_list)
+    pf = (gp / gl) if gl > 0 else (999.0 if gp > 0 else 0.0)
+    wr = 100.0 * len(wins) / n
 
-        monthly = defaultdict(float)
-        for tr in trade_list:
-            dt = datetime.datetime.utcfromtimestamp(tr["exit_t"] / 1000.0)
-            monthly[f"{dt.year}-{dt.month:02d}"] += tr["pnl"]
+    eq = INITIAL_CAP
+    peak = eq
+    mdd = 0.0
+    for tr in sorted(trade_list, key=lambda x: x["exit_t"]):
+        eq += tr["pnl"]
+        peak = max(peak, eq)
+        dd = (peak - eq) / peak * 100.0 if peak > 0 else 0.0
+        mdd = max(mdd, dd)
 
-        maxcw = cw = 0
-        maxcl = cl = 0
-        for tr in sorted(trade_list, key=lambda x: x["exit_t"]):
-            if tr["win"]:
-                cw += 1; cl = 0
-            else:
-                cl += 1; cw = 0
-            maxcw = max(maxcw, cw)
-            maxcl = max(maxcl, cl)
+    aw = (gp / len(wins)) if wins else 0.0
+    al = (gl / len(losses)) if losses else 0.0
+    expct = net / n
+    rets = [tr["pnl"] / INITIAL_CAP for tr in trade_list]
+    sharpe = (statistics.mean(rets) / statistics.pstdev(rets) * math.sqrt(n)) if len(rets) > 1 and statistics.pstdev(rets) > 0 else 0.0
+    durs = [tr["dur"] for tr in trade_list]
+    avg_dur = statistics.mean(durs) if durs else 0.0
+    longs = [tr for tr in trade_list if tr["dir"] == "long"]
+    shorts = [tr for tr in trade_list if tr["dir"] == "short"]
+    lwr = 100.0 * sum(1 for tr in longs if tr["win"]) / len(longs) if longs else 0.0
+    swr = 100.0 * sum(1 for tr in shorts if tr["win"]) / len(shorts) if shorts else 0.0
 
-        span_days = max(1.0, (end_ms - official_start_ms) / 86400000.0)
-        return {
-            "label": label, "n": n, "wr": round(wr, 2),
-            "pf": round(pf, 4) if pf != 999.0 else 999.0,
-            "net": round(net, 2), "net_pct": round(100.0 * net / INITIAL_CAP, 2),
-            "mdd": round(mdd, 2), "sharpe": round(sharpe, 3),
-            "aw": round(aw, 2), "al": round(al, 2),
-            "aw_margin_pct": round(aw_m, 2), "al_margin_pct": round(al_m, 2),
-            "exp": round(expct, 2), "dur": round(avg_dur, 1),
-            "nlongs": len(longs), "nshorts": len(shorts), "lwr": round(lwr, 2), "swr": round(swr, 2),
-            "monthly": dict(sorted(monthly.items())), "maxcw": maxcw, "maxcl": maxcl,
-            "gp": round(gp, 2), "gl": round(gl, 2), "trades_per_day": round(n / span_days, 2),
+    monthly = defaultdict(float)
+    for tr in trade_list:
+        dt = datetime.datetime.utcfromtimestamp(tr["exit_t"] / 1000.0)
+        monthly[f"{dt.year}-{dt.month:02d}"] += tr["pnl"]
+
+    maxcw = cw = 0
+    maxcl = cl = 0
+    for tr in sorted(trade_list, key=lambda x: x["exit_t"]):
+        if tr["win"]:
+            cw += 1; cl = 0
+        else:
+            cl += 1; cw = 0
+        maxcw = max(maxcw, cw)
+        maxcl = max(maxcl, cl)
+
+    span_days = max(1.0, (end_ms - official_start_ms) / 86400000.0)
+    breakeven_wr = round(100.0 * al / (aw + al), 2) if (aw + al) > 0 else 0.0
+    return {
+        "label": label, "n": n, "wr": round(wr, 2),
+        "pf": round(pf, 4) if pf != 999.0 else 999.0,
+        "net": round(net, 2), "net_pct": round(100.0 * net / INITIAL_CAP, 2),
+        "mdd": round(mdd, 2), "sharpe": round(sharpe, 3),
+        "aw": round(aw, 2), "al": round(al, 2), "breakeven_wr": breakeven_wr,
+        "exp": round(expct, 2), "dur": round(avg_dur, 1),
+        "nlongs": len(longs), "nshorts": len(shorts), "lwr": round(lwr, 2), "swr": round(swr, 2),
+        "monthly": dict(sorted(monthly.items())), "maxcw": maxcw, "maxcl": maxcl,
+        "gp": round(gp, 2), "gl": round(gl, 2), "trades_per_day": round(n / span_days, 2),
+    }
+
+
+# ================================================================================
+# 8. MAIN
+# ================================================================================
+def main():
+    now = datetime.datetime.utcnow()
+    end_dt = now
+    start_dt = end_dt - datetime.timedelta(days=365 * YEARS_BACK)
+    official_start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+    fetch_start_ms = official_start_ms - WARMUP_BARS * INTERVAL_MS
+
+    print("=" * 80)
+    print("BACKTEST START - Live Bot Strategy, 3 TP/SL ATR-multiplier variants")
+    print(f"Window: {start_dt.isoformat()} -> {end_dt.isoformat()} UTC")
+    print("=" * 80)
+
+    # ---- fetch + indicators ONCE, reused across all 3 strategies ----
+    per_symbol = {}
+    global_time_set = set()
+
+    for spec_name, fetch_sym in SYMBOLS:
+        print(f"\nFetching {fetch_sym} ({spec_name}) ...")
+        raw = fetch(fetch_sym, fetch_start_ms, end_ms)
+        print(f"  -> {len(raw)} candles")
+        if len(raw) < 250:
+            print(f"  [SKIP] {spec_name}: insufficient data")
+            per_symbol[spec_name] = None
+            continue
+        opens, highs, lows, closes, volumes, times = parse(raw)
+
+        ema9 = ema(closes, 9)
+        ema21 = ema(closes, 21)
+        ema50 = ema(closes, 50)
+        atr14 = atr(highs, lows, closes, 14)
+        adx14 = adx_dmi(highs, lows, closes, 14)
+
+        per_symbol[spec_name] = {
+            "times": times, "closes": closes, "highs": highs, "lows": lows,
+            "ema9": ema9, "ema21": ema21, "ema50": ema50, "atr": atr14, "adx": adx14,
+        }
+        global_time_set.update(t for t in times if t >= official_start_ms)
+
+    valid_symbols = [s for s in CORE_COINS_SPEC if per_symbol.get(s) is not None]
+    if not valid_symbols:
+        print("No symbols had usable data. Aborting.")
+        return
+
+    global_times = sorted(global_time_set)
+    grid_index = {t: i for i, t in enumerate(global_times)}
+    print(f"\nGlobal 15m grid: {len(global_times)} ticks across {len(valid_symbols)} usable symbols")
+
+    for spec_name in valid_symbols:
+        d = per_symbol[spec_name]
+        aligned = align_to_grid(d["times"], {
+            "close": d["closes"], "high": d["highs"], "low": d["lows"],
+            "ema9": d["ema9"], "ema21": d["ema21"], "ema50": d["ema50"],
+            "atr": d["atr"], "adx": d["adx"],
+        }, grid_index)
+        d["grid"] = aligned
+
+    all_results = {}
+    for strat_name, cfg in STRATEGIES.items():
+        print(f"\n{'='*80}\nRunning {strat_name} (TP={cfg['tp_mult']}x ATR, SL={cfg['sl_mult']}x ATR)\n{'='*80}")
+        trades, filter_counts, final_balance = run_strategy_sim(
+            per_symbol, valid_symbols, global_times, official_start_ms, end_ms,
+            cfg["tp_mult"], cfg["sl_mult"]
+        )
+        per_coin_metrics = []
+        for spec_name in valid_symbols:
+            coin_trades = [tr for tr in trades if tr["symbol"] == spec_name]
+            per_coin_metrics.append(compute_metrics(coin_trades, spec_name, official_start_ms, end_ms))
+        per_coin_metrics.sort(key=lambda x: x["pf"], reverse=True)
+        aggregate = compute_metrics(trades, "AGGREGATE", official_start_ms, end_ms)
+        pf_pass = sum(1 for c in per_coin_metrics if c["pf"] >= 1.5)
+        wr_pass = sum(1 for c in per_coin_metrics if c["wr"] >= 42)
+        print(f"  trades={aggregate['n']} WR={aggregate['wr']}% PF={aggregate['pf']} "
+              f"Net={aggregate['net_pct']}% MDD={aggregate['mdd']}% FinalBal=${final_balance:,.2f}")
+
+        all_results[strat_name] = {
+            "tp_mult": cfg["tp_mult"], "sl_mult": cfg["sl_mult"],
+            "aggregate": aggregate, "per_coin": per_coin_metrics,
+            "filters": dict(filter_counts), "final_balance": round(final_balance, 2),
+            "validation": {"pf_target": 1.5, "wr_target": 42, "pf_pass_count": pf_pass,
+                           "wr_pass_count": wr_pass, "total_coins": len(per_coin_metrics)},
         }
 
-    per_coin_metrics = []
-    for spec_name in valid_symbols:
-        coin_trades = [tr for tr in trades if tr["symbol"] == spec_name]
-        per_coin_metrics.append(compute_metrics(coin_trades, spec_name))
-    per_coin_metrics.sort(key=lambda x: x["pf"], reverse=True)
-    aggregate = compute_metrics(trades, "AGGREGATE")
-    avg_drift = statistics.mean(fill_drifts) if fill_drifts else 0.0
-
-    pf_pass = sum(1 for c in per_coin_metrics if c["pf"] >= 1.40)
-    wr_pass = sum(1 for c in per_coin_metrics if c["wr"] >= 65)
-
+    # ---- write report ----
     report = {
         "generated": now.isoformat(),
         "config": {
-            "initial_cap": INITIAL_CAP, "fee_taker": FEE_TAKER, "years_back": YEARS_BACK,
-            "window_start": start_dt.isoformat(), "window_end": end_dt.isoformat(),
+            "initial_cap": INITIAL_CAP, "fee_taker": FEE_TAKER, "slippage": SLIPPAGE,
+            "years_back": YEARS_BACK, "window_start": start_dt.isoformat(), "window_end": end_dt.isoformat(),
             "symbols_used": valid_symbols, "symbols_skipped": [s for s in CORE_COINS_SPEC if s not in valid_symbols],
-            "tp_roi": TP_ROI, "sl_atr_mult": SL_ATR_MULT, "avg_signal_to_fill_drift_pct": round(avg_drift, 4),
+            "entry_logic": "ADX>=22 + 50EMA slope(10bar,0.05%) + EMA9/21 cross (matches live bot exactly)",
         },
-        "aggregate": aggregate,
-        "per_coin": per_coin_metrics,
-        "filters": dict(filter_counts),
-        "final_balance": round(balance, 2),
-        "validation": {"pf_target": 1.40, "wr_target": 65, "pf_pass_count": pf_pass, "wr_pass_count": wr_pass,
-                       "total_coins": len(per_coin_metrics),
-                       "baseline_v60_pf": 1.01, "baseline_v60_wr": 42,
-                       "baseline_v61_pf": 0.81, "baseline_v61_wr": 37},
+        "strategies": all_results,
     }
     with open("backtest_report.json", "w") as f:
         json.dump(report, f, indent=2, default=str)
 
     lines = []
     lines.append("=" * 80)
-    lines.append("BACKTEST SUMMARY - v6.2 ADX-EMA Scalper (Fill-Price Fixed, shared portfolio, 30 coins)")
+    lines.append("BACKTEST SUMMARY - Live Bot Strategy, 3 TP/SL ATR-multiplier variants")
     lines.append(f"Generated: {now.isoformat()} UTC")
     lines.append(f"Window: {start_dt.date()} -> {end_dt.date()} ({YEARS_BACK} years)")
-    lines.append(f"Initial Capital: ${INITIAL_CAP:,.2f} (single shared balance across all symbols)")
-    lines.append(f"Fees: Taker {FEE_TAKER*100:.2f}% per side | Slippage: 0.01% BTC/ETH, 0.02% majors, 0.05% memes")
-    lines.append(f"TP: 5% ROI on margin | SL: 2x ATR14 from fill price")
-    lines.append(f"Fill model: signal at candle close -> filled at NEXT candle's open + slippage")
+    lines.append(f"Initial Capital: ${INITIAL_CAP:,.2f} (single shared balance per strategy, across all symbols)")
+    lines.append(f"Entry logic (identical across all 3): ADX>=22 + 50EMA slope(10bar,0.05%) + EMA9/21 cross")
+    lines.append(f"Fees/slippage added for realism (not in live bot code): Taker {FEE_TAKER*100:.2f}%/side, Slippage {SLIPPAGE*100:.2f}%")
+    lines.append(f"Leverage/position tiers (from live bot): <$10=10x/30% | $10-50=10x/10% | >$50=5x/10%")
     lines.append("=" * 80)
     lines.append("")
     lines.append(f"Symbols used ({len(valid_symbols)}/30): {', '.join(valid_symbols)}")
@@ -593,39 +589,42 @@ def main():
     if skipped:
         lines.append(f"Symbols skipped (insufficient data): {', '.join(skipped)}")
     lines.append("")
-    lines.append(f"FINAL BALANCE: ${balance:,.2f} (started at ${INITIAL_CAP:,.2f})")
-    lines.append(f"Avg signal-to-fill drift: {avg_drift:.4f}%")
+
+    lines.append("QUICK COMPARISON TABLE")
+    lines.append(f"  {'STRATEGY':<20}{'TP/SL':<12}{'TRADES':>8}{'WR%':>8}{'PF':>8}{'NET%':>10}{'MDD%':>8}{'FINAL BAL':>12}")
+    for strat_name, res in all_results.items():
+        agg = res["aggregate"]
+        tpsl = f"{res['tp_mult']}x/{res['sl_mult']}x"
+        lines.append(f"  {strat_name:<20}{tpsl:<12}{agg['n']:>8}{agg['wr']:>8}{agg['pf']:>8}{agg['net_pct']:>10}{agg['mdd']:>8}{'$'+format(res['final_balance'],',.2f'):>12}")
     lines.append("")
-    lines.append(f"AGGREGATE: trades={aggregate['n']} | WR={aggregate['wr']}% | PF={aggregate['pf']} | "
-                  f"Net={aggregate['net_pct']}% (${aggregate['net']:,.2f}) | MaxDD={aggregate['mdd']}% | "
-                  f"Trades/day={aggregate['trades_per_day']}")
-    lines.append(f"Avg Win: ${aggregate['aw']} ({aggregate['aw_margin_pct']}% margin) | "
-                  f"Avg Loss: ${aggregate['al']} ({aggregate['al_margin_pct']}% margin)")
-    lines.append(f"VALIDATION: PF>=1.40 on {pf_pass}/{len(per_coin_metrics)} coins | WR>=65% on {wr_pass}/{len(per_coin_metrics)} coins")
-    lines.append(f"COMPARISON: v6.0 live WR~42%/PF~1.01 | v6.1 backtest WR~37%/PF~0.81")
-    lines.append("")
-    lines.append("FILTER / REJECTION STATS (aggregate across all symbols):")
-    for k in ["ADX_LOW", "NO_TREND", "WAIT_UP", "WAIT_DOWN", "NO_NEXT_CANDLE_SKIP",
-              "BALANCE_FLOOR_SKIP", "ZERO_QTY_SKIP", "SIGNALS_GENERATED"]:
-        lines.append(f"  {k}: {filter_counts.get(k, 0)}")
-    lines.append("")
-    lines.append("PER-COIN TABLE (sorted by PF descending):")
-    lines.append(f"  {'SYMBOL':<14}{'TRADES':>8}{'WR%':>8}{'PF':>8}{'NET%':>10}{'MDD%':>8}{'T/DAY':>8}{'AVGWIN':>10}{'AVGLOSS':>10}")
-    for c in per_coin_metrics:
-        lines.append(f"  {c['label']:<14}{c['n']:>8}{c['wr']:>8}{c['pf']:>8}{c['net_pct']:>10}{c['mdd']:>8}{c['trades_per_day']:>8}{c['aw']:>10}{c['al']:>10}")
-    lines.append("")
-    lines.append("MONTHLY PNL (aggregate):")
-    for month, pnl in aggregate["monthly"].items():
-        lines.append(f"  {month}: ${pnl:,.2f}")
-    lines.append("")
-    lines.append("=" * 80)
-    lines.append("DESIRED OUTPUTS RECAP")
-    lines.append("=" * 80)
-    lines.append(f"AGGREGATE: NetPnL={aggregate['net_pct']}% | WR={aggregate['wr']}% | PF={aggregate['pf']} | "
-                  f"AvgWin=${aggregate['aw']} ({aggregate['aw_margin_pct']}%) | "
-                  f"AvgLoss=${aggregate['al']} ({aggregate['al_margin_pct']}%) | Expectancy=${aggregate['exp']} | "
-                  f"MaxDD={aggregate['mdd']}% | Sharpe={aggregate['sharpe']} | Trades={aggregate['n']} | "
-                  f"Trades/day={aggregate['trades_per_day']} | AvgFillDrift={avg_drift:.4f}%")
+
+    for strat_name, res in all_results.items():
+        lines.append("-" * 80)
+        lines.append(f"STRATEGY: {strat_name}  (TP={res['tp_mult']}x ATR / SL={res['sl_mult']}x ATR)")
+        lines.append("-" * 80)
+        agg = res["aggregate"]
+        lines.append(f"AGGREGATE: trades={agg['n']} | WR={agg['wr']}% | PF={agg['pf']} | "
+                      f"Net={agg['net_pct']}% (${agg['net']:,.2f}) | MaxDD={agg['mdd']}% | Trades/day={agg['trades_per_day']}")
+        lines.append(f"Avg Win: ${agg['aw']} | Avg Loss: ${agg['al']} | Breakeven WR needed: {agg['breakeven_wr']}%")
+        lines.append(f"Final Balance: ${res['final_balance']:,.2f} (started at ${INITIAL_CAP:,.2f})")
+        v = res["validation"]
+        lines.append(f"VALIDATION: PF>=1.5 on {v['pf_pass_count']}/{v['total_coins']} coins | WR>=42% on {v['wr_pass_count']}/{v['total_coins']} coins")
+        lines.append("")
+        lines.append("Filter stats:")
+        f = res["filters"]
+        for k in ["ADX_LOW", "NO_TREND", "WAIT_UP", "WAIT_DOWN", "BALANCE_FLOOR_SKIP", "ZERO_QTY_SKIP", "SIGNALS_GENERATED"]:
+            lines.append(f"  {k}: {f.get(k, 0)}")
+        lines.append("")
+        lines.append("Per-coin table (sorted by PF descending):")
+        lines.append(f"  {'SYMBOL':<14}{'TRADES':>8}{'WR%':>8}{'PF':>8}{'NET%':>10}{'MDD%':>8}{'AVGWIN':>10}{'AVGLOSS':>10}")
+        for c in res["per_coin"]:
+            lines.append(f"  {c['label']:<14}{c['n']:>8}{c['wr']:>8}{c['pf']:>8}{c['net_pct']:>10}{c['mdd']:>8}{c['aw']:>10}{c['al']:>10}")
+        lines.append("")
+        lines.append("Monthly PnL:")
+        for month, pnl in agg["monthly"].items():
+            lines.append(f"  {month}: ${pnl:,.2f}")
+        lines.append("")
+
     lines.append("=" * 80)
     lines.append("END OF SUMMARY")
     lines.append("=" * 80)
