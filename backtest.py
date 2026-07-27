@@ -357,34 +357,34 @@ def run_strategy(symbol, opens, highs, lows, closes, volumes, times, balance_sta
     for i in range(50, n):
         fc["total_candles"] += 1
 
-        # Auto-disable check
+        # Auto-disable check (only fully closed trades — pnl not None)
         if paused_at is None:
-            closed = [t for t in trades]
+            closed = [t for t in trades if t["pnl"] is not None]
             ntrades = len(closed)
-            if ntrades >= 10 and paused_at is None:
+            if ntrades >= 10:
                 wr = sum(1 for t in closed if t["win"]) / ntrades
-                wins  = [t["pnl"] for t in closed if t["win"]]
-                losses= [abs(t["pnl"]) for t in closed if not t["win"]]
+                wins   = [t["pnl"] for t in closed if t["win"]]
+                losses = [abs(t["pnl"]) for t in closed if not t["win"]]
                 gp = sum(wins)
                 gl = sum(losses)
                 pf = gp / gl if gl > 0 else (999 if gp > 0 else 0)
                 if wr < 0.35 or pf < 0.8:
                     paused_at = 10
                     break
-            if ntrades >= 20 and paused_at is None:
+            if ntrades >= 20:
                 wr = sum(1 for t in closed if t["win"]) / ntrades
-                wins  = [t["pnl"] for t in closed if t["win"]]
-                losses= [abs(t["pnl"]) for t in closed if not t["win"]]
+                wins   = [t["pnl"] for t in closed if t["win"]]
+                losses = [abs(t["pnl"]) for t in closed if not t["win"]]
                 gp = sum(wins)
                 gl = sum(losses)
                 pf = gp / gl if gl > 0 else (999 if gp > 0 else 0)
                 if wr < 0.40 or pf < 1.0:
                     paused_at = 20
                     break
-            if ntrades >= 30 and paused_at is None:
+            if ntrades >= 30:
                 wr = sum(1 for t in closed if t["win"]) / ntrades
-                wins  = [t["pnl"] for t in closed if t["win"]]
-                losses= [abs(t["pnl"]) for t in closed if not t["win"]]
+                wins   = [t["pnl"] for t in closed if t["win"]]
+                losses = [abs(t["pnl"]) for t in closed if not t["win"]]
                 gp = sum(wins)
                 gl = sum(losses)
                 pf = gp / gl if gl > 0 else (999 if gp > 0 else 0)
