@@ -1,34 +1,29 @@
-name: Run Backtest
+name: SuperTrend v8 Backtest
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - 'backtest.py'
+  workflow_dispatch: {}
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 350
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Run backtest
         run: python backtest.py
 
-      - name: Upload results as artifact
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results-${{ github.run_number }}
+          name: backtest-v8-results
           path: |
-            backtest_report.json
             backtest_summary.txt
-          retention-days: 30
+            backtest_report.json
+          if-no-files-found: warn
