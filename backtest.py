@@ -1,8 +1,13 @@
 """
-BACKTEST V6 — LIQUIDITY SWEEP REVERSAL + RSI DIVERGENCE + EMA21 BOUNCE
+BACKTEST V6 — FIXED — LIQUIDITY SWEEP REVERSAL + RSI DIVERGENCE + EMA21 BOUNCE
 400 Coins | 1 Year | 30M | Binance USDT-M Perpetuals
 6 Configurations: S1-A, S1-B, S1-C, S2-A, S2-B, S2-C
 10-coin parallel execution via ThreadPoolExecutor
+
+BUG FIX: Removed look-ahead bias from TP/SL.
+  BEFORE (BUGGED): TP = future swing high/low (read candles i+1 to i+N)
+  AFTER  (FIXED) : TP = entry ± 3×ATR | SL = entry ± 2×ATR
+  R:R = 1.5:1 fixed. No future data anywhere.
 """
 
 import json
@@ -327,15 +332,8 @@ def get_prev_swing_low(lows, end_idx, lookback):
     window = lows[start:mid]
     return min(window) if window else None
 
-def get_next_swing_low(lows, start_idx, lookback):
-    end = min(len(lows), start_idx + lookback)
-    window = lows[start_idx:end]
-    return min(window) if window else None
-
-def get_next_swing_high(highs, start_idx, lookback):
-    end = min(len(highs), start_idx + lookback)
-    window = highs[start_idx:end]
-    return max(window) if window else None
+# get_next_swing_low and get_next_swing_high REMOVED — look-ahead bias.
+# TP/SL now use fixed ATR multiples only (3×ATR TP, 2×ATR SL).
 
 # ═══════════════════════════════════════════════════════════
 # TRADE EXECUTION HELPERS
@@ -539,49 +537,46 @@ def run_s1(symbol, opens, highs, lows, closes, volumes, times, config):
                         # Bearish divergence: price higher high, RSI lower high
                         rsi_div = (highs[i] > (prev_sh or 0)) and (rsi_v < prev_rsi)
 
-                    # TP = next swing low
-                    tp_level = get_next_swing_low(lows, i + 1, SWING_TARGET_S1)
-                    sl_level = highs[i] + 0.5 * atr_v
+                    # Fixed ATR-based TP/SL — no future data
+                    entry    = closes[i] * (1 - FEE_RATE)
+                    sl_level = entry + (2 * atr_v)
+                    tp_level = entry - (3 * atr_v)
 
-                    if tp_level is None:
-                        filter_counts["s1_short_no_tp"] += 1
+                    if tp_level <= 0:
+                        filter_counts["s1_short_tp_invalid"] += 1
                     else:
-                        entry = closes[i] * (1 - FEE_RATE)
                         dist_sl = abs(sl_level - entry)
                         dist_tp = abs(entry - tp_level)
-                        if dist_tp <= 0 or (dist_sl > 0 and dist_tp / dist_sl < MIN_RR):
-                            filter_counts["s1_short_rr_fail"] += 1
-                        else:
-                            # Position sizing
-                            notional = FIXED_MARGIN * LEVERAGE
-                            if config == "C":
-                                notional = FIXED_MARGIN_SHORT_HEAVY * LEVERAGE
-                            qty = notional / entry
-                            risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
-                            qty = min(qty, risk_cap_qty)
+                        # Position sizing
+                        notional = FIXED_MARGIN * LEVERAGE
+                        if config == "C":
+                            notional = FIXED_MARGIN_SHORT_HEAVY * LEVERAGE
+                        qty = notional / entry
+                        risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
+                        qty = min(qty, risk_cap_qty)
 
-                            exit_p, exit_bar, hit_tp = simulate_exit(
-                                "SHORT", entry, sl_level, tp_level,
-                                highs, lows, i + 1, n)
-                            if exit_p is None:
-                                exit_p = closes[-1]
-                                exit_bar = n - 1
-                                hit_tp = False
+                        exit_p, exit_bar, hit_tp = simulate_exit(
+                            "SHORT", entry, sl_level, tp_level,
+                            highs, lows, i + 1, n)
+                        if exit_p is None:
+                            exit_p = closes[-1]
+                            exit_bar = n - 1
+                            hit_tp = False
 
-                            pnl = calc_pnl("SHORT", entry, exit_p, qty)
-                            rr  = dist_tp / dist_sl if dist_sl > 0 else 0
+                        pnl = calc_pnl("SHORT", entry, exit_p, qty)
+                        rr  = dist_tp / dist_sl if dist_sl > 0 else 1.5
 
-                            trades.append({
-                                "dir": "SHORT", "entry": entry, "exit": exit_p,
-                                "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
-                                "pnl": pnl, "win": hit_tp,
-                                "sl": sl_level, "tp": tp_level,
-                                "rr": rr, "risk": dist_sl * qty,
-                                "rsi_div": rsi_div,
-                            })
-                            trade_exit_bar = exit_bar
-                            filter_counts["s1_short_trades"] += 1
-                            continue
+                        trades.append({
+                            "dir": "SHORT", "entry": entry, "exit": exit_p,
+                            "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
+                            "pnl": pnl, "win": hit_tp,
+                            "sl": sl_level, "tp": tp_level,
+                            "rr": rr, "risk": dist_sl * qty,
+                            "rsi_div": rsi_div,
+                        })
+                        trade_exit_bar = exit_bar
+                        filter_counts["s1_short_trades"] += 1
+                        continue
 
         # ── LONG SETUP ──
         if config in ("B", "C"):
@@ -595,39 +590,38 @@ def run_s1(symbol, opens, highs, lows, closes, volumes, times, config):
 
                 filter_counts["s1_long_scanned"] += 1
                 if swept and closed_above and wick_ok and vol_ok:
-                    tp_level = get_next_swing_high(highs, i + 1, SWING_TARGET_S1)
-                    sl_level = lows[i] - 0.5 * atr_v
+                    # Fixed ATR-based TP/SL — no future data
+                    entry    = closes[i] * (1 + FEE_RATE)
+                    sl_level = entry - (2 * atr_v)
+                    tp_level = entry + (3 * atr_v)
 
-                    if tp_level is not None:
-                        entry = closes[i] * (1 + FEE_RATE)
-                        dist_sl = abs(entry - sl_level)
-                        dist_tp = abs(tp_level - entry)
-                        if dist_tp > 0 and dist_sl > 0 and dist_tp / dist_sl >= MIN_RR:
-                            notional = FIXED_MARGIN * LEVERAGE
-                            qty = notional / entry
-                            risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
-                            qty = min(qty, risk_cap_qty)
+                    dist_sl = abs(entry - sl_level)
+                    dist_tp = abs(tp_level - entry)
+                    notional = FIXED_MARGIN * LEVERAGE
+                    qty = notional / entry
+                    risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
+                    qty = min(qty, risk_cap_qty)
 
-                            exit_p, exit_bar, hit_tp = simulate_exit(
-                                "LONG", entry, sl_level, tp_level,
-                                highs, lows, i + 1, n)
-                            if exit_p is None:
-                                exit_p = closes[-1]
-                                exit_bar = n - 1
-                                hit_tp = False
+                    exit_p, exit_bar, hit_tp = simulate_exit(
+                        "LONG", entry, sl_level, tp_level,
+                        highs, lows, i + 1, n)
+                    if exit_p is None:
+                        exit_p = closes[-1]
+                        exit_bar = n - 1
+                        hit_tp = False
 
-                            pnl = calc_pnl("LONG", entry, exit_p, qty)
-                            rr  = dist_tp / dist_sl
+                    pnl = calc_pnl("LONG", entry, exit_p, qty)
+                    rr  = dist_tp / dist_sl if dist_sl > 0 else 1.5
 
-                            trades.append({
-                                "dir": "LONG", "entry": entry, "exit": exit_p,
-                                "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
-                                "pnl": pnl, "win": hit_tp,
-                                "sl": sl_level, "tp": tp_level,
-                                "rr": rr, "risk": dist_sl * qty,
-                            })
-                            trade_exit_bar = exit_bar
-                            filter_counts["s1_long_trades"] += 1
+                    trades.append({
+                        "dir": "LONG", "entry": entry, "exit": exit_p,
+                        "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
+                        "pnl": pnl, "win": hit_tp,
+                        "sl": sl_level, "tp": tp_level,
+                        "rr": rr, "risk": dist_sl * qty,
+                    })
+                    trade_exit_bar = exit_bar
+                    filter_counts["s1_long_trades"] += 1
 
     return trades, dict(filter_counts), disabled
 
@@ -720,47 +714,44 @@ def run_s2(symbol, opens, highs, lows, closes, volumes, times, config):
             elif not vol_ok:
                 filter_counts["s2_short_vol_fail"] += 1
             else:
-                # Exit logic
-                tp_level = get_next_swing_low(lows, i + 1, SWING_TARGET_S2)
-                sl_level = price_hh + 0.5 * atr_v  # above the divergence high
+                # Fixed ATR-based TP/SL — no future data
+                entry    = closes[i] * (1 - FEE_RATE)
+                sl_level = entry + (2 * atr_v)
+                tp_level = entry - (3 * atr_v)
 
-                if tp_level is None:
-                    filter_counts["s2_short_no_tp"] += 1
+                if tp_level <= 0:
+                    filter_counts["s2_short_tp_invalid"] += 1
                 else:
-                    entry = closes[i] * (1 - FEE_RATE)
                     dist_sl = abs(sl_level - entry)
                     dist_tp = abs(entry - tp_level)
-                    if dist_tp <= 0 or dist_sl <= 0 or dist_tp / dist_sl < MIN_RR:
-                        filter_counts["s2_short_rr_fail"] += 1
-                    else:
-                        notional = FIXED_MARGIN * LEVERAGE
-                        if config == "C":
-                            notional = FIXED_MARGIN_SHORT_HEAVY * LEVERAGE
-                        qty = notional / entry
-                        risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
-                        qty = min(qty, risk_cap_qty)
+                    notional = FIXED_MARGIN * LEVERAGE
+                    if config == "C":
+                        notional = FIXED_MARGIN_SHORT_HEAVY * LEVERAGE
+                    qty = notional / entry
+                    risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
+                    qty = min(qty, risk_cap_qty)
 
-                        exit_p, exit_bar, hit_tp = simulate_exit(
-                            "SHORT", entry, sl_level, tp_level,
-                            highs, lows, i + 1, n)
-                        if exit_p is None:
-                            exit_p = closes[-1]
-                            exit_bar = n - 1
-                            hit_tp = False
+                    exit_p, exit_bar, hit_tp = simulate_exit(
+                        "SHORT", entry, sl_level, tp_level,
+                        highs, lows, i + 1, n)
+                    if exit_p is None:
+                        exit_p = closes[-1]
+                        exit_bar = n - 1
+                        hit_tp = False
 
-                        pnl = calc_pnl("SHORT", entry, exit_p, qty)
-                        rr  = dist_tp / dist_sl
+                    pnl = calc_pnl("SHORT", entry, exit_p, qty)
+                    rr  = dist_tp / dist_sl if dist_sl > 0 else 1.5
 
-                        trades.append({
-                            "dir": "SHORT", "entry": entry, "exit": exit_p,
-                            "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
-                            "pnl": pnl, "win": hit_tp,
-                            "sl": sl_level, "tp": tp_level,
-                            "rr": rr, "risk": dist_sl * qty,
-                        })
-                        trade_exit_bar = exit_bar
-                        filter_counts["s2_short_trades"] += 1
-                        continue
+                    trades.append({
+                        "dir": "SHORT", "entry": entry, "exit": exit_p,
+                        "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
+                        "pnl": pnl, "win": hit_tp,
+                        "sl": sl_level, "tp": tp_level,
+                        "rr": rr, "risk": dist_sl * qty,
+                    })
+                    trade_exit_bar = exit_bar
+                    filter_counts["s2_short_trades"] += 1
+                    continue
 
         # ── LONG SETUP ──
         if config in ("B", "C"):
@@ -777,39 +768,38 @@ def run_s2(symbol, opens, highs, lows, closes, volumes, times, config):
             vol_ok = vol_v > VOL_MULT_S2 * vol_s
 
             if price_made_ll and rsi_div_bull and touched_below and closed_above and bullish_candle and vol_ok:
-                tp_level = get_next_swing_high(highs, i + 1, SWING_TARGET_S2)
-                sl_level = price_ll - 0.5 * atr_v
+                # Fixed ATR-based TP/SL — no future data
+                entry    = closes[i] * (1 + FEE_RATE)
+                sl_level = entry - (2 * atr_v)
+                tp_level = entry + (3 * atr_v)
 
-                if tp_level is not None:
-                    entry = closes[i] * (1 + FEE_RATE)
-                    dist_sl = abs(entry - sl_level)
-                    dist_tp = abs(tp_level - entry)
-                    if dist_tp > 0 and dist_sl > 0 and dist_tp / dist_sl >= MIN_RR:
-                        notional = FIXED_MARGIN * LEVERAGE
-                        qty = notional / entry
-                        risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
-                        qty = min(qty, risk_cap_qty)
+                dist_sl = abs(entry - sl_level)
+                dist_tp = abs(tp_level - entry)
+                notional = FIXED_MARGIN * LEVERAGE
+                qty = notional / entry
+                risk_cap_qty = (INITIAL_CAP * RISK_PCT) / (dist_sl * LEVERAGE) if dist_sl > 0 else qty
+                qty = min(qty, risk_cap_qty)
 
-                        exit_p, exit_bar, hit_tp = simulate_exit(
-                            "LONG", entry, sl_level, tp_level,
-                            highs, lows, i + 1, n)
-                        if exit_p is None:
-                            exit_p = closes[-1]
-                            exit_bar = n - 1
-                            hit_tp = False
+                exit_p, exit_bar, hit_tp = simulate_exit(
+                    "LONG", entry, sl_level, tp_level,
+                    highs, lows, i + 1, n)
+                if exit_p is None:
+                    exit_p = closes[-1]
+                    exit_bar = n - 1
+                    hit_tp = False
 
-                        pnl = calc_pnl("LONG", entry, exit_p, qty)
-                        rr  = dist_tp / dist_sl
+                pnl = calc_pnl("LONG", entry, exit_p, qty)
+                rr  = dist_tp / dist_sl if dist_sl > 0 else 1.5
 
-                        trades.append({
-                            "dir": "LONG", "entry": entry, "exit": exit_p,
-                            "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
-                            "pnl": pnl, "win": hit_tp,
-                            "sl": sl_level, "tp": tp_level,
-                            "rr": rr, "risk": dist_sl * qty,
-                        })
-                        trade_exit_bar = exit_bar
-                        filter_counts["s2_long_trades"] += 1
+                trades.append({
+                    "dir": "LONG", "entry": entry, "exit": exit_p,
+                    "entry_t": times[i], "exit_t": times[min(exit_bar, n-1)],
+                    "pnl": pnl, "win": hit_tp,
+                    "sl": sl_level, "tp": tp_level,
+                    "rr": rr, "risk": dist_sl * qty,
+                })
+                trade_exit_bar = exit_bar
+                filter_counts["s2_long_trades"] += 1
 
     return trades, dict(filter_counts), disabled
 
@@ -1101,7 +1091,7 @@ def write_summary(all_coin_results, skipped, config_aggregates, outfile):
 
 def main():
     log("═"*60)
-    log("BACKTEST V6 — Starting")
+    log("BACKTEST V6 — FIXED (ATR-based TP/SL, no look-ahead)")
     log(f"Period : {START_DATE} → {END_DATE}")
     log(f"Interval: {INTERVAL}")
     log(f"Workers : 10 parallel")
