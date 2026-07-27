@@ -139,48 +139,72 @@ def atr(highs, lows, closes, period=14):
     return result
 
 def adx_full(highs, lows, closes, period=14):
+    """
+    Clean Wilder ADX implementation.
+    Uses straight arrays (no None mid-series gaps) — all raw values are numeric from bar 1.
+    Returns (adx, pdi, mdi) as lists, None before warmup period.
+    """
     n = len(closes)
-    pdm = [None]*n; mdm = [None]*n; tr_arr = [None]*n
+
+    # Raw DM / TR — all numeric from index 1
+    tr_raw  = [0.0] * n
+    pdm_raw = [0.0] * n
+    mdm_raw = [0.0] * n
+
     for i in range(1, n):
         up   = highs[i]  - highs[i-1]
         down = lows[i-1] - lows[i]
-        pdm[i] = up   if up > down and up > 0   else 0.0
-        mdm[i] = down if down > up and down > 0 else 0.0
-        tr_arr[i] = max(highs[i]-lows[i],
-                        abs(highs[i]-closes[i-1]),
-                        abs(lows[i]-closes[i-1]))
+        pdm_raw[i] = up   if (up > down and up > 0)   else 0.0
+        mdm_raw[i] = down if (down > up and down > 0) else 0.0
+        tr_raw[i]  = max(highs[i] - lows[i],
+                         abs(highs[i]  - closes[i-1]),
+                         abs(lows[i]   - closes[i-1]))
 
-    def wilder_smooth(arr, p):
-        res = [None]*n
-        vals = [x for x in arr if x is not None]
-        # find first non-None index
-        first = next((i for i,x in enumerate(arr) if x is not None), None)
-        if first is None or first + p - 1 >= n:
+    # Wilder smooth — first value is SMA of first `period` bars, then rolling
+    def wilder(raw, p):
+        res = [None] * n
+        if n < p + 1:
             return res
-        window_end = first + p - 1
-        res[window_end] = sum(arr[first:window_end+1]) / p
-        for i in range(window_end+1, n):
-            if arr[i] is None:
-                continue
-            res[i] = (res[i-1] * (p-1) + arr[i]) / p if res[i-1] is not None else arr[i]
+        # seed at index p (covers bars 1..p)
+        res[p] = sum(raw[1:p+1])          # Wilder uses sum for seed, not average
+        for i in range(p + 1, n):
+            res[i] = res[i-1] - (res[i-1] / p) + raw[i]
         return res
 
-    sptr  = wilder_smooth(tr_arr, period)
-    spdm  = wilder_smooth(pdm,    period)
-    smdm  = wilder_smooth(mdm,    period)
+    s_tr  = wilder(tr_raw,  period)
+    s_pdm = wilder(pdm_raw, period)
+    s_mdm = wilder(mdm_raw, period)
 
-    pdi = [None]*n; mdi = [None]*n; dx = [None]*n
-    for i in range(n):
-        if sptr[i] and sptr[i] != 0:
-            pdi[i] = 100 * spdm[i] / sptr[i] if spdm[i] is not None else None
-            mdi[i] = 100 * smdm[i] / sptr[i] if smdm[i] is not None else None
-        if pdi[i] is not None and mdi[i] is not None:
-            dsum = pdi[i] + mdi[i]
-            if dsum != 0:
-                dx[i] = 100 * abs(pdi[i] - mdi[i]) / dsum
+    pdi = [None] * n
+    mdi = [None] * n
+    dx  = [None] * n
 
-    adx_arr = wilder_smooth(dx, period)
-    return adx_arr, pdi, mdi
+    for i in range(period, n):
+        if s_tr[i] is None or s_tr[i] == 0:
+            continue
+        pdi[i] = 100.0 * s_pdm[i] / s_tr[i]
+        mdi[i] = 100.0 * s_mdm[i] / s_tr[i]
+        dsum = pdi[i] + mdi[i]
+        if dsum != 0:
+            dx[i] = 100.0 * abs(pdi[i] - mdi[i]) / dsum
+
+    # Second Wilder pass on DX to get ADX
+    adx = [None] * n
+    # seed at index period*2
+    seed_start = period
+    seed_end   = period * 2
+    if seed_end >= n:
+        return adx, pdi, mdi
+    valid_dx = [dx[i] for i in range(seed_start, seed_end + 1) if dx[i] is not None]
+    if len(valid_dx) < period:
+        return adx, pdi, mdi
+    adx[seed_end] = sum(valid_dx[-period:]) / period
+    for i in range(seed_end + 1, n):
+        if dx[i] is None or adx[i-1] is None:
+            continue
+        adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
+
+    return adx, pdi, mdi
 
 # ── SUPERTREND ─────────────────────────────────────────────────────────────────
 def supertrend(highs, lows, closes, atr_period=10, mult=3.0):
@@ -472,6 +496,9 @@ def run_strategy(symbol, h30_raw, h4_raw, use_htf_filter=True):
             continue
 
         # Filter 5: DI separation >= 8 and correct DI dominance
+        if pdi_arr[i] is None or mdi_arr[i] is None:
+            fc["di_sep"] += 1
+            continue
         if direction == "LONG":
             if pdi_arr[i] <= mdi_arr[i]:
                 fc["di_sep"] += 1
