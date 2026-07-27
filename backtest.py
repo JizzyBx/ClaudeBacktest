@@ -13,6 +13,7 @@ import time
 import datetime
 import urllib.request
 import urllib.error
+import concurrent.futures
 from collections import defaultdict
 
 # ============================================================================
@@ -125,6 +126,7 @@ MAX_CONCURRENT = 3               # portfolio-wide, across all coins
 COOLDOWN_MS = 5 * 60 * 1000      # 5 minutes per symbol after close
 RISK_CAP_PCT = 0.02
 MAX_HOLD_BARS = 500              # safety cap (~10 days on 30m) before force-close
+FETCH_WORKERS = 10               # parallel fetch threads (network-bound, so GIL isn't a bottleneck)
 STRUCT_SL_LOOKBACK = 20
 STRUCT_TP_LOOKBACK = 40
 STRUCT_MIN_RR = 1.5
@@ -644,6 +646,31 @@ def tier_of(m):
 # ============================================================================
 # 11. MAIN
 # ============================================================================
+def process_symbol(symbol, start_ms, end_ms):
+    """Fetch + parse + compute indicators for one symbol. Runs in a worker thread."""
+    try:
+        raw = fetch_klines(symbol, INTERVAL, start_ms, end_ms)
+        if len(raw) < MIN_CANDLES:
+            return symbol, None, f"insufficient_data({len(raw)})"
+        opens, highs, lows, closes, volumes, times = parse(raw)
+        signals, filt, ema21, atr14 = detect_signals(opens, highs, lows, closes, volumes)
+        # secondary pass with OLD (V4) RSI bounds, counting-only, for the RSI impact report
+        signals_old, _, _, _ = detect_signals(
+            opens, highs, lows, closes, volumes,
+            rsi_lo_long=40, rsi_hi_long=68, rsi_lo_short=32, rsi_hi_short=60)
+        data = {
+            "opens": opens, "highs": highs, "lows": lows, "closes": closes,
+            "volumes": volumes, "times": times, "signals": signals,
+            "filt": filt, "ema21": ema21, "atr14": atr14,
+            "signals_old_rsi_count": len(signals_old),
+        }
+        return symbol, data, None
+    except urllib.error.HTTPError as e:
+        return symbol, None, f"http_{e.code}"
+    except Exception as e:
+        return symbol, None, f"error:{e}"
+
+
 def main():
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - DAYS_BACK * 24 * 60 * 60 * 1000
@@ -652,35 +679,22 @@ def main():
     all_data = {}
     tested, skipped = [], []
 
-    print(f"=== V5 BACKTEST START — {len(COINS)} symbols in universe ===")
-    for i, symbol in enumerate(COINS):
-        try:
-            raw = fetch_klines(symbol, INTERVAL, start_ms, end_ms)
-            if len(raw) < MIN_CANDLES:
-                skipped.append((symbol, f"insufficient_data({len(raw)})"))
-                print(f"[{i+1}/{len(COINS)}] {symbol}: SKIP insufficient data ({len(raw)} candles)")
-                continue
-            opens, highs, lows, closes, volumes, times = parse(raw)
-            signals, filt, ema21, atr14 = detect_signals(opens, highs, lows, closes, volumes)
-            # secondary pass with OLD (V4) RSI bounds, counting-only, for the RSI impact report
-            signals_old, filt_old, _, _ = detect_signals(
-                opens, highs, lows, closes, volumes,
-                rsi_lo_long=40, rsi_hi_long=68, rsi_lo_short=32, rsi_hi_short=60)
-            all_data[symbol] = {
-                "opens": opens, "highs": highs, "lows": lows, "closes": closes,
-                "volumes": volumes, "times": times, "signals": signals,
-                "filt": filt, "ema21": ema21, "atr14": atr14,
-                "signals_old_rsi_count": len(signals_old),
-            }
-            tested.append(symbol)
-            print(f"[{i+1}/{len(COINS)}] {symbol}: OK {len(raw)} candles, "
-                  f"{len(signals)} signals")
-        except urllib.error.HTTPError as e:
-            skipped.append((symbol, f"http_{e.code}"))
-            print(f"[{i+1}/{len(COINS)}] {symbol}: SKIP HTTP {e.code}")
-        except Exception as e:
-            skipped.append((symbol, f"error:{e}"))
-            print(f"[{i+1}/{len(COINS)}] {symbol}: SKIP error {e}")
+    print(f"=== V5 BACKTEST START — {len(COINS)} symbols in universe "
+          f"(fetching with {FETCH_WORKERS} parallel workers) ===")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        futures = {executor.submit(process_symbol, sym, start_ms, end_ms): sym for sym in COINS}
+        done_count = 0
+        for fut in concurrent.futures.as_completed(futures):
+            done_count += 1
+            symbol, data, err = fut.result()
+            if err:
+                skipped.append((symbol, err))
+                print(f"[{done_count}/{len(COINS)}] {symbol}: SKIP {err}")
+            else:
+                all_data[symbol] = data
+                tested.append(symbol)
+                print(f"[{done_count}/{len(COINS)}] {symbol}: OK "
+                      f"{len(data['closes'])} candles, {len(data['signals'])} signals")
 
     print(f"\n=== DATA FETCH DONE: {len(tested)} tested, {len(skipped)} skipped ===\n")
 
@@ -843,4 +857,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
