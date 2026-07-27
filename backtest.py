@@ -295,8 +295,10 @@ def precompute(symbol, raw_30, raw_4h):
         n=len(closes),
     )
 
+DEBUG_SAMPLES = []   # module-level, filled during the first debug-enabled run
+
 # ── PORTFOLIO SIMULATION ─────────────────────────────────────────────────────
-def simulate_portfolio(all_coin_data, use_htf):
+def simulate_portfolio(all_coin_data, use_htf, enable_dist=True, enable_di=True, debug=False):
     all_times = set()
     for cd in all_coin_data.values():
         all_times.update(cd["times"])
@@ -386,6 +388,7 @@ def simulate_portfolio(all_coin_data, use_htf):
             if (atr14[idx] is None or adx[idx] is None or pdi[idx] is None or
                 mdi[idx] is None or st_dir[idx] is None or st_dir[idx-1] is None or
                 st_dir[idx-2] is None):
+                fc["warmup_none"] += 1
                 continue
 
             flipped_long  = (st_dir[idx] == 1  and st_dir[idx-1] == -1)
@@ -411,20 +414,34 @@ def simulate_portfolio(all_coin_data, use_htf):
                 continue
 
             if st_line[idx] is None:
+                fc["warmup_none"] += 1
                 continue
             dist = abs(closes_[idx] - st_line[idx])
-            if dist > DIST_ATR_MULT * atr14[idx]:
-                fc["dist_filter"] += 1
-                continue
 
-            if direction == "LONG":
-                if pdi[idx] <= mdi[idx] or (pdi[idx] - mdi[idx]) < DI_SEP_MIN:
-                    fc["di_sep"] += 1
+            if debug and len(DEBUG_SAMPLES) < 40:
+                DEBUG_SAMPLES.append(dict(
+                    symbol=sym, ts=ts, direction=direction,
+                    dist=round(dist, 6), dist_threshold=round(DIST_ATR_MULT * atr14[idx], 6),
+                    dist_ratio=round(dist / (atr14[idx] or 1), 3),
+                    pdi=round(pdi[idx], 3), mdi=round(mdi[idx], 3),
+                    di_sep=round(abs(pdi[idx] - mdi[idx]), 3),
+                    adx=round(adx[idx], 3),
+                ))
+
+            if enable_dist:
+                if dist > DIST_ATR_MULT * atr14[idx]:
+                    fc["dist_filter"] += 1
                     continue
-            else:
-                if mdi[idx] <= pdi[idx] or (mdi[idx] - pdi[idx]) < DI_SEP_MIN:
-                    fc["di_sep"] += 1
-                    continue
+
+            if enable_di:
+                if direction == "LONG":
+                    if pdi[idx] <= mdi[idx] or (pdi[idx] - mdi[idx]) < DI_SEP_MIN:
+                        fc["di_sep"] += 1
+                        continue
+                else:
+                    if mdi[idx] <= pdi[idx] or (mdi[idx] - pdi[idx]) < DI_SEP_MIN:
+                        fc["di_sep"] += 1
+                        continue
 
             fc["signals_generated"] += 1
 
@@ -528,6 +545,7 @@ def strategy_summary(strat_name, all_trades, per_coin_metrics, filter_agg):
         lines.append(f"  Dist > 1.5xATR        : {filter_agg.get('dist_filter',0):,}")
         lines.append(f"  DI separation < {DI_SEP_MIN}   : {filter_agg.get('di_sep',0):,}")
         lines.append(f"  Signals generated     : {filter_agg.get('signals_generated',0):,}")
+        lines.append(f"  Warmup / None indicators: {filter_agg.get('warmup_none',0):,}")
         lines.append(f"  Max-positions blocked : {max_pos_blocked:,}")
         return "\n".join(lines)
 
@@ -590,6 +608,7 @@ def strategy_summary(strat_name, all_trades, per_coin_metrics, filter_agg):
         f"  Dist > 1.5xATR        : {filter_agg.get('dist_filter',0):,}",
         f"  DI separation < {DI_SEP_MIN}   : {filter_agg.get('di_sep',0):,}",
         f"  Signals generated     : {filter_agg.get('signals_generated',0):,}",
+        f"  Warmup / None indicators: {filter_agg.get('warmup_none',0):,}",
         f"  Max-positions blocked : {max_pos_blocked:,}",
     ]
     return "\n".join(lines)
@@ -655,29 +674,32 @@ def main():
         else:
             print(f"  WARNING: {sym} had insufficient data — skipped")
 
-    print("\n[PHASE 3] Simulating S1 (with 4H filter)...")
-    s1_trades, s1_fc_per_coin = simulate_portfolio(coin_data, use_htf=True)
-    s1_fc = defaultdict(int)
-    for sym, fc in s1_fc_per_coin.items():
-        if sym == "_max_pos_blocked":
-            s1_fc["_max_pos_blocked"] += fc
-            continue
-        for k, v in fc.items():
-            s1_fc[k] += v
-    s1_coin_metrics = [compute_metrics([t for t in s1_trades if t["symbol"] == sym], sym) for sym in fetched]
-    print(f"  S1 total trades: {len(s1_trades)}")
+    def run_variant(name, use_htf, enable_dist, enable_di, debug=False):
+        trades, fc_per_coin = simulate_portfolio(
+            coin_data, use_htf=use_htf, enable_dist=enable_dist,
+            enable_di=enable_di, debug=debug)
+        fc = defaultdict(int)
+        for sym, f in fc_per_coin.items():
+            if sym == "_max_pos_blocked":
+                fc["_max_pos_blocked"] += f
+                continue
+            for k, v in f.items():
+                fc[k] += v
+        coin_metrics = [compute_metrics([t for t in trades if t["symbol"] == sym], sym) for sym in fetched]
+        print(f"  {name} total trades: {len(trades)}")
+        return trades, dict(fc), coin_metrics
 
-    print("\n[PHASE 4] Simulating S2 (no 4H filter)...")
-    s2_trades, s2_fc_per_coin = simulate_portfolio(coin_data, use_htf=False)
-    s2_fc = defaultdict(int)
-    for sym, fc in s2_fc_per_coin.items():
-        if sym == "_max_pos_blocked":
-            s2_fc["_max_pos_blocked"] += fc
-            continue
-        for k, v in fc.items():
-            s2_fc[k] += v
-    s2_coin_metrics = [compute_metrics([t for t in s2_trades if t["symbol"] == sym], sym) for sym in fetched]
-    print(f"  S2 total trades: {len(s2_trades)}")
+    print("\n[PHASE 3] Simulating S1 (full spec, with 4H filter)...")
+    s1_trades, s1_fc, s1_coin_metrics = run_variant("S1", use_htf=True, enable_dist=True, enable_di=True, debug=True)
+
+    print("\n[PHASE 4] Simulating S2 (full spec, no 4H filter)...")
+    s2_trades, s2_fc, s2_coin_metrics = run_variant("S2", use_htf=False, enable_dist=True, enable_di=True)
+
+    print("\n[PHASE 4b] Simulating S3 (relaxed: flip + ADX + rising ADX only, WITH 4H filter)...")
+    s3_trades, s3_fc, s3_coin_metrics = run_variant("S3", use_htf=True, enable_dist=False, enable_di=False)
+
+    print("\n[PHASE 4c] Simulating S4 (relaxed: flip + ADX + rising ADX only, NO 4H filter)...")
+    s4_trades, s4_fc, s4_coin_metrics = run_variant("S4", use_htf=False, enable_dist=False, enable_di=False)
 
     print("\n[PHASE 5] Writing outputs...")
     header = [
@@ -690,21 +712,43 @@ def main():
         f"Generated  : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
     ]
 
-    s1_text = strategy_summary("S1 — SuperTrend + 4H HTF Filter (Conservative)", s1_trades, s1_coin_metrics, dict(s1_fc))
-    s2_text = strategy_summary("S2 — SuperTrend, NO 4H Filter (Aggressive)", s2_trades, s2_coin_metrics, dict(s2_fc))
+    s1_text = strategy_summary("S1 — SuperTrend + 4H HTF Filter (Conservative, full spec)", s1_trades, s1_coin_metrics, s1_fc)
+    s2_text = strategy_summary("S2 — SuperTrend, NO 4H Filter (Aggressive, full spec)", s2_trades, s2_coin_metrics, s2_fc)
+    s3_text = strategy_summary("S3 — RELAXED: flip + ADX>=25 + rising ADX only, WITH 4H filter (dist+DI disabled)", s3_trades, s3_coin_metrics, s3_fc)
+    s4_text = strategy_summary("S4 — RELAXED: flip + ADX>=25 + rising ADX only, NO 4H filter (dist+DI disabled)", s4_trades, s4_coin_metrics, s4_fc)
 
     s1_agg = compute_metrics(s1_trades)
     s2_agg = compute_metrics(s2_trades)
+    s3_agg = compute_metrics(s3_trades)
+    s4_agg = compute_metrics(s4_trades)
 
     rec = ["\n" + "="*72, "  RECOMMENDATION", "="*72]
-    for name, agg in [("S1 (4H filter)", s1_agg), ("S2 (no 4H)", s2_agg)]:
+    for name, agg in [("S1 (full spec, 4H filter)", s1_agg), ("S2 (full spec, no 4H)", s2_agg),
+                       ("S3 (relaxed, 4H filter)", s3_agg), ("S4 (relaxed, no 4H)", s4_agg)]:
         if agg:
             status = "USABLE" if agg["pf"] >= 1.5 and agg["wr"] >= 0.42 else "NOT READY"
             rec.append(f"  {name}: PF={agg['pf']:.4f}  WR={agg['wr']*100:.1f}%  Net=${agg['net']:,.2f}  MDD={agg['mdd']*100:.1f}%  -> {status}")
         else:
             rec.append(f"  {name}: NO TRADES -> NOT READY")
 
-    full_txt = "\n".join(header) + s1_text + s2_text + "\n".join(rec)
+    debug_lines = ["\n" + "="*72, "  DEBUG SAMPLES — first flip candles that reached the dist/DI check", "="*72]
+    if DEBUG_SAMPLES:
+        debug_lines.append(f"  {'Symbol':<16}{'Dir':<7}{'dist':>10}{'dist_thr':>10}{'dist/ATR14':>12}{'pdi':>8}{'mdi':>8}{'DIsep':>8}{'ADX':>7}")
+        for s in DEBUG_SAMPLES:
+            debug_lines.append(
+                f"  {s['symbol']:<16}{s['direction']:<7}{s['dist']:>10.4f}{s['dist_threshold']:>10.4f}"
+                f"{s['dist_ratio']:>12.3f}{s['pdi']:>8.2f}{s['mdi']:>8.2f}{s['di_sep']:>8.2f}{s['adx']:>7.2f}"
+            )
+        avg_ratio = sum(s['dist_ratio'] for s in DEBUG_SAMPLES) / len(DEBUG_SAMPLES)
+        debug_lines.append(f"\n  Avg dist/threshold ratio across samples: {avg_ratio:.3f}"
+                            f"  ({'>1 means dist filter would reject this candle' if avg_ratio>1 else '<=1 means it would pass'})")
+        none_pdi = sum(1 for s in DEBUG_SAMPLES if s['pdi'] is None or s['mdi'] is None)
+        debug_lines.append(f"  Samples with None pdi/mdi: {none_pdi}/{len(DEBUG_SAMPLES)} (confirms whether DI values are valid at this point)")
+    else:
+        debug_lines.append("  No candles ever reached the dist/DI check in S1 — every flip was rejected earlier"
+                            " (by no-flip, HTF, ADX-min, or ADX-rising).")
+
+    full_txt = "\n".join(header) + s1_text + s2_text + s3_text + s4_text + "\n".join(rec) + "\n".join(debug_lines)
     with open("backtest_summary.txt", "w") as f:
         f.write(full_txt)
     print("  wrote backtest_summary.txt")
@@ -729,12 +773,21 @@ def main():
         },
         "S1_with_4h_filter": {
             "aggregate": safe(s1_agg), "per_coin": [safe(m) for m in s1_coin_metrics],
-            "filter_stats": dict(s1_fc), "trades": s1_trades,
+            "filter_stats": s1_fc, "trades": s1_trades,
         },
         "S2_no_4h_filter": {
             "aggregate": safe(s2_agg), "per_coin": [safe(m) for m in s2_coin_metrics],
-            "filter_stats": dict(s2_fc), "trades": s2_trades,
-        }
+            "filter_stats": s2_fc, "trades": s2_trades,
+        },
+        "S3_relaxed_with_4h": {
+            "aggregate": safe(s3_agg), "per_coin": [safe(m) for m in s3_coin_metrics],
+            "filter_stats": s3_fc, "trades": s3_trades,
+        },
+        "S4_relaxed_no_4h": {
+            "aggregate": safe(s4_agg), "per_coin": [safe(m) for m in s4_coin_metrics],
+            "filter_stats": s4_fc, "trades": s4_trades,
+        },
+        "debug_samples_S1": DEBUG_SAMPLES,
     }
     with open("backtest_report.json", "w") as f:
         json.dump(report, f, indent=2)
