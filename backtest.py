@@ -1,21 +1,31 @@
 """
-SuperTrend + Multi-Filter Backtest (Grok v8 — Fixed)
+SuperTrend + Multi-Filter Backtest (Grok v8 spec)
   S1 = SuperTrend 30m flip + 4H SuperTrend filter + ADX/DI/ATR filters
   S2 = Same but NO 4H SuperTrend filter (more aggressive)
 
-Fixes applied vs previous version:
-  1. Data source → Binance FUTURES (fapi.binance.com) not Spot
-  2. Global equity — one account shared across all coins
-  3. Max 6 concurrent positions enforced across all coins
+Data source: data.binance.vision monthly USDS-M futures kline archives.
+This is Binance's static historical-data bucket, NOT the fapi.binance.com
+live REST API — GitHub Actions runner IPs are blocked from the live futures
+API (451), but this bucket is a plain file host and has worked from Actions
+in this pipeline before. If it also gets blocked, that will show up
+immediately as 403/404s on every symbol in Phase 1 and the run will report
+zero fetched coins.
 
-Period : 2024-07-01 → 2026-07-01
+Fix vs the version Grok/Claude reviewed before running:
+  - 4H HTF filter previously could read the *current, still-forming* 4H
+    candle's SuperTrend direction (lookahead bias). Fixed by offsetting the
+    lookup by one 4H period so only a fully CLOSED 4H candle is used.
+  - Indicators are computed once per coin and reused for both S1 and S2
+    (previously recomputed from scratch for each), just to save time.
+
+Period : 2024-07-01 -> 2026-07-01
 Output : backtest_report.json + backtest_summary.txt
 """
 
-import json, math, time, datetime, statistics, urllib.request, urllib.error
+import json, math, io, csv, zipfile, datetime, statistics, urllib.request, urllib.error
 from collections import defaultdict
 
-# ── COIN LIST ──────────────────────────────────────────────────────────────────
+# ── COIN LIST (exactly as specified) ────────────────────────────────────────
 ALL_COINS = [
     "ETHUSDT","DOGEUSDT","DOTUSDT","ARBUSDT",
     "1000BONKUSDT","1000PEPEUSDT","1000SHIBUSDT",
@@ -27,7 +37,7 @@ ALL_COINS = [
     "TRUMPUSDT","BOMEUSDT","WLDUSDT","NEIROUSDT",
 ]
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────
+# ── CONFIG (matches Grok v8 spec exactly) ───────────────────────────────────
 FEE_RATE       = 0.0005
 SLIPPAGE       = 0.0002
 INITIAL_CAP    = 10_000.0
@@ -43,43 +53,97 @@ COOLDOWN_BARS  = 3
 MAX_POSITIONS  = 6
 STOP_ATR_MULT  = 2.0
 
-START_MS = int(datetime.datetime(2024, 7, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
-END_MS   = int(datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+FOUR_HOURS_MS = 4 * 60 * 60 * 1000
 
-# ── FUTURES ENDPOINT ──────────────────────────────────────────────────────────
-# Using Binance Futures public endpoint — no API key required
-FUTURES_URL = "https://fapi.binance.com/fapi/v1/klines"
+START_YM = (2024, 7)
+END_YM   = (2026, 6)     # last full month before the 2026-07-01 cutoff
 
-# ── DATA FETCH ─────────────────────────────────────────────────────────────────
-def fetch_klines(symbol, interval, start_ms, end_ms):
+# ── DATA SOURCE: static monthly USDS-M futures kline archives ──────────────
+BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
+
+def month_range(start_ym, end_ym):
+    y, m = start_ym
+    ey, em = end_ym
+    out = []
+    while (y, m) <= (ey, em):
+        out.append((y, m))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return out
+
+MONTHS = month_range(START_YM, END_YM)
+
+def fetch_month_csv(symbol, interval, year, month):
+    """Download+unzip one monthly kline archive. Returns list of raw rows or None if missing."""
+    fname = f"{symbol}-{interval}-{year:04d}-{month:02d}"
+    url = f"{BASE_URL}/{symbol}/{interval}/{fname}.zip"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            blob = r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    except urllib.error.URLError:
+        raise
+
+    rows = []
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        inner = zf.namelist()[0]
+        with zf.open(inner) as f:
+            text = io.TextIOWrapper(f, encoding="utf-8")
+            reader = csv.reader(text)
+            for row in reader:
+                if not row:
+                    continue
+                # header row (if present) starts with a non-numeric field
+                try:
+                    open_time = int(row[0])
+                except ValueError:
+                    continue
+                rows.append(row)
+    return rows
+
+def fetch_symbol_klines(symbol, interval, months):
+    """Fetch+merge all monthly archives for a symbol. Returns raw row list sorted by open_time."""
     all_rows = []
-    cur = start_ms
-    while cur < end_ms:
-        url = (f"{FUTURES_URL}?symbol={symbol}&interval={interval}"
-               f"&startTime={cur}&endTime={end_ms}&limit=1500")
-        for attempt in range(5):
-            try:
-                with urllib.request.urlopen(url, timeout=25) as r:
-                    data = json.loads(r.read())
-                break
-            except Exception as e:
-                if attempt == 4:
-                    raise
-                time.sleep(0.5 * (2 ** attempt))
-        if not data:
-            break
-        all_rows.extend(data)
-        last_open = data[-1][0]
-        if last_open >= end_ms or len(data) < 1500:
-            break
-        cur = last_open + 1
-        time.sleep(0.12)
-    return all_rows
+    got_any = False
+    for (y, m) in months:
+        try:
+            rows = fetch_month_csv(symbol, interval, y, m)
+        except Exception:
+            rows = None
+        if rows:
+            got_any = True
+            all_rows.extend(rows)
+    if not got_any:
+        return None
+    all_rows.sort(key=lambda r: int(r[0]))
+    # de-dupe on open_time in case of overlap
+    seen = set()
+    dedup = []
+    for r in all_rows:
+        ot = int(r[0])
+        if ot in seen:
+            continue
+        seen.add(ot)
+        dedup.append(r)
+    return dedup
 
 def parse_klines(raw):
+    """raw: list of csv rows [open_time, open, high, low, close, volume, ...] -> arrays."""
+    # Binance futures kline timestamps: pre-2025 archives are ms; some 2025+
+    # archives switched to microseconds for SPOT (not confirmed for futures,
+    # but guard anyway by detecting absurdly large values).
     times, opens, highs, lows, closes, volumes = [], [], [], [], [], []
     for row in raw:
-        times.append(int(row[0]))
+        ot = int(row[0])
+        if ot > 10**14:   # looks like microseconds, not ms
+            ot //= 1000
+        times.append(ot)
         opens.append(float(row[1]))
         highs.append(float(row[2]))
         lows.append(float(row[3]))
@@ -87,7 +151,7 @@ def parse_klines(raw):
         volumes.append(float(row[5]))
     return times, opens, highs, lows, closes, volumes
 
-# ── INDICATORS ─────────────────────────────────────────────────────────────────
+# ── INDICATORS ─────────────────────────────────────────────────────────────
 def calc_atr(highs, lows, closes, period=14):
     n = len(closes)
     result = [None] * n
@@ -98,17 +162,12 @@ def calc_atr(highs, lows, closes, period=14):
         tr[i] = max(highs[i] - lows[i],
                     abs(highs[i] - closes[i-1]),
                     abs(lows[i]  - closes[i-1]))
-    # Wilder seed
     result[period] = sum(tr[1:period+1]) / period
     for i in range(period + 1, n):
         result[i] = (result[i-1] * (period - 1) + tr[i]) / period
     return result
 
 def calc_adx(highs, lows, closes, period=14):
-    """
-    Returns (adx, pdi, mdi) — all None before warmup (2*period bars).
-    Uses true Wilder smoothing: seed = sum of first period, then rolling subtract+add.
-    """
     n = len(closes)
     tr_raw  = [0.0] * n
     pdm_raw = [0.0] * n
@@ -160,7 +219,6 @@ def calc_adx(highs, lows, closes, period=14):
     return adx, pdi, mdi
 
 def calc_supertrend(highs, lows, closes, atr_period=10, mult=3.0):
-    """Returns (st_line, direction) — direction: +1=bull, -1=bear, None before warmup."""
     n = len(closes)
     atr_vals = calc_atr(highs, lows, closes, atr_period)
     st   = [None] * n
@@ -170,9 +228,9 @@ def calc_supertrend(highs, lows, closes, atr_period=10, mult=3.0):
     for i in range(n):
         if atr_vals[i] is None:
             continue
-        mid     = (highs[i] + lows[i]) / 2.0
-        raw_ub  = mid + mult * atr_vals[i]
-        raw_lb  = mid - mult * atr_vals[i]
+        mid    = (highs[i] + lows[i]) / 2.0
+        raw_ub = mid + mult * atr_vals[i]
+        raw_lb = mid - mult * atr_vals[i]
         if ub[i-1] is None:
             ub[i] = raw_ub
             lb[i] = raw_lb
@@ -184,11 +242,11 @@ def calc_supertrend(highs, lows, closes, atr_period=10, mult=3.0):
         elif dire[i-1] == 1:
             dire[i] = -1 if closes[i] < lb[i] else 1
         else:
-            dire[i] =  1 if closes[i] > ub[i] else -1
+            dire[i] = 1 if closes[i] > ub[i] else -1
         st[i] = lb[i] if dire[i] == 1 else ub[i]
     return st, dire
 
-# ── 4H TREND LOOKUP ───────────────────────────────────────────────────────────
+# ── 4H TREND LOOKUP (lookahead-safe) ────────────────────────────────────────
 def build_htf_map(h4_times, h4_highs, h4_lows, h4_closes):
     _, dire = calc_supertrend(h4_highs, h4_lows, h4_closes, ST_ATR_PERIOD, ST_MULT)
     trend_map = {}
@@ -199,29 +257,34 @@ def build_htf_map(h4_times, h4_highs, h4_lows, h4_closes):
     return trend_map, sorted_ts
 
 def get_htf_trend(bar_ts, sorted_ts, trend_map):
+    """
+    Returns the direction of the most recent FULLY CLOSED 4H candle as of bar_ts.
+    A 4H candle with open time T covers [T, T+4H) and is not closed until T+4H.
+    We offset the query by one 4H period so a candle whose open time equals
+    (or is later than) bar_ts - 4H is never treated as closed prematurely.
+    """
+    query_ts = bar_ts - FOUR_HOURS_MS
     lo, hi, idx = 0, len(sorted_ts) - 1, -1
     while lo <= hi:
         mid = (lo + hi) // 2
-        if sorted_ts[mid] <= bar_ts:
+        if sorted_ts[mid] <= query_ts:
             idx = mid; lo = mid + 1
         else:
             hi = mid - 1
     return trend_map[sorted_ts[idx]] if idx >= 0 else None
 
-# ── PRE-COMPUTE INDICATORS PER COIN ──────────────────────────────────────────
-def precompute(symbol, h30_raw, h4_raw, use_htf):
-    """Returns dict of all indicator arrays + 4H map, keyed by bar index."""
-    if not h30_raw or len(h30_raw) < 100:
+# ── PRE-COMPUTE INDICATORS PER COIN (once, reused for S1 and S2) ───────────
+def precompute(symbol, raw_30, raw_4h):
+    if not raw_30 or len(raw_30) < 100:
         return None
-    times, _, highs, lows, closes, _ = parse_klines(h30_raw)
-    atr14        = calc_atr(highs, lows, closes, ATR_PERIOD)
+    times, _, highs, lows, closes, _ = parse_klines(raw_30)
+    atr14         = calc_atr(highs, lows, closes, ATR_PERIOD)
     adx, pdi, mdi = calc_adx(highs, lows, closes, ADX_PERIOD)
     st_line, st_dir = calc_supertrend(highs, lows, closes, ST_ATR_PERIOD, ST_MULT)
 
-    htf_map = {}
-    htf_ts  = []
-    if use_htf and h4_raw and len(h4_raw) >= 50:
-        t4, _, h4h, h4l, h4c, _ = parse_klines(h4_raw)
+    htf_map, htf_ts = {}, []
+    if raw_4h and len(raw_4h) >= 50:
+        t4, _, h4h, h4l, h4c, _ = parse_klines(raw_4h)
         htf_map, htf_ts = build_htf_map(t4, h4h, h4l, h4c)
 
     return dict(
@@ -232,63 +295,47 @@ def precompute(symbol, h30_raw, h4_raw, use_htf):
         n=len(closes),
     )
 
-# ── PORTFOLIO SIMULATION ──────────────────────────────────────────────────────
+# ── PORTFOLIO SIMULATION ─────────────────────────────────────────────────────
 def simulate_portfolio(all_coin_data, use_htf):
-    """
-    Time-aligned portfolio simulation.
-    One global equity, max MAX_POSITIONS open at once.
-    Returns (all_trades, filter_counts_per_coin)
-    """
-    # Build a unified sorted timeline of all 30m bar timestamps
     all_times = set()
     for cd in all_coin_data.values():
         all_times.update(cd["times"])
     timeline = sorted(all_times)
 
-    # Index: symbol → {timestamp: bar_index}
-    time_index = {}
-    for sym, cd in all_coin_data.items():
-        time_index[sym] = {t: i for i, t in enumerate(cd["times"])}
+    time_index = {sym: {t: i for i, t in enumerate(cd["times"])}
+                  for sym, cd in all_coin_data.items()}
 
-    # Per-symbol state
-    coin_state = {}
-    for sym in all_coin_data:
-        coin_state[sym] = dict(
-            in_trade=None,
-            cooldown=0,
-            fc=defaultdict(int),
-        )
+    coin_state = {sym: dict(cooldown=0, fc=defaultdict(int)) for sym in all_coin_data}
 
-    equity    = INITIAL_CAP
-    open_pos  = {}   # sym → trade dict
+    equity     = INITIAL_CAP
+    open_pos   = {}
     all_trades = []
+    max_pos_blocked = 0
 
     for ts in timeline:
-        # ── EXITS first (process before entries on same bar) ──
+        # ── EXITS ──
         to_close = []
         for sym, pos in open_pos.items():
             cd  = all_coin_data[sym]
             idx = time_index[sym].get(ts)
             if idx is None:
                 continue
-            lows_  = cd["lows"]
-            highs_ = cd["highs"]
-            closes_= cd["closes"]
-            st_dir = cd["st_dir"]
+            lows_, highs_, closes_, st_dir = cd["lows"], cd["highs"], cd["closes"], cd["st_dir"]
 
-            exit_p      = None
+            exit_p = None
             exit_reason = None
+            flip_against = idx > 0 and st_dir[idx] is not None and st_dir[idx-1] is not None
 
             if pos["dir"] == "LONG":
                 if lows_[idx] <= pos["sl"]:
-                    exit_p = pos["sl"]; exit_reason = "SL"
-                elif st_dir[idx] == -1 and st_dir[idx-1] == 1 if idx > 0 else False:
-                    exit_p = closes_[idx]; exit_reason = "ST_FLIP"
+                    exit_p, exit_reason = pos["sl"], "SL"
+                elif flip_against and st_dir[idx] == -1 and st_dir[idx-1] == 1:
+                    exit_p, exit_reason = closes_[idx], "ST_FLIP"
             else:
                 if highs_[idx] >= pos["sl"]:
-                    exit_p = pos["sl"]; exit_reason = "SL"
-                elif st_dir[idx] == 1 and st_dir[idx-1] == -1 if idx > 0 else False:
-                    exit_p = closes_[idx]; exit_reason = "ST_FLIP"
+                    exit_p, exit_reason = pos["sl"], "SL"
+                elif flip_against and st_dir[idx] == 1 and st_dir[idx-1] == -1:
+                    exit_p, exit_reason = closes_[idx], "ST_FLIP"
 
             if exit_p is not None:
                 if pos["dir"] == "LONG":
@@ -301,11 +348,9 @@ def simulate_portfolio(all_coin_data, use_htf):
                 equity += pnl
                 dur = (ts - pos["entry_t"]) / (1000 * 60 * 30)
                 all_trades.append(dict(
-                    symbol=sym, dir=pos["dir"],
-                    entry=pos["entry"], exit=exit_p,
-                    entry_t=pos["entry_t"], exit_t=ts,
-                    pnl=round(pnl, 4), win=(pnl > 0),
-                    dur=dur, exit_reason=exit_reason,
+                    symbol=sym, dir=pos["dir"], entry=pos["entry"], exit=exit_p,
+                    entry_t=pos["entry_t"], exit_t=ts, pnl=round(pnl, 4),
+                    win=(pnl > 0), dur=dur, exit_reason=exit_reason,
                 ))
                 coin_state[sym]["cooldown"] = COOLDOWN_BARS
                 to_close.append(sym)
@@ -315,6 +360,7 @@ def simulate_portfolio(all_coin_data, use_htf):
 
         # ── ENTRIES ──
         if len(open_pos) >= MAX_POSITIONS:
+            max_pos_blocked += 1
             continue
 
         for sym, cd in all_coin_data.items():
@@ -324,6 +370,7 @@ def simulate_portfolio(all_coin_data, use_htf):
                 coin_state[sym]["cooldown"] -= 1
                 continue
             if len(open_pos) >= MAX_POSITIONS:
+                max_pos_blocked += 1
                 break
 
             idx = time_index[sym].get(ts)
@@ -333,22 +380,14 @@ def simulate_portfolio(all_coin_data, use_htf):
             fc = coin_state[sym]["fc"]
             fc["total_candles"] += 1
 
-            atr14  = cd["atr14"]
-            adx    = cd["adx"]
-            pdi    = cd["pdi"]
-            mdi    = cd["mdi"]
-            st_dir = cd["st_dir"]
-            st_line= cd["st_line"]
-            closes_= cd["closes"]
-            times_ = cd["times"]
+            atr14, adx, pdi, mdi = cd["atr14"], cd["adx"], cd["pdi"], cd["mdi"]
+            st_dir, st_line, closes_ = cd["st_dir"], cd["st_line"], cd["closes"]
 
-            # Need valid indicators
-            if (atr14[idx] is None or adx[idx] is None or
-                pdi[idx] is None or mdi[idx] is None or
-                st_dir[idx] is None or st_dir[idx-1] is None or st_dir[idx-2] is None):
+            if (atr14[idx] is None or adx[idx] is None or pdi[idx] is None or
+                mdi[idx] is None or st_dir[idx] is None or st_dir[idx-1] is None or
+                st_dir[idx-2] is None):
                 continue
 
-            # ST flip detection
             flipped_long  = (st_dir[idx] == 1  and st_dir[idx-1] == -1)
             flipped_short = (st_dir[idx] == -1 and st_dir[idx-1] == 1)
             if not flipped_long and not flipped_short:
@@ -357,24 +396,20 @@ def simulate_portfolio(all_coin_data, use_htf):
 
             direction = "LONG" if flipped_long else "SHORT"
 
-            # F1: 4H HTF alignment
             if use_htf and cd["htf_ts"]:
                 h4t = get_htf_trend(ts, cd["htf_ts"], cd["htf_map"])
                 if h4t is None or (direction == "LONG" and h4t != 1) or (direction == "SHORT" and h4t != -1):
                     fc["htf_filter"] += 1
                     continue
 
-            # F2: ADX >= 25
             if adx[idx] < ADX_MIN:
                 fc["adx_min"] += 1
                 continue
 
-            # F3: ADX rising vs 2 bars ago
             if adx[idx-2] is None or adx[idx] <= adx[idx-2]:
                 fc["adx_rising"] += 1
                 continue
 
-            # F4: Distance from ST <= 1.5 * ATR14
             if st_line[idx] is None:
                 continue
             dist = abs(closes_[idx] - st_line[idx])
@@ -382,10 +417,6 @@ def simulate_portfolio(all_coin_data, use_htf):
                 fc["dist_filter"] += 1
                 continue
 
-            # F5: DI dominance + separation >= 8
-            if pdi[idx] is None or mdi[idx] is None:
-                fc["di_sep"] += 1
-                continue
             if direction == "LONG":
                 if pdi[idx] <= mdi[idx] or (pdi[idx] - mdi[idx]) < DI_SEP_MIN:
                     fc["di_sep"] += 1
@@ -397,7 +428,6 @@ def simulate_portfolio(all_coin_data, use_htf):
 
             fc["signals_generated"] += 1
 
-            # Position sizing on global equity
             stop_dist = STOP_ATR_MULT * atr14[idx]
             if stop_dist <= 0:
                 continue
@@ -412,14 +442,14 @@ def simulate_portfolio(all_coin_data, use_htf):
                 entry_adj = entry_p * (1 - SLIPPAGE) * (1 - FEE_RATE)
                 sl_price  = entry_p + stop_dist
 
-            open_pos[sym] = dict(
-                dir=direction, entry=entry_p, entry_adj=entry_adj,
-                sl=sl_price, size=size, entry_t=ts,
-            )
+            open_pos[sym] = dict(dir=direction, entry=entry_p, entry_adj=entry_adj,
+                                  sl=sl_price, size=size, entry_t=ts)
 
-    return all_trades, {sym: dict(coin_state[sym]["fc"]) for sym in coin_state}
+    fc_out = {sym: dict(coin_state[sym]["fc"]) for sym in coin_state}
+    fc_out["_max_pos_blocked"] = max_pos_blocked
+    return all_trades, fc_out
 
-# ── METRICS ───────────────────────────────────────────────────────────────────
+# ── METRICS ───────────────────────────────────────────────────────────────
 def compute_metrics(trades, symbol="ALL"):
     if not trades:
         return None
@@ -435,7 +465,6 @@ def compute_metrics(trades, symbol="ALL"):
     al     = gl / len(losses) if losses else 0
     exp    = wr * aw - (1 - wr) * al
 
-    # Global equity curve for MDD
     equity = INITIAL_CAP; peak = INITIAL_CAP; mdd = 0.0
     for t in sorted(trades, key=lambda x: x["exit_t"]):
         equity += t["pnl"]
@@ -443,13 +472,12 @@ def compute_metrics(trades, symbol="ALL"):
         dd = (peak - equity) / peak
         if dd > mdd: mdd = dd
 
-    # Monthly PnL
     monthly = defaultdict(float)
     for t in trades:
         mo = datetime.datetime.utcfromtimestamp(t["exit_t"]/1000).strftime("%Y-%m")
         monthly[mo] += t["pnl"]
     mo_vals = list(monthly.values())
-    sharpe  = sortino = 0.0
+    sharpe = sortino = 0.0
     if len(mo_vals) > 1:
         avg_r = statistics.mean(mo_vals)
         std_r = statistics.stdev(mo_vals)
@@ -472,20 +500,22 @@ def compute_metrics(trades, symbol="ALL"):
         else:        cl += 1; cw = 0; maxcl = max(maxcl, cl)
 
     avg_dur = statistics.mean([t["dur"] for t in trades])
+    avg_r = (aw / (al if al else 1)) if al else 0  # crude avg-R proxy (win$/loss$)
 
     return dict(
         symbol=symbol, n=n, wr=round(wr,4), pf=round(pf,4),
         net=round(net,2), mdd=round(mdd,4), sharpe=round(sharpe,3),
         sortino=round(sortino,3), aw=round(aw,2), al=round(al,2),
-        exp=round(exp,2), dur=round(avg_dur,1),
+        exp=round(exp,2), dur=round(avg_dur,1), avg_r=round(avg_r,3),
         nlongs=nlongs, nshorts=nshorts, lwr=round(lwr,4), swr=round(swr,4),
         monthly=dict(sorted(monthly.items())),
         maxcw=maxcw, maxcl=maxcl, gp=round(gp,2), gl=round(gl,2),
     )
 
-# ── SUMMARY WRITER ────────────────────────────────────────────────────────────
+# ── SUMMARY WRITER ───────────────────────────────────────────────────────
 def strategy_summary(strat_name, all_trades, per_coin_metrics, filter_agg):
     lines = [f"\n{'='*72}", f"  {strat_name}", f"{'='*72}"]
+    max_pos_blocked = filter_agg.get("_max_pos_blocked", 0)
     if not all_trades:
         lines.append("  NO TRADES GENERATED")
         lines.append(f"\n  FILTER REJECTION STATS")
@@ -495,9 +525,10 @@ def strategy_summary(strat_name, all_trades, per_coin_metrics, filter_agg):
         lines.append(f"  4H HTF filter         : {filter_agg.get('htf_filter',0):,}")
         lines.append(f"  ADX < {ADX_MIN}             : {filter_agg.get('adx_min',0):,}")
         lines.append(f"  ADX not rising        : {filter_agg.get('adx_rising',0):,}")
-        lines.append(f"  Dist > 1.5×ATR        : {filter_agg.get('dist_filter',0):,}")
+        lines.append(f"  Dist > 1.5xATR        : {filter_agg.get('dist_filter',0):,}")
         lines.append(f"  DI separation < {DI_SEP_MIN}   : {filter_agg.get('di_sep',0):,}")
         lines.append(f"  Signals generated     : {filter_agg.get('signals_generated',0):,}")
+        lines.append(f"  Max-positions blocked : {max_pos_blocked:,}")
         return "\n".join(lines)
 
     agg = compute_metrics(all_trades, "AGGREGATE")
@@ -506,39 +537,38 @@ def strategy_summary(strat_name, all_trades, per_coin_metrics, filter_agg):
             f"\n  AGGREGATE RESULTS", f"  {'─'*50}",
             f"  Total Trades : {agg['n']}",
             f"  Win Rate     : {agg['wr']*100:.1f}%",
-            f"  Profit Factor: {agg['pf']:.4f}  {'✅ PASS' if agg['pf'] >= 1.5 else '❌ FAIL'}",
+            f"  Profit Factor: {agg['pf']:.4f}  {'PASS' if agg['pf'] >= 1.5 else 'FAIL'}",
             f"  Net PnL      : ${agg['net']:,.2f}",
             f"  Max Drawdown : {agg['mdd']*100:.1f}%",
             f"  Sharpe       : {agg['sharpe']:.3f}",
             f"  Sortino      : {agg['sortino']:.3f}",
             f"  Avg Win      : ${agg['aw']:.2f}",
             f"  Avg Loss     : ${agg['al']:.2f}",
+            f"  Avg R (proxy): {agg['avg_r']:.3f}",
             f"  Expectancy   : ${agg['exp']:.2f}",
             f"  Avg Duration : {agg['dur']:.1f} bars",
             f"  Longs/Shorts : {agg['nlongs']}/{agg['nshorts']}",
             f"  Long WR      : {agg['lwr']*100:.1f}%",
             f"  Short WR     : {agg['swr']*100:.1f}%",
             f"  Max Win Streak: {agg['maxcw']}  Max Loss Streak: {agg['maxcl']}",
-            f"\n  VALIDATION: PF≥1.5 {'✅' if agg['pf']>=1.5 else '❌'}  WR≥42% {'✅' if agg['wr']>=0.42 else '❌'}",
+            f"\n  VALIDATION: PF>=1.5 {'YES' if agg['pf']>=1.5 else 'NO'}  WR>=42% {'YES' if agg['wr']>=0.42 else 'NO'}",
         ]
 
-    # Per-coin
     valid = [m for m in per_coin_metrics if m]
     valid.sort(key=lambda x: x["pf"], reverse=True)
     pf_pass = sum(1 for m in valid if m["pf"] >= 1.5)
-    lines.append(f"  PF≥1.5 on {pf_pass}/{len(valid)} coins")
+    lines.append(f"  PF>=1.5 on {pf_pass}/{len(valid)} coins")
     lines.append(f"\n  PER-COIN BREAKDOWN (sorted by PF desc)")
     lines.append(f"  {'Symbol':<18} {'Trades':>6} {'WR':>7} {'PF':>8} {'Net PnL':>10} {'MDD':>6} {'L/S':>5}")
     lines.append(f"  {'─'*65}")
     for m in valid:
-        mk = "✅" if m["pf"] >= 1.5 else ("⚠️ " if m["pf"] >= 1.0 else "❌")
+        mk = "PASS" if m["pf"] >= 1.5 else ("~   " if m["pf"] >= 1.0 else "FAIL")
         lines.append(
             f"  {m['symbol']:<18} {m['n']:>6} {m['wr']*100:>6.1f}%"
             f" {m['pf']:>8.4f}{mk} ${m['net']:>9,.2f} {m['mdd']*100:>5.1f}%"
             f" {m['nlongs']}/{m['nshorts']}"
         )
 
-    # Monthly
     monthly_all = defaultdict(float)
     for t in all_trades:
         mo = datetime.datetime.utcfromtimestamp(t["exit_t"]/1000).strftime("%Y-%m")
@@ -546,10 +576,9 @@ def strategy_summary(strat_name, all_trades, per_coin_metrics, filter_agg):
     lines.append(f"\n  MONTHLY PnL")
     lines.append(f"  {'─'*30}")
     for mo in sorted(monthly_all):
-        bar = "▲" if monthly_all[mo] >= 0 else "▼"
+        bar = "+" if monthly_all[mo] >= 0 else "-"
         lines.append(f"  {mo}  {bar}  ${monthly_all[mo]:>9,.2f}")
 
-    # Filters
     lines += [
         f"\n  FILTER REJECTION STATS (aggregated across all coins)",
         f"  {'─'*40}",
@@ -558,29 +587,28 @@ def strategy_summary(strat_name, all_trades, per_coin_metrics, filter_agg):
         f"  4H HTF filter         : {filter_agg.get('htf_filter',0):,}",
         f"  ADX < {ADX_MIN}             : {filter_agg.get('adx_min',0):,}",
         f"  ADX not rising        : {filter_agg.get('adx_rising',0):,}",
-        f"  Dist > 1.5×ATR        : {filter_agg.get('dist_filter',0):,}",
+        f"  Dist > 1.5xATR        : {filter_agg.get('dist_filter',0):,}",
         f"  DI separation < {DI_SEP_MIN}   : {filter_agg.get('di_sep',0):,}",
         f"  Signals generated     : {filter_agg.get('signals_generated',0):,}",
-        f"  Max-positions blocked : {filter_agg.get('max_pos_blocked',0):,}",
+        f"  Max-positions blocked : {max_pos_blocked:,}",
     ]
     return "\n".join(lines)
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# ── MAIN ─────────────────────────────────────────────────────────────────
 def main():
-    print(f"SuperTrend + Multi-Filter Backtest — Grok v8 (Fixed)")
-    print(f"Data source : Binance FUTURES (fapi.binance.com)")
+    print("SuperTrend + Multi-Filter Backtest — Grok v8 spec")
+    print("Data source : data.binance.vision (futures/um monthly klines)")
     print(f"Coins       : {len(ALL_COINS)}")
-    print(f"Period      : 2024-07-01 → 2026-07-01")
+    print(f"Period      : 2024-07-01 -> 2026-07-01 ({len(MONTHS)} months)")
     print(f"Equity      : Global ${INITIAL_CAP:,.0f}, max {MAX_POSITIONS} positions")
     print("=" * 65)
 
-    # ── PHASE 1: FETCH ────────────────────────────────────────────────
     print("\n[PHASE 1] Fetching 30m futures data...")
     raw_30 = {}
     for sym in ALL_COINS:
         print(f"  {sym:<18} 30m...", end=" ", flush=True)
         try:
-            raw = fetch_klines(sym, "30m", START_MS, END_MS)
+            raw = fetch_symbol_klines(sym, "30m", MONTHS)
             if raw:
                 raw_30[sym] = raw
                 print(f"OK ({len(raw):,} candles)")
@@ -589,14 +617,14 @@ def main():
         except Exception as e:
             print(f"FAIL: {e}")
 
-    print(f"\n[PHASE 1b] Fetching 4h futures data...")
+    print("\n[PHASE 1b] Fetching 4h futures data...")
     raw_4h = {}
     for sym in ALL_COINS:
         if sym not in raw_30:
             continue
         print(f"  {sym:<18} 4h...", end=" ", flush=True)
         try:
-            raw = fetch_klines(sym, "4h", START_MS, END_MS)
+            raw = fetch_symbol_klines(sym, "4h", MONTHS)
             if raw:
                 raw_4h[sym] = raw
                 print(f"OK ({len(raw):,} candles)")
@@ -609,73 +637,61 @@ def main():
     skipped = [s for s in ALL_COINS if s not in raw_30]
     print(f"\n  Fetched: {len(fetched)} coins  |  Skipped: {skipped or 'none'}")
 
-    # ── PHASE 2: PRE-COMPUTE INDICATORS ──────────────────────────────
-    print("\n[PHASE 2] Pre-computing indicators...")
+    if not fetched:
+        with open("backtest_summary.txt", "w") as f:
+            f.write("NO DATA FETCHED FOR ANY COIN.\n"
+                    "data.binance.vision likely blocked from this runner too, "
+                    "or the futures/um monthly klines path/symbol list is wrong.\n"
+                    f"Skipped: {skipped}\n")
+        print("ABORT: no data fetched for any coin — see backtest_summary.txt")
+        return
 
-    def build_coin_data(use_htf):
-        cd = {}
-        for sym in fetched:
-            result = precompute(sym, raw_30[sym], raw_4h.get(sym,[]), use_htf)
-            if result:
-                cd[sym] = result
-            else:
-                print(f"  WARNING: {sym} had insufficient data — skipped")
-        return cd
-
-    # ── PHASE 3: SIMULATE ─────────────────────────────────────────────
-    print("\n[PHASE 3] Simulating S1 (with 4H filter)...")
-    cd_s1 = build_coin_data(use_htf=True)
-    s1_trades, s1_fc_per_coin = simulate_portfolio(cd_s1, use_htf=True)
-
-    # Aggregate filter counts
-    s1_fc = defaultdict(int)
-    for fc in s1_fc_per_coin.values():
-        for k, v in fc.items(): s1_fc[k] += v
-
-    # Per-coin metrics
-    s1_coin_metrics = []
+    print("\n[PHASE 2] Pre-computing indicators (once per coin, shared by S1 & S2)...")
+    coin_data = {}
     for sym in fetched:
-        ct = [t for t in s1_trades if t.get("symbol") == sym]
-        s1_coin_metrics.append(compute_metrics(ct, sym) if ct else None)
+        result = precompute(sym, raw_30[sym], raw_4h.get(sym, []))
+        if result:
+            coin_data[sym] = result
+        else:
+            print(f"  WARNING: {sym} had insufficient data — skipped")
 
+    print("\n[PHASE 3] Simulating S1 (with 4H filter)...")
+    s1_trades, s1_fc_per_coin = simulate_portfolio(coin_data, use_htf=True)
+    s1_fc = defaultdict(int)
+    for sym, fc in s1_fc_per_coin.items():
+        if sym == "_max_pos_blocked":
+            s1_fc["_max_pos_blocked"] += fc
+            continue
+        for k, v in fc.items():
+            s1_fc[k] += v
+    s1_coin_metrics = [compute_metrics([t for t in s1_trades if t["symbol"] == sym], sym) for sym in fetched]
     print(f"  S1 total trades: {len(s1_trades)}")
 
     print("\n[PHASE 4] Simulating S2 (no 4H filter)...")
-    cd_s2 = build_coin_data(use_htf=False)
-    s2_trades, s2_fc_per_coin = simulate_portfolio(cd_s2, use_htf=False)
-
+    s2_trades, s2_fc_per_coin = simulate_portfolio(coin_data, use_htf=False)
     s2_fc = defaultdict(int)
-    for fc in s2_fc_per_coin.values():
-        for k, v in fc.items(): s2_fc[k] += v
-
-    s2_coin_metrics = []
-    for sym in fetched:
-        ct = [t for t in s2_trades if t.get("symbol") == sym]
-        s2_coin_metrics.append(compute_metrics(ct, sym) if ct else None)
-
+    for sym, fc in s2_fc_per_coin.items():
+        if sym == "_max_pos_blocked":
+            s2_fc["_max_pos_blocked"] += fc
+            continue
+        for k, v in fc.items():
+            s2_fc[k] += v
+    s2_coin_metrics = [compute_metrics([t for t in s2_trades if t["symbol"] == sym], sym) for sym in fetched]
     print(f"  S2 total trades: {len(s2_trades)}")
 
-    # ── PHASE 5: WRITE OUTPUTS ────────────────────────────────────────
     print("\n[PHASE 5] Writing outputs...")
-
     header = [
-        "SUPERTREND + MULTI-FILTER BACKTEST — Grok v8 (Fixed)",
-        f"Period     : 2024-07-01 → 2026-07-01",
-        f"Data source: Binance FUTURES (fapi.binance.com)",
+        "SUPERTREND + MULTI-FILTER BACKTEST — Grok v8 spec",
+        "Period     : 2024-07-01 -> 2026-07-01",
+        "Data source: data.binance.vision (futures/um monthly klines)",
         f"Coins      : {len(fetched)} fetched | Skipped: {skipped or 'none'}",
-        f"Targets    : PF≥1.5  |  WR≥42%",
+        "Targets    : PF>=1.5  |  WR>=42%",
         f"Portfolio  : ${INITIAL_CAP:,.0f} global equity, max {MAX_POSITIONS} concurrent positions",
         f"Generated  : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
     ]
 
-    s1_text = strategy_summary(
-        "S1 — SuperTrend + 4H HTF Filter (Conservative)",
-        s1_trades, s1_coin_metrics, dict(s1_fc)
-    )
-    s2_text = strategy_summary(
-        "S2 — SuperTrend, NO 4H Filter (Aggressive)",
-        s2_trades, s2_coin_metrics, dict(s2_fc)
-    )
+    s1_text = strategy_summary("S1 — SuperTrend + 4H HTF Filter (Conservative)", s1_trades, s1_coin_metrics, dict(s1_fc))
+    s2_text = strategy_summary("S2 — SuperTrend, NO 4H Filter (Aggressive)", s2_trades, s2_coin_metrics, dict(s2_fc))
 
     s1_agg = compute_metrics(s1_trades)
     s2_agg = compute_metrics(s2_trades)
@@ -683,22 +699,22 @@ def main():
     rec = ["\n" + "="*72, "  RECOMMENDATION", "="*72]
     for name, agg in [("S1 (4H filter)", s1_agg), ("S2 (no 4H)", s2_agg)]:
         if agg:
-            status = "✅ USABLE" if agg["pf"] >= 1.5 and agg["wr"] >= 0.42 else "❌ NOT READY"
-            rec.append(f"  {name}: PF={agg['pf']:.4f}  WR={agg['wr']*100:.1f}%  Net=${agg['net']:,.2f}  MDD={agg['mdd']*100:.1f}%  → {status}")
+            status = "USABLE" if agg["pf"] >= 1.5 and agg["wr"] >= 0.42 else "NOT READY"
+            rec.append(f"  {name}: PF={agg['pf']:.4f}  WR={agg['wr']*100:.1f}%  Net=${agg['net']:,.2f}  MDD={agg['mdd']*100:.1f}%  -> {status}")
         else:
-            rec.append(f"  {name}: NO TRADES → ❌ NOT READY")
+            rec.append(f"  {name}: NO TRADES -> NOT READY")
 
     full_txt = "\n".join(header) + s1_text + s2_text + "\n".join(rec)
     with open("backtest_summary.txt", "w") as f:
         f.write(full_txt)
-    print("  ✓ backtest_summary.txt")
+    print("  wrote backtest_summary.txt")
 
     def safe(m): return m if m else {}
     report = {
         "meta": {
-            "strategy": "SuperTrend + Multi-Filter (Grok v8 Fixed)",
+            "strategy": "SuperTrend + Multi-Filter (Grok v8 spec)",
             "period": "2024-07-01 to 2026-07-01",
-            "data_source": "Binance Futures fapi.binance.com",
+            "data_source": "data.binance.vision futures/um monthly klines",
             "coins_fetched": fetched,
             "coins_skipped": skipped,
             "settings": {
@@ -712,25 +728,20 @@ def main():
             }
         },
         "S1_with_4h_filter": {
-            "aggregate": safe(s1_agg),
-            "per_coin": [safe(m) for m in s1_coin_metrics],
-            "filter_stats": dict(s1_fc),
-            "trades": s1_trades,
+            "aggregate": safe(s1_agg), "per_coin": [safe(m) for m in s1_coin_metrics],
+            "filter_stats": dict(s1_fc), "trades": s1_trades,
         },
         "S2_no_4h_filter": {
-            "aggregate": safe(s2_agg),
-            "per_coin": [safe(m) for m in s2_coin_metrics],
-            "filter_stats": dict(s2_fc),
-            "trades": s2_trades,
+            "aggregate": safe(s2_agg), "per_coin": [safe(m) for m in s2_coin_metrics],
+            "filter_stats": dict(s2_fc), "trades": s2_trades,
         }
     }
     with open("backtest_report.json", "w") as f:
         json.dump(report, f, indent=2)
-    print("  ✓ backtest_report.json")
+    print("  wrote backtest_report.json")
 
     print("\n" + "="*65)
     print(full_txt)
 
 if __name__ == "__main__":
     main()
-
