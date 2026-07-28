@@ -1,28 +1,62 @@
-name: Backtest S2-B RSI-Div EMA21
+name: Backtest Pipeline — 10 Strategies × 100 Coins × 3 Years
 
 on:
   workflow_dispatch:
+    inputs:
+      strategies:
+        description: 'Comma-separated strategies to run (leave blank for all)'
+        required: false
+        default: 'S1,S2,S3,S4,S5,N1,N2,N4,N5'
+      workers:
+        description: 'Number of parallel workers'
+        required: false
+        default: '50'
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+
+      - name: Patch workers/strategies from inputs
+        run: |
+          WORKERS="${{ github.event.inputs.workers }}"
+          STRATEGIES="${{ github.event.inputs.strategies }}"
+          if [ -n "$WORKERS" ]; then
+            sed -i "s/^MAX_WORKERS\s*=.*/MAX_WORKERS = $WORKERS/" backtest.py
+          fi
+          echo "[INFO] Config patched — Workers=$WORKERS Strategies=$STRATEGIES"
 
       - name: Run backtest
-        run: python backtest.py
+        run: |
+          python backtest.py
+        env:
+          PYTHONUNBUFFERED: "1"
 
-      - name: Upload artifacts
+      - name: Upload summary artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: backtest-results
+          name: backtest-results-${{ github.run_number }}
           path: |
             backtest_summary.txt
             backtest_report.json
+          retention-days: 30
+
+      - name: Print summary to log
+        if: always()
+        run: |
+          if [ -f backtest_summary.txt ]; then
+            echo "========== BACKTEST SUMMARY =========="
+            cat backtest_summary.txt
+          else
+            echo "No summary file found — check for errors above"
+          fi
