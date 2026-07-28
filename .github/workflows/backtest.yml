@@ -1,14 +1,14 @@
-name: SuperTrend v8 Backtest
+name: Backtest
 
 on:
   workflow_dispatch: {}
 
 jobs:
-  backtest:
+  run-backtest:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -22,7 +22,7 @@ jobs:
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-v8-results
+          name: backtest-results-${{ github.run_id }}
           path: |
             backtest_summary.txt
             backtest_report.json
