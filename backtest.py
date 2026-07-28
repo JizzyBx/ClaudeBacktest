@@ -20,6 +20,7 @@ EXTRA DIAGNOSTICS (no signal change):
 
 import urllib.request, zipfile, io, csv, json, math, time, sys
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -287,18 +288,28 @@ def backtest_all(max_pos_limit, sym_data=None, sym_idx=None, timeline=None):
     trades    = []
 
     if sym_data is None:
-        print(f"\n[Phase 1] Fetching data for {len(SYMBOLS)} symbols...")
-        sym_data     = {}
-        fetch_fails  = 0
-        for i, sym in enumerate(SYMBOLS, 1):
-            print(f"  {i:3d}/{len(SYMBOLS)}  {sym}", flush=True)
+        print(f"\n[Phase 1] Fetching data for {len(SYMBOLS)} symbols in parallel (20 workers)...")
+        sym_data    = {}
+        fetch_fails = 0
+        completed   = 0
+        lock_print  = __import__('threading').Lock()
+
+        def fetch_one(sym):
             candles = fetch_symbol(sym)
-            if len(candles) >= MIN_BARS:
-                sym_data[sym] = candles
-            else:
-                print(f"         → skipped ({len(candles)} candles)")
-                fetch_fails += 1
-            time.sleep(0.05)
+            return sym, candles
+
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(fetch_one, sym): sym for sym in SYMBOLS}
+            for fut in as_completed(futures):
+                sym, candles = fut.result()
+                completed += 1
+                with lock_print:
+                    if len(candles) >= MIN_BARS:
+                        sym_data[sym] = candles
+                        print(f"  {completed:3d}/{len(SYMBOLS)}  {sym}  ({len(candles)} bars)", flush=True)
+                    else:
+                        fetch_fails += 1
+                        print(f"  {completed:3d}/{len(SYMBOLS)}  {sym}  → skipped ({len(candles)} candles)", flush=True)
 
         if not sym_data:
             print("FATAL: No data fetched. Check network / geo-block.")
