@@ -1,17 +1,17 @@
-name: Backtest
+name: Backtest S2-B RSI-Div EMA21
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
-  run-backtest:
+  backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    timeout-minutes: 360
 
-      - name: Set up Python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -19,11 +19,10 @@ jobs:
       - name: Run backtest
         run: python backtest.py
 
-      - name: Upload results
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results-${{ github.run_id }}
+          name: backtest-results
           path: |
             backtest_summary.txt
             backtest_report.json
-          if-no-files-found: warn
