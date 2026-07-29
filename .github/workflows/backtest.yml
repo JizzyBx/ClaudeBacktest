@@ -1,32 +1,35 @@
-name: Binance Futures Backtest Pipeline
+name: Backtest — 5 Variants (50 Coins, 3 Years)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
-  run-backtest:
+  backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Run Binance Futures Backtest
+      - name: Run backtest
         run: python backtest.py
 
-      - name: Upload Backtest Summary & Report Artifacts
+      - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
-          path: |
-            backtest_summary.txt
-            backtest_report.json
+          name: backtest-summary
+          path: backtest_summary.txt
+          retention-days: 30
+
+      - name: Upload JSON report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-report-json
+          path: backtest_report.json
           retention-days: 30
