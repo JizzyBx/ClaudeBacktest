@@ -1,4 +1,4 @@
-name: Backtest — 5 Variants (50 Coins, 3 Years)
+name: InfinityX Backtest
 
 on:
   workflow_dispatch:
@@ -9,27 +9,20 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Run backtest
-        run: python backtest_v7.py
+      - name: Run Backtest
+        run: python backtest.py
 
-      - name: Upload summary
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-summary
-          path: backtest_summary.txt
-          retention-days: 30
-
-      - name: Upload JSON report
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-report-json
-          path: backtest_report.json
-          retention-days: 30
+          name: backtest-results
+          path: |
+            backtest_summary.txt
+            backtest_report.json
