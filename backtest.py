@@ -117,38 +117,48 @@ FALLBACK_SYMBOLS = [
 # on, especially when Binance Vision already gives free, official OHLCV.
 # ---------------------------------------------------------------------------
 
-COINGECKO_TICKERS_URL = "https://api.coingecko.com/api/v3/exchanges/binance_futures/tickers"
+COINGECKO_DERIVATIVES_URL = "https://api.coingecko.com/api/v3/derivatives/exchanges/binance_futures"
 COINGECKO_API_KEY = ""  # optional: paste a free CoinGecko Demo API key here if this starts 401'ing
 
 
 def _fetch_symbols_coingecko():
-    """Primary source: CoinGecko's public 'binance_futures' exchange ticker
-    list. Free, no auth required for this endpoint as of now (a demo key
-    can be added above if that changes). Paginated ~100 tickers/page."""
-    symbols = set()
-    page = 1
-    while page <= 15:  # generous cap; Binance USDT-M perps are a few hundred
-        url = f"{COINGECKO_TICKERS_URL}?page={page}"
-        if COINGECKO_API_KEY:
-            url += f"&x_cg_demo_api_key={COINGECKO_API_KEY}"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "backtest-v8.5"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            print(f"[symbol discovery] CoinGecko page {page} failed: {e}")
-            break
+    """Primary source: CoinGecko's derivatives-exchange endpoint for
+    Binance Futures. NOTE: /exchanges/{id}/tickers (what v8.5 used) is the
+    SPOT-exchange endpoint — CoinGecko's own docs say derivatives exchanges
+    like binance_futures must use /derivatives/exchanges/{id} instead, which
+    is why that call came back empty every time. This is a single call
+    (include_tickers=all returns the full list, no pagination needed),
+    free/keyless, same as before."""
+    url = f"{COINGECKO_DERIVATIVES_URL}?include_tickers=all"
+    if COINGECKO_API_KEY:
+        url += f"&x_cg_demo_api_key={COINGECKO_API_KEY}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "backtest-v8.6"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[symbol discovery] CoinGecko derivatives call failed: {e}")
+        return []
 
-        tickers = data.get("tickers", [])
-        if not tickers:
-            break
-        for t in tickers:
-            base = (t.get("base") or "").upper().strip()
-            target = (t.get("target") or "").upper().strip()
-            if target == "USDT" and base and "_" not in base:
-                symbols.add(f"{base}USDT")
-        page += 1
-        time.sleep(1.5)  # stay well under the free-tier rate limit
+    tickers = data.get("tickers", [])
+    if not tickers:
+        print(f"[symbol discovery] CoinGecko returned 0 tickers (response keys: {list(data.keys())})")
+        return []
+
+    symbols = set()
+    for t in tickers:
+        symbol = (t.get("symbol") or "").upper().strip()
+        target = (t.get("target") or "").upper().strip()
+        contract = (t.get("contract_type") or "").lower().strip()
+        expired = t.get("expired_at")
+        if (
+            target == "USDT"
+            and contract == "perpetual"
+            and expired is None
+            and symbol.endswith("USDT")
+            and "_" not in symbol
+        ):
+            symbols.add(symbol)
 
     return sorted(symbols)
 
@@ -752,7 +762,7 @@ def write_outputs(variant_reports, issues, symbols):
 
     report = {
         "meta": {
-            "version": "v8.5",
+            "version": "v8.6",
             "period": f"{START_YM[0]}-{START_YM[1]:02d} -> {END_YM[0]}-{END_YM[1]:02d}",
             "symbols_tested": len(symbols),
             "variants": {k: {"tp": v["tp"], "sl": v["sl"], "filters": v["filters"]} for k, v in VARIANTS.items()},
