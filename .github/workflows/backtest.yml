@@ -1,4 +1,4 @@
-name: InfinityX Backtest
+name: Backtest v8 — Fixed % TP/SL
 
 on:
   workflow_dispatch:
@@ -6,12 +6,13 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -20,9 +21,11 @@ jobs:
         run: python backtest.py
 
       - name: Upload Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
+          name: backtest-results-v8
           path: |
             backtest_summary.txt
             backtest_report.json
+          retention-days: 30
