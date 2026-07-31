@@ -101,18 +101,64 @@ FALLBACK_SYMBOLS = [
 
 # ---------------------------------------------------------------------------
 # SYMBOL DISCOVERY
+#
+# v8.4 tried listing the Binance Vision S3 bucket directly (?delimiter=/
+# &prefix=...). That came back empty on the actual run — 35 symbols out,
+# exactly the hardcoded FALLBACK_SYMBOLS count, meaning the call failed
+# outright. Likely cause: the bucket serves individual objects publicly but
+# doesn't expose the S3 ListObjects operation itself (common setup — read
+# access to files doesn't imply read access to the directory listing).
+# So v8.5 gets the SYMBOL LIST from CoinGecko's public exchange-tickers API
+# instead (exactly what was asked for — a third-party site for names/
+# symbols) and still gets all the CANDLE DATA from Binance Vision zips,
+# unchanged. TradingView was considered too: it has no public bulk-download
+# historical-data API, and pulling its chart data any other way means
+# scraping a site whose terms explicitly prohibit that — not worth building
+# on, especially when Binance Vision already gives free, official OHLCV.
 # ---------------------------------------------------------------------------
 
-def fetch_all_futures_symbols():
-    """Pull the live USDT-M perpetual symbol list from the Binance Vision
-    static bucket listing (NOT the fapi REST API — that's 451-blocked on
-    GH Actions runners). Falls back to FALLBACK_SYMBOLS on any failure.
-    Excludes dated/quarterly contracts (they contain an underscore, e.g.
-    BTCUSDT_240329) and non-USDT-margined pairs.
-    """
+COINGECKO_TICKERS_URL = "https://api.coingecko.com/api/v3/exchanges/binance_futures/tickers"
+COINGECKO_API_KEY = ""  # optional: paste a free CoinGecko Demo API key here if this starts 401'ing
+
+
+def _fetch_symbols_coingecko():
+    """Primary source: CoinGecko's public 'binance_futures' exchange ticker
+    list. Free, no auth required for this endpoint as of now (a demo key
+    can be added above if that changes). Paginated ~100 tickers/page."""
+    symbols = set()
+    page = 1
+    while page <= 15:  # generous cap; Binance USDT-M perps are a few hundred
+        url = f"{COINGECKO_TICKERS_URL}?page={page}"
+        if COINGECKO_API_KEY:
+            url += f"&x_cg_demo_api_key={COINGECKO_API_KEY}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "backtest-v8.5"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"[symbol discovery] CoinGecko page {page} failed: {e}")
+            break
+
+        tickers = data.get("tickers", [])
+        if not tickers:
+            break
+        for t in tickers:
+            base = (t.get("base") or "").upper().strip()
+            target = (t.get("target") or "").upper().strip()
+            if target == "USDT" and base and "_" not in base:
+                symbols.add(f"{base}USDT")
+        page += 1
+        time.sleep(1.5)  # stay well under the free-tier rate limit
+
+    return sorted(symbols)
+
+
+def _fetch_symbols_vision_bucket():
+    """Secondary source: try the Vision bucket listing directly. Kept as a
+    fallback in case CoinGecko is unreachable/rate-limited on a given run."""
     try:
         req = urllib.request.Request(
-            VISION_LIST_URL, headers={"User-Agent": "backtest-v8.4"}
+            VISION_LIST_URL, headers={"User-Agent": "backtest-v8.5"}
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             xml = resp.read().decode("utf-8", errors="ignore")
@@ -124,17 +170,29 @@ def fetch_all_futures_symbols():
             sym = sym.strip("/")
             if sym.endswith("USDT") and "_" not in sym and sym.isupper():
                 symbols.add(sym)
-
-        if not symbols:
-            print("[symbol discovery] bucket listing returned 0 symbols, falling back")
-            return sorted(FALLBACK_SYMBOLS)
-
-        print(f"[symbol discovery] found {len(symbols)} live USDT-M symbols from Vision bucket")
         return sorted(symbols)
-
     except Exception as e:
-        print(f"[symbol discovery] failed ({e}), falling back to hardcoded list")
-        return sorted(FALLBACK_SYMBOLS)
+        print(f"[symbol discovery] Vision bucket listing failed: {e}")
+        return []
+
+
+def fetch_all_futures_symbols():
+    """Try CoinGecko first, then the Vision bucket listing, then fall back
+    to the hardcoded backup list. Candle data always comes from Binance
+    Vision regardless of which source names the symbols."""
+    symbols = _fetch_symbols_coingecko()
+    if symbols:
+        print(f"[symbol discovery] found {len(symbols)} USDT-M symbols via CoinGecko")
+        return symbols
+
+    print("[symbol discovery] CoinGecko returned nothing, trying Vision bucket listing")
+    symbols = _fetch_symbols_vision_bucket()
+    if symbols:
+        print(f"[symbol discovery] found {len(symbols)} USDT-M symbols via Vision bucket")
+        return symbols
+
+    print("[symbol discovery] both sources failed, falling back to hardcoded list")
+    return sorted(FALLBACK_SYMBOLS)
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +752,7 @@ def write_outputs(variant_reports, issues, symbols):
 
     report = {
         "meta": {
-            "version": "v8.4",
+            "version": "v8.5",
             "period": f"{START_YM[0]}-{START_YM[1]:02d} -> {END_YM[0]}-{END_YM[1]:02d}",
             "symbols_tested": len(symbols),
             "variants": {k: {"tp": v["tp"], "sl": v["sl"], "filters": v["filters"]} for k, v in VARIANTS.items()},
