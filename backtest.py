@@ -1,74 +1,43 @@
 """
-Binance USDT-M Futures Strategy Backtest — v8.4
-Stdlib only (Python 3.11). Runs on GitHub Actions.
-
-WHAT'S NEW IN v8.4 vs v8.3:
-1. Symbol list is now pulled LIVE from the Binance Vision static bucket
-   (data.binance.vision) at run start, instead of a hardcoded SYMBOLS list.
-   This covers every USDT-M perpetual with kline history, not just the ~130
-   that were manually listed before. Falls back to a hardcoded backup list
-   if the bucket listing call fails for any reason (rate limit, schema
-   change, etc) so a bad run never means zero coins.
-   NOTE: the fapi.binance.com REST API (incl. /fapi/v1/exchangeInfo) is
-   451-blocked on GH Actions runners — that's why this uses the Vision
-   *static* bucket listing (different domain, just serves zip files) rather
-   than exchangeInfo. This is the first live run of that discovery code —
-   watch the "[symbol discovery]" log line in Actions output; if it falls
-   back, that's a signal to debug the bucket-listing endpoint, not silently
-   trust the backup list.
-
-2. Variants: G and H are unchanged (still the SL 15% base). Added:
-     J1  = TP 5% / SL 15%   (ratio 1:3   -> breakeven WR ~75.0%)
-     J2  = TP 3% / SL 10%   (ratio 1:3.3 -> breakeven WR ~76.9%)
-     J3  = TP 5% / SL 10%   (ratio 1:2   -> breakeven WR ~66.7%)
-   plus the same three with a confirmation filter stack (like variant I
-   had) to see if better-quality entries clear the now-lower breakeven bar
-   by a wider margin instead of sitting right on it like G/H did in v8.3:
-     J1F, J2F, J3F = same TP/SL as J1/J2/J3 + filters:
-       - ADX(14) >= 27 (raised from base 22)
-       - MACD(12,26,9) histogram agrees with trade direction
-       - Volume > 1.5x its 20-bar average
-       - 50EMA slope over 40 bars (~10h) agrees with trade direction
-
-WHY THIS MATTERS (v8.3 finding): position size = risk / SL%, so TP:SL ratio
-directly sets the breakeven win rate needed just to cover fees/slippage.
-G (1:5 ratio) needs 83.3% WR to break even and v8.3 actually landed at
-83.35% WR — dead on the line, so fees alone made it PF 0.946. J1/J2/J3 cut
-that required WR to 66-77%, which should leave real room above breakeven
-instead of balancing on it.
+Backtest v8.5 — Full Binance USDT-M Futures universe
+- Symbols: auto-discovered from data.binance.vision S3 bucket (no fapi needed)
+- Timeframe: 30m candles, 2-year history (2024-07 to 2026-06)
+- Variants: G, H, J1, J2, J3, J1F, J2F, J3F (same as v8.4)
+- Infrastructure: GitHub Actions, ProcessPoolExecutor, stdlib only
 """
 
-import csv
-import io
-import json
-import math
-import re
-import statistics
-import time
-import urllib.error
-import urllib.request
-import zipfile
+import os, sys, io, csv, json, math, time, zipfile, urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import date
+import multiprocessing
 
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+INTERVAL        = "30m"
+CAPITAL         = 10_000.0
+RISK_PCT        = 0.0075
+FEE             = 0.0005
+SLIP            = 0.0002
+MAX_POSITIONS   = 5
+ADX_MIN         = 22
+FILTER_ADX_MIN  = 27        # stricter ADX for F-variants
+RSI_LONG_MIN    = 45
+RSI_SHORT_MAX   = 55
+COOLDOWN_BARS   = 4
+WARMUP_BARS     = 100
+MAX_WORKERS     = 60
 
-CAPITAL = 10_000.0
-RISK_PCT = 0.0075
-FEE = 0.0005
-SLIP = 0.0002
-MAX_POSITIONS = 5
-ADX_MIN = 22
-RSI_LONG_MIN = 45
-RSI_SHORT_MAX = 55
-COOLDOWN_BARS = 4
-WARMUP_BARS = 100
-INTERVAL = "15m"
+# Date range: July 2024 → June 2026 (24 months)
+MONTHS = []
+for y in range(2024, 2027):
+    for m in range(1, 13):
+        if (y == 2024 and m < 7): continue
+        if (y == 2026 and m > 6): break
+        MONTHS.append(f"{y}-{m:02d}")
 
-START_YM = (2024, 7)
-END_YM = (2026, 6)
+BASE_URL = "https://data.binance.vision"
+S3_URL   = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 
 VARIANTS = {
     "G":   {"tp": 0.03, "sl": 0.15, "filters": False},
@@ -81,710 +50,575 @@ VARIANTS = {
     "J3F": {"tp": 0.05, "sl": 0.10, "filters": True},
 }
 
-FILTER_ADX_MIN = 27
-FILTER_VOL_MULT = 1.5
-FILTER_HTF_BARS = 40  # ~10h at 15m candles
-
-VISION_LIST_URL = "https://data.binance.vision/?delimiter=/&prefix=data/futures/um/monthly/klines/"
-VISION_ZIP_URL = "https://data.binance.vision/data/futures/um/monthly/klines/{sym}/{interval}/{sym}-{interval}-{yyyy}-{mm}.zip"
-
-# Backup list used only if the live bucket listing fails outright.
-FALLBACK_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT", "ADAUSDT",
-    "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "ATOMUSDT", "UNIUSDT",
-    "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "SUIUSDT", "INJUSDT",
-    "TRXUSDT", "BNBUSDT", "1000PEPEUSDT", "1000BONKUSDT", "1000SHIBUSDT",
-    "WIFUSDT", "1000FLOKIUSDT", "SEIUSDT", "TIAUSDT", "STRKUSDT", "ALGOUSDT",
-    "SNXUSDT", "FETUSDT", "MANAUSDT", "IMXUSDT", "XLMUSDT", "WLDUSDT",
-]
-
-
-# ---------------------------------------------------------------------------
-# SYMBOL DISCOVERY
-#
-# v8.4 tried listing the Binance Vision S3 bucket directly (?delimiter=/
-# &prefix=...). That came back empty on the actual run — 35 symbols out,
-# exactly the hardcoded FALLBACK_SYMBOLS count, meaning the call failed
-# outright. Likely cause: the bucket serves individual objects publicly but
-# doesn't expose the S3 ListObjects operation itself (common setup — read
-# access to files doesn't imply read access to the directory listing).
-# So v8.5 gets the SYMBOL LIST from CoinGecko's public exchange-tickers API
-# instead (exactly what was asked for — a third-party site for names/
-# symbols) and still gets all the CANDLE DATA from Binance Vision zips,
-# unchanged. TradingView was considered too: it has no public bulk-download
-# historical-data API, and pulling its chart data any other way means
-# scraping a site whose terms explicitly prohibit that — not worth building
-# on, especially when Binance Vision already gives free, official OHLCV.
-# ---------------------------------------------------------------------------
-
-COINGECKO_DERIVATIVES_URL = "https://api.coingecko.com/api/v3/derivatives/exchanges/binance_futures"
-COINGECKO_API_KEY = ""  # optional: paste a free CoinGecko Demo API key here if this starts 401'ing
-
-
-def _fetch_symbols_coingecko():
-    """Primary source: CoinGecko's derivatives-exchange endpoint for
-    Binance Futures. NOTE: /exchanges/{id}/tickers (what v8.5 used) is the
-    SPOT-exchange endpoint — CoinGecko's own docs say derivatives exchanges
-    like binance_futures must use /derivatives/exchanges/{id} instead, which
-    is why that call came back empty every time. This is a single call
-    (include_tickers=all returns the full list, no pagination needed),
-    free/keyless, same as before."""
-    url = f"{COINGECKO_DERIVATIVES_URL}?include_tickers=all"
-    if COINGECKO_API_KEY:
-        url += f"&x_cg_demo_api_key={COINGECKO_API_KEY}"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "backtest-v8.6"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[symbol discovery] CoinGecko derivatives call failed: {e}")
-        return []
-
-    tickers = data.get("tickers", [])
-    if not tickers:
-        print(f"[symbol discovery] CoinGecko returned 0 tickers (response keys: {list(data.keys())})")
-        return []
-
-    symbols = set()
-    for t in tickers:
-        symbol = (t.get("symbol") or "").upper().strip()
-        target = (t.get("target") or "").upper().strip()
-        contract = (t.get("contract_type") or "").lower().strip()
-        expired = t.get("expired_at")
-        if (
-            target == "USDT"
-            and contract == "perpetual"
-            and expired is None
-            and symbol.endswith("USDT")
-            and "_" not in symbol
-        ):
-            symbols.add(symbol)
-
-    return sorted(symbols)
-
-
-def _fetch_symbols_vision_bucket():
-    """Secondary source: try the Vision bucket listing directly. Kept as a
-    fallback in case CoinGecko is unreachable/rate-limited on a given run."""
-    try:
-        req = urllib.request.Request(
-            VISION_LIST_URL, headers={"User-Agent": "backtest-v8.5"}
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            xml = resp.read().decode("utf-8", errors="ignore")
-
-        prefixes = re.findall(r"<Prefix>(.*?)</Prefix>", xml)
-        symbols = set()
-        for p in prefixes:
-            sym = p.rsplit("/", 2)[-2] if p.endswith("/") else p.split("/")[-1]
-            sym = sym.strip("/")
-            if sym.endswith("USDT") and "_" not in sym and sym.isupper():
-                symbols.add(sym)
-        return sorted(symbols)
-    except Exception as e:
-        print(f"[symbol discovery] Vision bucket listing failed: {e}")
-        return []
-
-
-def fetch_all_futures_symbols():
-    """Try CoinGecko first, then the Vision bucket listing, then fall back
-    to the hardcoded backup list. Candle data always comes from Binance
-    Vision regardless of which source names the symbols."""
-    symbols = _fetch_symbols_coingecko()
-    if symbols:
-        print(f"[symbol discovery] found {len(symbols)} USDT-M symbols via CoinGecko")
-        return symbols
-
-    print("[symbol discovery] CoinGecko returned nothing, trying Vision bucket listing")
-    symbols = _fetch_symbols_vision_bucket()
-    if symbols:
-        print(f"[symbol discovery] found {len(symbols)} USDT-M symbols via Vision bucket")
-        return symbols
-
-    print("[symbol discovery] both sources failed, falling back to hardcoded list")
-    return sorted(FALLBACK_SYMBOLS)
-
-
-# ---------------------------------------------------------------------------
-# DATA FETCH
-# ---------------------------------------------------------------------------
-
-def month_range(start_ym, end_ym):
-    y, m = start_ym
-    ey, em = end_ym
-    out = []
-    while (y, m) <= (ey, em):
-        out.append((y, m))
-        m += 1
-        if m == 13:
-            m = 1
-            y += 1
-    return out
-
-
-def fetch_symbol_data(symbol):
-    """Download + parse all monthly klines for a symbol. Returns list of
-    bar dicts sorted by open_time, or None if no data at all."""
-    bars = []
-    for (y, m) in month_range(START_YM, END_YM):
-        url = VISION_ZIP_URL.format(sym=symbol, interval=INTERVAL, yyyy=y, mm=f"{m:02d}")
+# ── SYMBOL DISCOVERY ────────────────────────────────────────────────────────
+def discover_symbols():
+    """Fetch all USDT perpetual futures symbols from data.binance.vision S3 listing."""
+    prefix    = f"data/futures/um/monthly/klines/"
+    delimiter = "/"
+    url = f"{S3_URL}?prefix={prefix}&delimiter={delimiter}"
+    symbols = []
+    marker = ""
+    while True:
+        req_url = url + (f"&marker={marker}" if marker else "")
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "backtest-v8.4"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                continue  # symbol didn't exist / no data that month
-            print(f"[{symbol}] HTTP {e.code} for {y}-{m:02d}")
-            continue
+            with urllib.request.urlopen(req_url, timeout=30) as r:
+                xml_data = r.read()
         except Exception as e:
-            print(f"[{symbol}] fetch failed {y}-{m:02d}: {e}")
-            continue
+            print(f"[WARN] S3 listing failed: {e}", flush=True)
+            break
 
+        root = ET.fromstring(xml_data)
+        ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+
+        for cp in root.findall("s3:CommonPrefixes", ns):
+            p = cp.find("s3:Prefix", ns).text  # e.g. data/futures/um/monthly/klines/BTCUSDT/
+            sym = p.rstrip("/").split("/")[-1]
+            if sym.endswith("USDT") and "_" not in sym:  # skip quarterly contracts like BTCUSDT_250627
+                symbols.append(sym)
+
+        is_truncated = root.find("s3:IsTruncated", ns)
+        if is_truncated is not None and is_truncated.text.lower() == "true":
+            # get next marker
+            last = root.find("s3:NextMarker", ns)
+            if last is not None:
+                marker = last.text
+            else:
+                # fallback: use last CommonPrefixes
+                all_cp = root.findall("s3:CommonPrefixes", ns)
+                if all_cp:
+                    marker = all_cp[-1].find("s3:Prefix", ns).text
+                else:
+                    break
+        else:
+            break
+
+    # Known problem coins — skip upfront (HTTP 400 / delisted / bad data)
+    BAD = {"1000FLOKIUSDT", "COCOUSDT", "MUBARAKUSDT", "TSTUSDT", "OMUSDT", "ACTUSDT"}
+    symbols = [s for s in symbols if s not in BAD]
+
+    # Fix known renames
+    renamed = []
+    for s in symbols:
+        if s == "MATICUSDT":
+            renamed.append("POLUSDT")
+        else:
+            renamed.append(s)
+    return sorted(set(renamed))
+
+# ── DATA FETCHING ────────────────────────────────────────────────────────────
+def fetch_month(symbol, month, interval):
+    """Download one monthly zip from data.binance.vision, return list of OHLCV rows."""
+    sym_dl = symbol
+    # POLUSDT was MATICUSDT on Binance before rename — try both
+    candidates = [sym_dl]
+    if sym_dl == "POLUSDT":
+        candidates = ["POLUSDT", "MATICUSDT"]
+
+    for sym in candidates:
+        url = f"{BASE_URL}/data/futures/um/monthly/klines/{sym}/{interval}/{sym}-{interval}-{month}.zip"
         try:
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = r.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 name = zf.namelist()[0]
                 with zf.open(name) as f:
-                    text = io.TextIOWrapper(f, encoding="utf-8")
-                    reader = csv.reader(text)
-                    for row in reader:
-                        if not row or row[0] in ("open_time",):
-                            continue
-                        try:
-                            bars.append({
-                                "t": int(row[0]),
-                                "o": float(row[1]),
-                                "h": float(row[2]),
-                                "l": float(row[3]),
-                                "c": float(row[4]),
-                                "v": float(row[5]),
-                            })
-                        except (ValueError, IndexError):
-                            continue
-        except zipfile.BadZipFile:
-            print(f"[{symbol}] bad zip for {y}-{m:02d}")
-            continue
-
-    if not bars:
-        return None
-    bars.sort(key=lambda b: b["t"])
-    return bars
-
-
-# ---------------------------------------------------------------------------
-# INDICATORS (pure python, stdlib only)
-# ---------------------------------------------------------------------------
-
-def ema_series(values, period):
-    k = 2.0 / (period + 1)
-    out = [None] * len(values)
-    ema = None
-    for i, v in enumerate(values):
-        if ema is None:
-            if i + 1 == period:
-                ema = sum(values[:period]) / period
-                out[i] = ema
-            continue
-        ema = v * k + ema * (1 - k)
-        out[i] = ema
-    return out
-
-
-def rsi_series(closes, period=14):
-    out = [None] * len(closes)
-    if len(closes) <= period:
-        return out
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    rs = avg_gain / avg_loss if avg_loss else float("inf")
-    out[period] = 100 - 100 / (1 + rs) if avg_loss else 100.0
-    for i in range(period + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gain = max(d, 0)
-        loss = max(-d, 0)
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        rs = avg_gain / avg_loss if avg_loss else float("inf")
-        out[i] = 100 - 100 / (1 + rs) if avg_loss else 100.0
-    return out
-
-
-def adx_series(highs, lows, closes, period=14):
-    n = len(closes)
-    out = [None] * n
-    if n <= period * 2:
-        return out
-    tr, plus_dm, minus_dm = [0.0] * n, [0.0] * n, [0.0] * n
-    for i in range(1, n):
-        up = highs[i] - highs[i - 1]
-        down = lows[i - 1] - lows[i]
-        plus_dm[i] = up if (up > down and up > 0) else 0.0
-        minus_dm[i] = down if (down > up and down > 0) else 0.0
-        tr[i] = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-
-    atr = sum(tr[1:period + 1]) / period
-    p_dm = sum(plus_dm[1:period + 1]) / period
-    m_dm = sum(minus_dm[1:period + 1]) / period
-    dx_list = [None] * n
-
-    def _dx(p_di, m_di):
-        s = p_di + m_di
-        return 100 * abs(p_di - m_di) / s if s else 0.0
-
-    p_di = 100 * p_dm / atr if atr else 0.0
-    m_di = 100 * m_dm / atr if atr else 0.0
-    dx_list[period] = _dx(p_di, m_di)
-
-    for i in range(period + 1, n):
-        atr = (atr * (period - 1) + tr[i]) / period
-        p_dm = (p_dm * (period - 1) + plus_dm[i]) / period
-        m_dm = (m_dm * (period - 1) + minus_dm[i]) / period
-        p_di = 100 * p_dm / atr if atr else 0.0
-        m_di = 100 * m_dm / atr if atr else 0.0
-        dx_list[i] = _dx(p_di, m_di)
-
-    idx0 = period * 2
-    if idx0 < n and all(dx_list[period:idx0 + 1]):
-        adx = sum(x for x in dx_list[period:idx0 + 1] if x is not None) / (idx0 - period + 1)
-        out[idx0] = adx
-        for i in range(idx0 + 1, n):
-            if dx_list[i] is None:
+                    rows = list(csv.reader(io.TextIOWrapper(f)))
+            # strip header if present
+            if rows and not rows[0][0].lstrip('-').isdigit():
+                rows = rows[1:]
+            return [[float(c) for c in r[:6]] for r in rows if len(r) >= 6]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
                 continue
-            adx = (adx * (period - 1) + dx_list[i]) / period
-            out[i] = adx
-    return out
+            raise
+        except Exception:
+            continue
+    return []
 
+def fetch_symbol_data(symbol, interval, months):
+    """Fetch all months for a symbol, return combined OHLCV list."""
+    bars = []
+    for month in months:
+        bars.extend(fetch_month(symbol, month, interval))
+    return bars  # [[open_time, open, high, low, close, volume], ...]
 
-def macd_hist_series(closes, fast=12, slow=26, signal=9):
-    ema_fast = ema_series(closes, fast)
-    ema_slow = ema_series(closes, slow)
-    macd_line = [
-        (a - b) if (a is not None and b is not None) else None
-        for a, b in zip(ema_fast, ema_slow)
-    ]
-    valid = [x for x in macd_line if x is not None]
-    if len(valid) < signal:
-        return [None] * len(closes)
+# ── INDICATORS ───────────────────────────────────────────────────────────────
+def ema(vals, period):
+    k = 2.0 / (period + 1)
+    result = [None] * len(vals)
+    for i, v in enumerate(vals):
+        if i == 0:
+            result[i] = v
+        else:
+            result[i] = v * k + result[i-1] * (1 - k)
+    return result
+
+def compute_adx(highs, lows, closes, period=14):
+    n = len(closes)
+    adx = [None] * n
+    if n < period * 2 + 1:
+        return adx
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, n):
+        h, l, pc = highs[i], lows[i], closes[i-1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        pdm = max(highs[i] - highs[i-1], 0) if (highs[i] - highs[i-1]) > (lows[i-1] - lows[i]) else 0
+        ndm = max(lows[i-1] - lows[i], 0) if (lows[i-1] - lows[i]) > (highs[i] - highs[i-1]) else 0
+        tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
+
+    def smooth(lst, p):
+        s = [None] * len(lst)
+        s[p-1] = sum(lst[:p])
+        for i in range(p, len(lst)):
+            s[i] = s[i-1] - s[i-1]/p + lst[i]
+        return s
+
+    atr = smooth(tr_list, period)
+    pdi_s = smooth(pdm_list, period)
+    ndi_s = smooth(ndm_list, period)
+    dx_list = []
+    for i in range(period-1, len(tr_list)):
+        a = atr[i]; p = pdi_s[i]; nd = ndi_s[i]
+        if a == 0: dx_list.append(0); continue
+        pdi = 100 * p / a; ndi = 100 * nd / a
+        dx = 100 * abs(pdi - ndi) / (pdi + ndi) if (pdi + ndi) > 0 else 0
+        dx_list.append(dx)
+
+    # smooth DX into ADX
+    adx_vals = smooth(dx_list, period)
+    offset = period  # adx_vals[0] corresponds to index period in original
+    for i in range(len(adx_vals)):
+        orig_i = i + offset
+        if orig_i < n and adx_vals[i] is not None:
+            adx[orig_i] = adx_vals[i]
+    return adx
+
+def compute_rsi(closes, period=14):
+    n = len(closes)
+    rsi = [None] * n
+    if n < period + 1:
+        return rsi
+    gains, losses = [], []
+    for i in range(1, n):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, n):
+        if i > period:
+            avg_g = (avg_g * (period-1) + gains[i-1]) / period
+            avg_l = (avg_l * (period-1) + losses[i-1]) / period
+        rsi[i] = 100 - 100/(1 + avg_g/avg_l) if avg_l != 0 else 100
+    return rsi
+
+def compute_macd(closes, fast=12, slow=26, signal=9):
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line = [f - s if f and s else None for f, s in zip(ema_fast, ema_slow)]
+    valid = [v for v in macd_line if v is not None]
+    sig_raw = ema(valid, signal)
     sig_full = [None] * len(macd_line)
-    start = next(i for i, x in enumerate(macd_line) if x is not None)
-    sig_vals = ema_series(macd_line[start:], signal)
-    for i, v in enumerate(sig_vals):
-        sig_full[start + i] = v
-    hist = [
-        (m - s) if (m is not None and s is not None) else None
-        for m, s in zip(macd_line, sig_full)
-    ]
+    vi = 0
+    for i, v in enumerate(macd_line):
+        if v is not None:
+            sig_full[i] = sig_raw[vi]; vi += 1
+    hist = [m - s if m is not None and s is not None else None
+            for m, s in zip(macd_line, sig_full)]
     return hist
 
+# ── SIGNAL GENERATION ────────────────────────────────────────────────────────
+def compute_signals(bars, variant='G'):
+    """Return list of signal dicts for each bar."""
+    use_filters = VARIANTS[variant]["filters"]
+    adx_thresh = FILTER_ADX_MIN if use_filters else ADX_MIN
 
-# ---------------------------------------------------------------------------
-# SIGNAL LOGIC
-# ---------------------------------------------------------------------------
-
-def compute_signals(bars, use_filters):
-    """Returns list of 'long' / 'short' / None per bar index."""
-    closes = [b["c"] for b in bars]
-    highs = [b["h"] for b in bars]
-    lows = [b["l"] for b in bars]
-    vols = [b["v"] for b in bars]
+    opens  = [b[1] for b in bars]
+    highs  = [b[2] for b in bars]
+    lows   = [b[3] for b in bars]
+    closes = [b[4] for b in bars]
+    vols   = [b[5] for b in bars]
     n = len(bars)
 
-    ema9 = ema_series(closes, 9)
-    ema21 = ema_series(closes, 21)
-    ema50 = ema_series(closes, 50)
-    rsi = rsi_series(closes, 14)
-    adx = adx_series(highs, lows, closes, 14)
-    macd_hist = macd_hist_series(closes) if use_filters else [None] * n
+    ema9  = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    ema50 = ema(closes, 50)
+    adx   = compute_adx(highs, lows, closes, 14)
+    rsi   = compute_rsi(closes, 14)
 
-    vol_avg20 = [None] * n
+    macd_hist = None
+    vol_ma    = None
     if use_filters:
-        for i in range(19, n):
-            vol_avg20[i] = sum(vols[i - 19:i + 1]) / 20
+        macd_hist = compute_macd(closes, 12, 26, 9)
+        vol_ma = [None] * n
+        for i in range(20, n):
+            vol_ma[i] = sum(vols[i-20:i]) / 20
 
     signals = [None] * n
-    min_adx = FILTER_ADX_MIN if use_filters else ADX_MIN
-
     for i in range(WARMUP_BARS, n):
-        if None in (ema9[i], ema21[i], ema50[i], ema9[i - 1], ema21[i - 1], rsi[i], adx[i]):
+        if (ema9[i] is None or ema21[i] is None or ema50[i] is None
+                or adx[i] is None or rsi[i] is None):
             continue
-        if ema50[i - 10] is None:
-            continue
-
-        slope50 = (ema50[i] - ema50[i - 10]) / ema50[i - 10] * 100 if ema50[i - 10] else 0
-        cross_up = ema9[i - 1] <= ema21[i - 1] and ema9[i] > ema21[i]
-        cross_down = ema9[i - 1] >= ema21[i - 1] and ema9[i] < ema21[i]
-
-        if adx[i] < min_adx:
+        if adx[i] < adx_thresh:
             continue
 
-        side = None
-        if slope50 > 0.05 and cross_up and rsi[i] >= RSI_LONG_MIN:
-            side = "long"
-        elif slope50 < -0.05 and cross_down and rsi[i] <= RSI_SHORT_MAX:
-            side = "short"
-
-        if side is None:
+        # 50EMA slope (10 bars)
+        slope_bars = 10
+        if i < slope_bars or ema50[i-slope_bars] is None:
             continue
+        slope = (ema50[i] - ema50[i-slope_bars]) / ema50[i-slope_bars]
+        slope_thresh = 0.0005
+
+        # 9/21 EMA cross: current bar crossed (prev below/above, now above/below)
+        if i < 1 or ema9[i-1] is None or ema21[i-1] is None:
+            continue
+        cross_long  = ema9[i-1] <= ema21[i-1] and ema9[i] > ema21[i]
+        cross_short = ema9[i-1] >= ema21[i-1] and ema9[i] < ema21[i]
+
+        long_base  = slope > slope_thresh  and cross_long  and rsi[i] >= RSI_LONG_MIN
+        short_base = slope < -slope_thresh and cross_short and rsi[i] <= RSI_SHORT_MAX
 
         if use_filters:
-            if macd_hist[i] is None:
+            # MACD histogram confirmation
+            mh = macd_hist[i] if macd_hist and macd_hist[i] is not None else None
+            if mh is None:
                 continue
-            if side == "long" and macd_hist[i] <= 0:
-                continue
-            if side == "short" and macd_hist[i] >= 0:
-                continue
+            macd_ok_long  = mh > 0
+            macd_ok_short = mh < 0
 
-            if vol_avg20[i] is None or vols[i] <= vol_avg20[i] * FILTER_VOL_MULT:
+            # Volume spike: > 1.5x 20-bar average
+            vm = vol_ma[i] if vol_ma and vol_ma[i] is not None else None
+            if vm is None or vm == 0:
                 continue
+            vol_ok = vols[i] > 1.5 * vm
 
-            j = i - FILTER_HTF_BARS
-            if j < 0 or ema50[j] is None or ema50[j] == 0:
+            # HTF slope: 50EMA over 40 bars
+            htf_bars = 40
+            if i < htf_bars or ema50[i-htf_bars] is None:
                 continue
-            htf_slope = (ema50[i] - ema50[j]) / ema50[j] * 100
-            if side == "long" and htf_slope <= 0:
-                continue
-            if side == "short" and htf_slope >= 0:
-                continue
+            htf_slope = (ema50[i] - ema50[i-htf_bars]) / ema50[i-htf_bars]
+            htf_long  = htf_slope > 0
+            htf_short = htf_slope < 0
 
-        signals[i] = side
+            long_base  = long_base  and macd_ok_long  and vol_ok and htf_long
+            short_base = short_base and macd_ok_short and vol_ok and htf_short
+
+        if long_base:
+            signals[i] = "long"
+        elif short_base:
+            signals[i] = "short"
 
     return signals
 
-
-# ---------------------------------------------------------------------------
-# SINGLE-COIN, SINGLE-VARIANT BACKTEST
-# ---------------------------------------------------------------------------
-
-def backtest_coin_variant(symbol, bars, variant_name, variant_cfg):
-    signals = compute_signals(bars, variant_cfg["filters"])
-    tp_pct, sl_pct = variant_cfg["tp"], variant_cfg["sl"]
-
-    trades = []
-    cooldown_until = -1
-    i = 0
+# ── BACKTESTING ───────────────────────────────────────────────────────────────
+def backtest_coin_variant(bars, variant):
+    """Run backtest for one coin+variant. Returns list of trade dicts."""
+    tp_pct = VARIANTS[variant]["tp"]
+    sl_pct = VARIANTS[variant]["sl"]
+    signals = compute_signals(bars, variant)
     n = len(bars)
 
-    while i < n:
-        if i <= cooldown_until or signals[i] is None:
-            i += 1
+    trades = []
+    in_trade = False
+    cooldown = 0
+
+    for i in range(n):
+        sig = signals[i]
+        bar = bars[i]
+        ts, o, h, l, c = int(bar[0]), bar[1], bar[2], bar[3], bar[4]
+
+        if in_trade:
+            entry, direction, tp_price, sl_price, entry_ts = (
+                trade_entry, trade_dir, trade_tp, trade_sl, trade_ts)
+            # check exit on this bar
+            exit_price = None
+            result = None
+            if direction == "long":
+                if l <= sl_price:
+                    exit_price = sl_price; result = "sl"
+                elif h >= tp_price:
+                    exit_price = tp_price; result = "tp"
+            else:  # short
+                if h >= sl_price:
+                    exit_price = sl_price; result = "sl"
+                elif l <= tp_price:
+                    exit_price = tp_price; result = "tp"
+
+            if result:
+                pnl_pct = (exit_price - entry) / entry if direction == "long" else (entry - exit_price) / entry
+                pos_size = (CAPITAL * RISK_PCT) / sl_pct
+                pnl = pnl_pct * pos_size - (FEE + SLIP) * 2 * pos_size
+                trades.append({
+                    "entry_ts": entry_ts, "exit_ts": ts,
+                    "direction": direction, "result": result,
+                    "pnl": pnl, "bars_held": i - entry_bar_idx,
+                })
+                in_trade = False
+                cooldown = COOLDOWN_BARS
             continue
 
-        side = signals[i]
-        entry_bar = bars[i]
-        entry_price = entry_bar["c"]
-        entry_time = entry_bar["t"]
+        if cooldown > 0:
+            cooldown -= 1
+            continue
 
-        if side == "long":
-            tp_price = entry_price * (1 + tp_pct)
-            sl_price = entry_price * (1 - sl_pct)
-        else:
-            tp_price = entry_price * (1 - tp_pct)
-            sl_price = entry_price * (1 + sl_pct)
-
-        exit_price = None
-        exit_time = None
-        exit_reason = None
-        j = i + 1
-        while j < n:
-            hi, lo = bars[j]["h"], bars[j]["l"]
-            if side == "long":
-                hit_sl = lo <= sl_price
-                hit_tp = hi >= tp_price
+        if sig in ("long", "short"):
+            entry_price = bar[4]  # close of signal bar
+            if sig == "long":
+                tp_price = entry_price * (1 + tp_pct)
+                sl_price = entry_price * (1 - sl_pct)
             else:
-                hit_sl = hi >= sl_price
-                hit_tp = lo <= tp_price
+                tp_price = entry_price * (1 - tp_pct)
+                sl_price = entry_price * (1 + sl_pct)
 
-            if hit_sl and hit_tp:
-                # ambiguous same-bar hit; assume SL first (conservative)
-                exit_price, exit_reason = sl_price, "SL"
-            elif hit_sl:
-                exit_price, exit_reason = sl_price, "SL"
-            elif hit_tp:
-                exit_price, exit_reason = tp_price, "TP"
-
-            if exit_price is not None:
-                exit_time = bars[j]["t"]
-                break
-            j += 1
-
-        if exit_price is None:
-            break  # ran off the end of data with position open; drop it
-
-        risk_amt = CAPITAL * RISK_PCT
-        pos_size = risk_amt / sl_pct  # notional
-        fee_cost = pos_size * FEE * 2
-        slip_cost = pos_size * SLIP * 2
-
-        if side == "long":
-            raw_pnl = pos_size * (exit_price - entry_price) / entry_price
-        else:
-            raw_pnl = pos_size * (entry_price - exit_price) / entry_price
-
-        net_pnl = raw_pnl - fee_cost - slip_cost
-
-        trades.append({
-            "symbol": symbol, "variant": variant_name, "side": side,
-            "entry_time": entry_time, "exit_time": exit_time,
-            "entry_price": entry_price, "exit_price": exit_price,
-            "reason": exit_reason, "pnl": net_pnl,
-            "bars_held": j - i,
-        })
-
-        cooldown_until = j + COOLDOWN_BARS
-        i = j + 1
+            in_trade = True
+            trade_entry = entry_price
+            trade_dir   = sig
+            trade_tp    = tp_price
+            trade_sl    = sl_price
+            trade_ts    = ts
+            entry_bar_idx = i
 
     return trades
 
-
-# ---------------------------------------------------------------------------
-# WORKER (one process per symbol, runs ALL variants on that symbol's data)
-# ---------------------------------------------------------------------------
-
-def worker_task(symbol):
-    bars = fetch_symbol_data(symbol)
-    if not bars or len(bars) < WARMUP_BARS + 60:
-        return symbol, None, "insufficient ({} bars)".format(len(bars) if bars else 0)
-
-    result = {}
-    for vname, vcfg in VARIANTS.items():
-        result[vname] = backtest_coin_variant(symbol, bars, vname, vcfg)
-    return symbol, result, None
-
-
-# ---------------------------------------------------------------------------
-# PORTFOLIO CAP
-# ---------------------------------------------------------------------------
-
-def apply_portfolio_cap(all_trades):
-    """all_trades: list of trade dicts (single variant, all symbols).
-    Sorts by entry time, drops trades that would exceed MAX_POSITIONS
-    concurrent slots. Returns the accepted trade list."""
-    events = sorted(all_trades, key=lambda t: t["entry_time"])
-    open_positions = []  # list of exit_time for currently open slots
-    accepted = []
-    for t in events:
-        open_positions = [e for e in open_positions if e > t["entry_time"]]
-        if len(open_positions) < MAX_POSITIONS:
-            open_positions.append(t["exit_time"])
-            accepted.append(t)
-    return accepted
-
-
-# ---------------------------------------------------------------------------
-# STATS
-# ---------------------------------------------------------------------------
-
+# ── STATS ─────────────────────────────────────────────────────────────────────
 def calc_stats(trades):
     if not trades:
-        return None
-    wins = [t for t in trades if t["pnl"] > 0]
-    losses = [t for t in trades if t["pnl"] <= 0]
-    gross_profit = sum(t["pnl"] for t in wins)
-    gross_loss = -sum(t["pnl"] for t in losses)
-    net_pnl = gross_profit - gross_loss
-    pf = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+        return {"trades": 0, "wr": 0, "pf": 0, "net_pnl": 0, "max_dd": 0,
+                "sharpe": 0, "expectancy": 0, "avg_bars": 0,
+                "long_trades": 0, "long_wr": 0, "short_trades": 0, "short_wr": 0,
+                "gross_profit": 0, "gross_loss": 0}
+
+    wins  = [t for t in trades if t["pnl"] > 0]
+    losses= [t for t in trades if t["pnl"] <= 0]
+    longs = [t for t in trades if t["direction"] == "long"]
+    shorts= [t for t in trades if t["direction"] == "short"]
+
     wr = len(wins) / len(trades) * 100
+    gp = sum(t["pnl"] for t in wins)
+    gl = abs(sum(t["pnl"] for t in losses))
+    pf = gp / gl if gl > 0 else float("inf")
+    net = sum(t["pnl"] for t in trades)
+    exp = net / len(trades)
+    avg_bars = sum(t["bars_held"] for t in trades) / len(trades)
 
-    equity = CAPITAL
-    peak = CAPITAL
-    max_dd = 0.0
-    for t in sorted(trades, key=lambda x: x["exit_time"]):
+    # max drawdown on running equity
+    equity = 0; peak = 0; max_dd = 0
+    for t in sorted(trades, key=lambda x: x["exit_ts"]):
         equity += t["pnl"]
-        peak = max(peak, equity)
-        dd = (peak - equity) / peak * 100 if peak else 0
-        max_dd = max(max_dd, dd)
+        if equity > peak: peak = equity
+        dd = (peak - equity) / (CAPITAL + peak) * 100
+        if dd > max_dd: max_dd = dd
 
+    # sharpe (per trade)
     pnls = [t["pnl"] for t in trades]
-    sharpe = (statistics.mean(pnls) / statistics.pstdev(pnls) * math.sqrt(252)
-              if len(pnls) > 1 and statistics.pstdev(pnls) > 0 else 0.0)
+    mean = sum(pnls) / len(pnls)
+    std  = math.sqrt(sum((p - mean)**2 for p in pnls) / len(pnls)) if len(pnls) > 1 else 1
+    sharpe = mean / std * math.sqrt(len(pnls)) if std > 0 else 0
+
+    l_wr = len([t for t in longs if t["pnl"] > 0]) / len(longs) * 100 if longs else 0
+    s_wr = len([t for t in shorts if t["pnl"] > 0]) / len(shorts) * 100 if shorts else 0
 
     return {
-        "trades": len(trades),
-        "wr": wr,
-        "pf": pf,
-        "net_pnl": net_pnl,
-        "max_dd": max_dd,
-        "sharpe": sharpe,
-        "expectancy": net_pnl / len(trades),
-        "avg_bars": statistics.mean(t["bars_held"] for t in trades),
-        "gross_profit": gross_profit,
-        "gross_loss": gross_loss,
-        "long_trades": [t for t in trades if t["side"] == "long"],
-        "short_trades": [t for t in trades if t["side"] == "short"],
+        "trades": len(trades), "wr": wr, "pf": pf, "net_pnl": net,
+        "max_dd": max_dd, "sharpe": sharpe, "expectancy": exp, "avg_bars": avg_bars,
+        "long_trades": len(longs), "long_wr": l_wr,
+        "short_trades": len(shorts), "short_wr": s_wr,
+        "gross_profit": gp, "gross_loss": gl,
     }
 
+def apply_portfolio_cap(all_trades_flat):
+    """Apply MAX_POSITIONS cap across all coins. Returns filtered trade list."""
+    all_trades_flat.sort(key=lambda t: t["entry_ts"])
+    active = []  # list of exit_ts
+    kept = []
+    for t in all_trades_flat:
+        # remove expired
+        active = [e for e in active if e > t["entry_ts"]]
+        if len(active) < MAX_POSITIONS:
+            active.append(t["exit_ts"])
+            kept.append(t)
+    return kept
 
-def per_coin_stats(trades):
-    by_symbol = {}
-    for t in trades:
-        by_symbol.setdefault(t["symbol"], []).append(t)
-    out = {}
-    for sym, tl in by_symbol.items():
-        s = calc_stats(tl)
-        if s:
-            out[sym] = s
-    return out
+# ── WORKER ───────────────────────────────────────────────────────────────────
+def worker_task(symbol):
+    """Fetch data + run all variants for one symbol. Returns (symbol, variant->trades)."""
+    try:
+        bars = fetch_symbol_data(symbol, INTERVAL, MONTHS)
+        if len(bars) < WARMUP_BARS + 50:
+            return symbol, None, f"not enough data ({len(bars)} bars)"
 
+        result = {}
+        for vname in VARIANTS:
+            trades = backtest_coin_variant(bars, vname)
+            result[vname] = trades
+        return symbol, result, None
+    except Exception as e:
+        return symbol, None, str(e)
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
-
+# ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     t0 = time.time()
-    symbols = fetch_all_futures_symbols()
-    print(f"Testing {len(symbols)} symbols across {len(VARIANTS)} variants...")
+    print("=== Backtest v8.5 — Full Binance USDT-M Universe ===", flush=True)
 
-    per_symbol_results = {}
-    issues = []
+    # 1. Discover symbols
+    print("Discovering symbols from data.binance.vision S3...", flush=True)
+    symbols = discover_symbols()
+    print(f"Found {len(symbols)} USDT-M perpetual symbols", flush=True)
 
-    with ProcessPoolExecutor(max_workers=60) as ex:
-        futures = {ex.submit(worker_task, s): s for s in symbols}
+    # 2. Run parallel workers
+    all_coin_trades = defaultdict(dict)  # variant -> coin -> [trades]
+    symbol_issues = []
+    done = 0
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(worker_task, sym): sym for sym in symbols}
         for fut in as_completed(futures):
             sym = futures[fut]
+            done += 1
             try:
-                symbol, result, issue = fut.result()
+                symbol, result, err = fut.result()
             except Exception as e:
-                issues.append(f"{sym}: worker crashed ({e})")
+                symbol_issues.append({"symbol": sym, "error": str(e)})
+                print(f"[{done}/{len(symbols)}] {sym} EXCEPTION: {e}", flush=True)
                 continue
-            if issue:
-                issues.append(f"{symbol}: {issue}")
-                continue
-            per_symbol_results[symbol] = result
 
-    variant_reports = {}
+            if err:
+                symbol_issues.append({"symbol": symbol, "error": err})
+                print(f"[{done}/{len(symbols)}] {symbol} SKIP: {err}", flush=True)
+                continue
+
+            for vname, trades in result.items():
+                all_coin_trades[vname][symbol] = trades
+            print(f"[{done}/{len(symbols)}] {symbol} OK", flush=True)
+
+    # 3. Apply portfolio cap per variant, compute stats
+    report = {"meta": {}, "variants": {}, "symbol_issues": symbol_issues}
+    summary_lines = []
+
+    # count trading days
+    all_ts = []
     for vname in VARIANTS:
-        all_trades = []
-        for sym, res in per_symbol_results.items():
-            all_trades.extend(res[vname])
-        capped_trades = apply_portfolio_cap(all_trades)
-        stats = calc_stats(capped_trades)
-        coin_stats = per_coin_stats(capped_trades)
-        variant_reports[vname] = {"stats": stats, "coins": coin_stats}
+        for sym, trades in all_coin_trades[vname].items():
+            for t in trades:
+                all_ts.append(t["exit_ts"])
+    if all_ts:
+        days = (max(all_ts) - min(all_ts)) / (1000 * 86400)
+    else:
+        days = 365 * 2
 
-    write_outputs(variant_reports, issues, symbols)
-    print(f"Done in {time.time() - t0:.1f}s")
+    for vname, vcfg in VARIANTS.items():
+        # flatten all trades for this variant
+        flat = []
+        for sym, trades in all_coin_trades[vname].items():
+            for t in trades:
+                t["symbol"] = sym
+                flat.append(t)
 
+        capped = apply_portfolio_cap(flat)
 
-def days_in_range():
-    from datetime import date as _d
-    d0 = _d(START_YM[0], START_YM[1], 1)
-    y, m = END_YM
-    d1 = _d(y + (1 if m == 12 else 0), 1 if m == 12 else m + 1, 1)
-    return (d1 - d0).days
+        # per-coin stats
+        coin_trades_map = defaultdict(list)
+        for t in capped:
+            coin_trades_map[t["symbol"]].append(t)
 
+        coin_stats = {}
+        for sym, trades in coin_trades_map.items():
+            coin_stats[sym] = calc_stats(trades)
 
-def write_outputs(variant_reports, issues, symbols):
-    days = days_in_range()
-    lines = []
+        portfolio_stats = calc_stats(capped)
+        trades_per_day = len(capped) / days if days > 0 else 0
 
-    def fmt_pf(pf):
-        return "inf" if pf == float("inf") else f"{pf:.3f}"
+        # passing coins: PF>=1.5, WR>=42%, trades>=8
+        passing = {s: st for s, st in coin_stats.items()
+                   if st["pf"] >= 1.5 and st["wr"] >= 42 and st["trades"] >= 8}
 
-    for vname, cfg in VARIANTS.items():
-        rep = variant_reports[vname]
-        stats = rep["stats"]
-        lines.append("=" * 65)
-        tag = " + confirmation filters" if cfg["filters"] else ""
-        lines.append(f"  VARIANT {vname} — TP {cfg['tp']*100:.0f}% / SL {cfg['sl']*100:.0f}%{tag}")
-        lines.append("=" * 65)
-        if not stats:
-            lines.append("  NO TRADES")
-            lines.append("")
-            continue
-
-        lines.append(f"  Trades       : {stats['trades']}")
-        lines.append(f"  Win Rate     : {stats['wr']:.2f}%")
-        lines.append(f"  Profit Factor: {fmt_pf(stats['pf'])}")
-        lines.append(f"  Net PnL      : ${stats['net_pnl']:.1f}")
-        lines.append(f"  Max Drawdown : {stats['max_dd']:.2f}%")
-        lines.append(f"  Sharpe       : {stats['sharpe']:.3f}")
-        lines.append(f"  Expectancy   : ${stats['expectancy']:.2f}/trade")
-        lines.append(f"  Avg Bars Held: {stats['avg_bars']:.1f}")
-        lt, st = stats["long_trades"], stats["short_trades"]
-        lwr = (sum(1 for t in lt if t["pnl"] > 0) / len(lt) * 100) if lt else 0
-        swr = (sum(1 for t in st if t["pnl"] > 0) / len(st) * 100) if st else 0
-        lines.append(f"  Long  : {len(lt)} trades | WR {lwr:.2f}%")
-        lines.append(f"  Short : {len(st)} trades | WR {swr:.2f}%")
-        lines.append(f"  Gross Profit : ${stats['gross_profit']:.1f} | Loss: ${stats['gross_loss']:.1f}")
-        lines.append("")
-
-        coins = rep["coins"]
-        ranked = sorted(coins.items(), key=lambda kv: (kv[1]["pf"] if kv[1]["pf"] != float("inf") else 9e9), reverse=True)
-        lines.append("  -- Top 25 by Profit Factor --")
-        for sym, s in ranked[:25]:
-            lines.append(f"  {sym:<22} {s['trades']:>5}  {s['wr']:>6.1f}%  {fmt_pf(s['pf']):>7}  ${s['net_pnl']:>9.2f}")
-        lines.append("")
-
-        passing = {
-            sym: s for sym, s in coins.items()
-            if (s["pf"] == float("inf") or s["pf"] >= 1.5) and s["wr"] >= 42 and s["trades"] >= 8
+        report["variants"][vname] = {
+            "stats": portfolio_stats,
+            "coins": coin_stats,
         }
-        lines.append(f"  -- Passing Coins (PF>=1.5 WR>=42% >=8 trades): {len(passing)} --")
-        for sym, s in sorted(passing.items(), key=lambda kv: (kv[1]["pf"] if kv[1]["pf"] != float("inf") else 9e9), reverse=True):
-            lines.append(f"  OK {sym:<22} PF={fmt_pf(s['pf'])} WR={s['wr']:.1f}% T={s['trades']}")
-        tpd = stats["trades"] / days if days else 0
-        lines.append(f"\n  Trades/day (portfolio): ~{tpd:.1f}")
-        lines.append("")
 
-    lines.append("=" * 65)
-    lines.append("  CROSS-VARIANT SUMMARY")
-    lines.append("=" * 65)
-    lines.append(f"  {'Var':<5}{'TP':>5}{'SL':>6}{'Trades':>9}{'T/day':>8}{'WR%':>8}{'PF':>9}{'NetPnL':>13}{'MaxDD':>8}  Verdict")
-    for vname, cfg in VARIANTS.items():
-        stats = variant_reports[vname]["stats"]
-        if not stats:
-            continue
-        tpd = stats["trades"] / days if days else 0
-        verdict = "LIVE-CANDIDATE" if (stats["pf"] >= 1.5 and stats["wr"] >= 80 and stats["max_dd"] < 20) else (
-            "PROFITABLE" if stats["pf"] > 1.0 else "NOT YET")
-        lines.append(
-            f"  {vname:<5}{cfg['tp']*100:>4.0f}%{cfg['sl']*100:>5.0f}%{stats['trades']:>9}{tpd:>8.1f}"
-            f"{stats['wr']:>7.1f}%{fmt_pf(stats['pf']):>9}  ${stats['net_pnl']:>10.2f}{stats['max_dd']:>7.1f}%  {verdict}"
+        # ── Format summary block ──
+        tp_pct = int(vcfg["tp"]*100)
+        sl_pct = int(vcfg["sl"]*100)
+        tag = f"TP {tp_pct}% / SL {sl_pct}%"
+        if vcfg["filters"]: tag += " + confirmation filters"
+        lines = [
+            f"\n{'='*65}",
+            f"  VARIANT {vname} — {tag}",
+            f"{'='*65}",
+            f"  Trades       : {portfolio_stats['trades']}",
+            f"  Win Rate     : {portfolio_stats['wr']:.2f}%",
+            f"  Profit Factor: {portfolio_stats['pf']:.3f}",
+            f"  Net PnL      : ${portfolio_stats['net_pnl']:.1f}",
+            f"  Max Drawdown : {portfolio_stats['max_dd']:.2f}%",
+            f"  Sharpe       : {portfolio_stats['sharpe']:.3f}",
+            f"  Expectancy   : ${portfolio_stats['expectancy']:.2f}/trade",
+            f"  Avg Bars Held: {portfolio_stats['avg_bars']:.1f}",
+            f"  Long  : {portfolio_stats['long_trades']} trades | WR {portfolio_stats['long_wr']:.2f}%",
+            f"  Short : {portfolio_stats['short_trades']} trades | WR {portfolio_stats['short_wr']:.2f}%",
+            f"  Gross Profit : ${portfolio_stats['gross_profit']:.1f} | Loss: ${portfolio_stats['gross_loss']:.1f}",
+        ]
+
+        # top 25 by PF
+        lines.append(f"\n  -- Top 25 by Profit Factor --")
+        sorted_coins = sorted(coin_stats.items(), key=lambda x: (x[1]["pf"] if x[1]["pf"] != float("inf") else 9999, x[1]["wr"]), reverse=True)
+        for sym, st in sorted_coins[:25]:
+            pf_str = "   inf" if st["pf"] == float("inf") else f"{st['pf']:6.3f}"
+            lines.append(f"  {sym:<26}{st['trades']:>5}  {st['wr']:>6.1f}%  {pf_str}  ${st['net_pnl']:>9.2f}")
+
+        # passing coins
+        lines.append(f"\n  -- Passing Coins (PF>=1.5 WR>=42% >=8 trades): {len(passing)} --")
+        for sym, st in sorted(passing.items(), key=lambda x: x[1]["pf"], reverse=True):
+            pf_str = "inf" if st["pf"] == float("inf") else f"{st['pf']:.3f}"
+            lines.append(f"  OK {sym:<22} PF={pf_str} WR={st['wr']:.1f}% T={st['trades']}")
+
+        lines.append(f"\n  Trades/day (portfolio): ~{trades_per_day:.1f}")
+        summary_lines.extend(lines)
+
+    # ── Cross-variant table ──
+    summary_lines.append(f"\n{'='*65}")
+    summary_lines.append("  CROSS-VARIANT SUMMARY")
+    summary_lines.append(f"{'='*65}")
+    header = f"  {'Var':<7} {'TP':>4} {'SL':>4} {'Trades':>7} {'T/day':>6} {'WR%':>7} {'PF':>8} {'NetPnL':>12} {'MaxDD':>6}  Verdict"
+    summary_lines.append(header)
+    for vname, vcfg in VARIANTS.items():
+        st = report["variants"][vname]["stats"]
+        tpd = st["trades"] / days if days > 0 else 0
+        verdict = "PROFITABLE" if st["net_pnl"] > 0 and st["pf"] > 1.0 else "NOT YET"
+        summary_lines.append(
+            f"  {vname:<7} {int(vcfg['tp']*100):>3}% {int(vcfg['sl']*100):>3}%"
+            f" {st['trades']:>7} {tpd:>6.1f} {st['wr']:>6.1f}%"
+            f" {st['pf']:>8.3f} ${st['net_pnl']:>10.2f} {st['max_dd']:>5.1f}%  {verdict}"
         )
-    lines.append("")
 
-    lines.append("-- Symbol Issues ({}) --".format(len(issues)))
-    for iss in issues:
-        lines.append(f"  {iss}")
+    # ── Symbol issues ──
+    summary_lines.append(f"\n-- Symbol Issues ({len(symbol_issues)}) --")
+    for si in symbol_issues:
+        summary_lines.append(f"  {si['symbol']}: {si['error']}")
 
+    # ── Write outputs ──
+    summary_text = "\n".join(summary_lines)
     with open("backtest_summary.txt", "w") as f:
-        f.write("\n".join(lines))
+        f.write(summary_text)
 
-    report = {
-        "meta": {
-            "version": "v8.6",
-            "period": f"{START_YM[0]}-{START_YM[1]:02d} -> {END_YM[0]}-{END_YM[1]:02d}",
-            "symbols_tested": len(symbols),
-            "variants": {k: {"tp": v["tp"], "sl": v["sl"], "filters": v["filters"]} for k, v in VARIANTS.items()},
-            "settings": {
-                "capital": CAPITAL, "risk_pct": RISK_PCT, "fee": FEE, "slip": SLIP,
-                "adx_min": ADX_MIN, "filter_adx_min": FILTER_ADX_MIN,
-                "max_positions": MAX_POSITIONS,
-                "rsi_long_min": RSI_LONG_MIN, "rsi_short_max": RSI_SHORT_MAX,
-            },
-        },
-        "variants": {
-            vname: {
-                "stats": {k: v for k, v in rep["stats"].items() if k not in ("long_trades", "short_trades")} if rep["stats"] else None,
-                "coins": rep["coins"],
-            }
-            for vname, rep in variant_reports.items()
-        },
-        "symbol_issues": issues,
+    report["meta"] = {
+        "version": "v8.5",
+        "period": f"{MONTHS[0]} -> {MONTHS[-1]}",
+        "symbols_tested": len(symbols),
+        "variants": {k: {**v, "tp": v["tp"], "sl": v["sl"]} for k, v in VARIANTS.items()},
+        "settings": {
+            "capital": CAPITAL, "risk_pct": RISK_PCT,
+            "fee": FEE, "slip": SLIP,
+            "adx_min": ADX_MIN, "filter_adx_min": FILTER_ADX_MIN,
+            "max_positions": MAX_POSITIONS,
+            "rsi_long_min": RSI_LONG_MIN, "rsi_short_max": RSI_SHORT_MAX,
+        }
     }
     with open("backtest_report.json", "w") as f:
         json.dump(report, f, default=str)
 
+    elapsed = time.time() - t0
+    print(f"\nDone in {elapsed:.0f}s", flush=True)
+    print(summary_text, flush=True)
 
 if __name__ == "__main__":
     main()
