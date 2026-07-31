@@ -1,24 +1,27 @@
 """
-Backtest v8.2 — RSI-Filtered Whitelist + Extended Variants
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Strategy : ADX>=22 + 50EMA slope + 9/21 EMA crossover (15m)
-           + RSI-14 filter (long>45, short<55)
-Entry    : Whitelist only — coins with positive PF across 2+ variants in v8.1
-TP/SL    : Fixed % (7 variants A-G)
-Coins    : ~50 curated coins (whitelist core + expanded liquid alts)
-Period   : 2 years (coins with less history use what they have)
-Capital  : $10,000 shared | Risk 0.75%/trade | Max 5 positions
-Fees     : 0.05% taker per side | Slippage 0.02% per side
-Workers  : 60 ProcessPoolExecutor inside single GH Actions job
+Backtest v8.3 — Wide SL Strategy | Variants G / H / I
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Base strategy : ADX>=22 + 50EMA slope + 9/21 EMA crossover (15m)
+               + RSI-14 filter (long>=45, short<=55)
+
+Variants:
+  G : TP 3%  / SL 15%  — proven baseline (+$412, PF 1.023, DD 11%)
+  H : TP 4%  / SL 15%  — higher reward, same breathing room
+  I : TP 3%  / SL 15%  — G + extra quality filters (MACD + Volume + HTF)
+
+Variant I extra filters:
+  1. MACD histogram positive on long, negative on short
+  2. Volume > 1.5x 20-bar average (real breakout, not chop)
+  3. Higher timeframe trend: 50EMA slope over 40 bars (≈ 10h) must agree
+
+Coins    : Full Binance USDT-M futures list (~159 symbols)
+Period   : 2 years
+Capital  : $10,000 | Risk 0.75%/trade | Max 5 positions
+Fees     : 0.05% taker + 0.02% slippage per side
+Workers  : 60 ProcessPoolExecutor
 stdlib   : only
 
-Changes vs v8.1:
-  - RSI-14 entry filter added (reduces false crossovers)
-  - Coin universe trimmed to whitelist (removes consistent losers)
-  - Expanded with new liquid coins for more trade frequency
-  - MAX_POSITIONS reduced 6→5 (drawdown reduction)
-  - Variant F SL changed 9%→7%
-  - New Variant G: TP 3% / SL 15%
+After run: cut weak coins, build final whitelist for live trading.
 """
 
 import csv, io, json, math, os, time, urllib.request, zipfile
@@ -28,19 +31,15 @@ from pathlib import Path
 
 # ── Variants ──────────────────────────────────────────────────────────────
 VARIANTS = {
-    'A': {'tp': 0.02, 'sl': 0.01},
-    'B': {'tp': 0.02, 'sl': 0.015},
-    'C': {'tp': 0.03, 'sl': 0.01},
-    'D': {'tp': 0.03, 'sl': 0.015},
-    'E': {'tp': 0.03, 'sl': 0.02},
-    'F': {'tp': 0.03, 'sl': 0.07},   # SL changed 9%→7%
-    'G': {'tp': 0.03, 'sl': 0.15},   # NEW: wide SL, same TP
+    'G': {'tp': 0.03, 'sl': 0.15},
+    'H': {'tp': 0.04, 'sl': 0.15},
+    'I': {'tp': 0.03, 'sl': 0.15},   # same TP/SL as G but filtered entries
 }
 
 # ── Settings ──────────────────────────────────────────────────────────────
 CAPITAL       = 10_000.0
 RISK_PCT      = 0.0075
-MAX_POSITIONS = 5          # reduced from 6 → helps drawdown
+MAX_POSITIONS = 5
 FEE_RATE      = 0.0005
 SLIP_RATE     = 0.0002
 ADX_MIN       = 22
@@ -49,10 +48,18 @@ COOLDOWN_BARS = 4
 WORKERS       = 60
 INTERVAL      = '15m'
 
-# RSI filter thresholds
-RSI_LONG_MIN  = 45   # only take long if RSI >= this
-RSI_SHORT_MAX = 55   # only take short if RSI <= this
+# RSI filter
+RSI_LONG_MIN  = 45
+RSI_SHORT_MAX = 55
 RSI_PERIOD    = 14
+
+# Variant I extra filter settings
+VOL_MULT      = 1.5    # volume must be > this x 20-bar avg
+VOL_PERIOD    = 20
+HTF_BARS      = 40     # 40 x 15m = 10 hours, pseudo-HTF slope window
+MACD_FAST     = 12
+MACD_SLOW     = 26
+MACD_SIGNAL   = 9
 
 _now = datetime.now(timezone.utc)
 _em  = _now.month - 1 if _now.month > 1 else 12
@@ -65,94 +72,67 @@ if END_MONTH == 12:
 
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
-# ── Whitelist — coins with positive PF in 2+ v8.1 variants ────────────────
-# Core whitelist from v8.1 per-coin analysis:
-# Strong performers: THETA, XRP, MATIC, AVAX, TRX, ALGO, RENDER, SNX, AAVE, LTC
-# F-variant stars:   BOME, FET, SEI, STRK, MANA, TRUMP, RATS, ETH, BTC
-# Additional liquid alts added for trade frequency (high volume, established)
+# ── Full Binance USDT-M Futures symbol list ────────────────────────────────
+# Covers all major sectors. Symbols that don't exist on Binance futures
+# will return 404 and be skipped automatically.
 SYMBOLS = [
-    # ── v8.1 Whitelist Core (proven positive PF) ──
-    'BTCUSDT',      # anchor, always include
-    'ETHUSDT',      # anchor
-    'XRPUSDT',      # consistent positive
-    'LTCUSDT',      # consistent positive
-    'TRXUSDT',      # consistent positive
-    'AVAXUSDT',     # consistent positive
-    'MATICUSDT',    # consistent positive
-    'ALGOUSDT',     # consistent positive
-    'THETAUSDT',    # consistent positive (top performer)
-    'RENDERUSDT',   # consistent positive
-    'AAVEUSDT',     # consistent positive, F-star
-    'SNXUSDT',      # consistent positive
-    'FETUSDT',      # F-star (PF 3.5)
-    'SEIUSDT',      # F-star
-    'STRKUSDT',     # F-star
-    'MANAUSDT',     # F-star
-    'TRUMPUSDT',    # F-star (high volatility, wide SL works)
-    '1000RATSUSDT', # F-star
-    'BOMEUSDT',     # F-star (PF 3.9, top F performer)
-    'BNBUSDT',      # large cap, liquid
+    # ── Anchors ──
+    'BTCUSDT', 'ETHUSDT',
 
-    # ── High-volume L1/L2 additions (trade frequency) ──
-    'SOLUSDT',      # high volume, trending
-    'ADAUSDT',      # high volume
-    'DOTUSDT',      # solid volume
-    'LINKUSDT',     # DeFi anchor, high volume
-    'ATOMUSDT',     # solid
-    'NEARUSDT',     # growing volume
-    'APTUSDT',      # active
-    'SUIUSDT',      # active
-    'INJUSDT',      # active AI/L1
-    'ARBUSDT',      # L2 high volume
-    'OPUSDT',       # L2 high volume
-    'STXUSDT',      # BTC ecosystem
-    'TIAUSDT',      # modular DA sector
-    'HBARUSDT',     # stable volume
-    'XLMUSDT',      # stable volume
+    # ── Layer 1 majors ──
+    'BNBUSDT', 'SOLUSDT', 'ADAUSDT', 'XRPUSDT', 'AVAXUSDT',
+    'DOTUSDT', 'ATOMUSDT', 'NEARUSDT', 'APTUSDT', 'SUIUSDT',
+    'SEIUSDT', 'TIAUSDT', 'INJUSDT', 'FTMUSDT', 'ALGOUSDT',
+    'ICPUSDT', 'HBARUSDT', 'XLMUSDT', 'TRXUSDT', 'LTCUSDT',
+    'BCHUSDT', 'ETCUSDT', 'FILUSDT', 'EGLDUSDT', 'QNTUSDT',
+    'FLOWUSDT', 'KASUSDT', 'TONUSDT', 'STXUSDT', 'THETAUSDT',
+    'VETUSDT', 'XTZUSDT', 'EOSUSDT', 'NEOUSDT', 'ZILUSDT',
+    'MINAUSDT', 'CFXUSDT', 'CKBUSDT', 'MOVRUSDT',
 
-    # ── DeFi (selective — removed consistent losers) ──
-    'UNIUSDT',      # DeFi blue chip
-    'MKRUSDT',      # DeFi blue chip
-    'COMPUSDT',     # stable DeFi
-    'GMXUSDT',      # perp DEX, active
-    'JUPUSDT',      # Solana DeFi, high volume
+    # ── Layer 2 / Scaling ──
+    'ARBUSDT', 'OPUSDT', 'MATICUSDT', 'IMXUSDT', 'STRKUSDT',
+    'MANTAUSDT', 'ZETAUSDT', 'SCROLLUSDT', 'METISUSDT',
+    'LRCUSDT', 'CELRUSDT',
 
-    # ── AI sector (high momentum) ──
-    'WLDUSDT',      # AI/identity
-    'TAOUSDT',      # AI/data
-    'AGIXUSDT',     # AI sector
-    'OCEANUSDT',    # AI/data
+    # ── DeFi ──
+    'UNIUSDT', 'AAVEUSDT', 'LINKUSDT', 'MKRUSDT', 'CRVUSDT',
+    'SNXUSDT', 'COMPUSDT', 'DYDXUSDT', 'GMXUSDT', 'JUPUSDT',
+    'RUNEUSDT', 'LDOUSDT', 'RPLUSDT', 'CAKEUSDT', 'BALUSDT',
+    'YFIUSDT', '1INCHUSDT', 'KAVAUSDT', 'BANDUSDT', 'SUSHIUSDT',
+    'ONDOUSDT',
 
-    # ── Meme (only volume leaders — removed NEIRO, WIF, FLOW etc.) ──
-    'DOGEUSDT',     # meme anchor, massive volume
-    'PEPEUSDT',     # massive volume
-    '1000BONKUSDT', # SOL meme, high volume
-    '1000PEPEUSDT', # high volume
-    'FLOKIUSDT',    # solid volume
+    # ── AI / Data ──
+    'FETUSDT', 'RENDERUSDT', 'WLDUSDT', 'TAOUSDT', 'ARKMUSDT',
+    'AGIXUSDT', 'OCEANUSDT', 'GRTUSDT', 'IOTXUSDT',
 
-    # ── Infrastructure additions for frequency ──
-    'RUNEUSDT',     # THORChain, active
-    'LDOUSDT',      # liquid staking
-    'RPLUSDT',      # liquid staking
-    'PYTHUSDT',     # oracle, active
-    'ONDOUSDT',     # RWA sector hot
-    'ARUSDT',       # storage, consistent
-    'EGLDUSDT',     # MultiversX, solid
+    # ── Meme (correct Binance futures naming) ──
+    'DOGEUSDT', 'SHIBUSDT',
+    '1000PEPEUSDT', '1000BONKUSDT', '1000SHIBUSDT', '1000FLOKIUSDT',
+    '1000RATSUSDT', 'WIFUSDT', 'BOMEUSDT', 'NEIROUSDT', 'MEMEUSDT',
+    'POPCATUSDT', 'MOGUSDT', 'ACTUSDT', 'DOGSUSDT',
 
-    # ── Gaming (kept performers, dropped IMMX) ──
-    'AXSUSDT',      # gaming anchor
-    'SANDUSDT',     # metaverse
-    'GALAUSDT',     # gaming
+    # ── Gaming / Metaverse ──
+    'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'GALAUSDT', 'ENJUSDT',
+    'YGGUSDT', 'GMTUSDT', 'ALICEUSDT',
 
-    # ── Additional liquid coins for trade count ──
-    'ICPUSDT',      # ICP large cap
-    'FTMUSDT',      # Fantom, active
-    'QNTUSDT',      # enterprise, stable
-    'ETCUSDT',      # ETC, liquid
-    'BCHUSDT',      # BCH, liquid
-    'FILUSDT',      # storage sector
-    'IMXUSDT',      # gaming L2
-    'CAKEUSDT',     # BSC DeFi
+    # ── Infrastructure / Storage ──
+    'ARUSDT', 'STORJUSDT', 'BLURUSDT',
+
+    # ── New / RWA / Recent listings ──
+    'PYTHUSDT', 'EIGENUSDT', 'ENAUSDT', 'ETHFIUSDT',
+    'NOTUSDT', 'IOUSDT', 'ZROUSDT', 'ZKUSDT',
+    'LISTAUSDT', 'PENUSDT',
+
+    # ── Political / viral ──
+    'TRUMPUSDT', 'MELANIAUSDT',
+
+    # ── Exchange tokens ──
+    'OKBUSDT',
+
+    # ── Privacy / Other established ──
+    'XMRUSDT', 'ZECUSDT', 'DASHUSDT', 'BATUSDT', 'CHZUSDT',
+    'ANKRUSDT', 'SKLUSDT', 'LITUSDT', 'IDUSDT', 'MAVUSDT',
+    'CYBERUSDT', 'ARKUSDT', 'BEAMXUSDT',
 ]
 
 # Deduplicate while preserving order
@@ -200,8 +180,14 @@ def fetch_symbol_data(symbol):
                 ts = int(row[0])
                 if ts > 10**14:
                     ts //= 1000
-                bars.append((ts, float(row[1]), float(row[2]),
-                             float(row[3]), float(row[4]), float(row[5])))
+                bars.append((
+                    ts,
+                    float(row[1]),  # open
+                    float(row[2]),  # high
+                    float(row[3]),  # low
+                    float(row[4]),  # close
+                    float(row[5]),  # volume
+                ))
             except (ValueError, IndexError):
                 continue
     bars.sort(key=lambda x: x[0])
@@ -250,46 +236,53 @@ def adx_series(highs, lows, closes, period=14):
             [None] + pad_di + mdi)
 
 def rsi_series(closes, period=14):
-    """Wilder RSI — same smoothing as TradingView default."""
+    """Wilder RSI — matches TradingView default."""
     n = len(closes)
     if n < period + 1:
         return [None] * n
-
     gains, losses = [], []
     for i in range(1, n):
         diff = closes[i] - closes[i-1]
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
-
-    # Initial average
     avg_g = sum(gains[:period]) / period
     avg_l = sum(losses[:period]) / period
-
-    rsi = [None] * (period)  # pad with None for warmup bars
-    if avg_l == 0:
-        rsi.append(100.0)
-    else:
-        rs = avg_g / avg_l
-        rsi.append(100 - 100 / (1 + rs))
-
+    rsi = [None] * period
+    rsi.append(100.0 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l))
     for i in range(period, len(gains)):
         avg_g = (avg_g * (period - 1) + gains[i]) / period
         avg_l = (avg_l * (period - 1) + losses[i]) / period
-        if avg_l == 0:
-            rsi.append(100.0)
-        else:
-            rs = avg_g / avg_l
-            rsi.append(100 - 100 / (1 + rs))
-
+        rsi.append(100.0 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l))
     return rsi
 
-# ── Signal generation (with RSI filter) ────────────────────────────────────
-def compute_signals(bars):
-    closes = [b[4] for b in bars]
-    highs  = [b[2] for b in bars]
-    lows   = [b[3] for b in bars]
-    n      = len(closes)
-    warmup = 80   # increased slightly to allow RSI to warm up too
+def macd_histogram(closes, fast=12, slow=26, signal=9):
+    """Returns MACD histogram series (None-padded to len(closes))."""
+    n = len(closes)
+    if n < slow + signal:
+        return [None] * n
+    ema_f = ema_series(closes, fast)
+    ema_s = ema_series(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_f, ema_s)]
+    # signal line is EMA of macd_line starting from index (slow-1)
+    sig_line = ema_series(macd_line[slow-1:], signal)
+    # pad front
+    pad = slow - 1 + signal - 1
+    hist_raw = [m - s for m, s in zip(macd_line[slow-1+signal-1:],
+                                        sig_line[signal-1:])]
+    return [None] * (n - len(hist_raw)) + hist_raw
+
+# ── Signal generation ──────────────────────────────────────────────────────
+def compute_signals(bars, variant='G'):
+    """
+    variant G/H : ADX + EMA slope + 9/21 cross + RSI
+    variant I   : all of above + MACD hist + Volume spike + HTF slope
+    """
+    closes  = [b[4] for b in bars]
+    highs   = [b[2] for b in bars]
+    lows    = [b[3] for b in bars]
+    volumes = [b[5] for b in bars]
+    n       = len(closes)
+    warmup  = 100   # enough for all indicators to warm up
     if n < warmup:
         return []
 
@@ -299,13 +292,17 @@ def compute_signals(bars):
     adx_arr, _, _ = adx_series(highs, lows, closes, 14)
     rsi_arr = rsi_series(closes, RSI_PERIOD)
 
+    # Variant I extras
+    if variant == 'I':
+        macd_hist = macd_histogram(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    else:
+        macd_hist = None
+
     signals = []
     for i in range(warmup, n):
         if adx_arr[i] is None or rsi_arr[i] is None:
             signals.append({'i': i, 'signal': None}); continue
         if adx_arr[i] < ADX_MIN:
-            signals.append({'i': i, 'signal': None}); continue
-        if i < 10:
             signals.append({'i': i, 'signal': None}); continue
 
         slope = (e50[i] - e50[i-10]) / e50[i-10]
@@ -317,14 +314,39 @@ def compute_signals(bars):
         cross_up   = e9[i] > e21[i] and e9[i-1] <= e21[i-1]
         cross_down = e9[i] < e21[i] and e9[i-1] >= e21[i-1]
 
-        sig = None
         rsi_val = rsi_arr[i]
+        sig = None
 
-        # RSI filter: only enter if RSI confirms direction
-        if trend_up and cross_up and rsi_val >= RSI_LONG_MIN:
+        if trend_up   and cross_up   and rsi_val >= RSI_LONG_MIN:
             sig = 'long'
         if trend_down and cross_down and rsi_val <= RSI_SHORT_MAX:
             sig = 'short'
+
+        # ── Variant I: extra quality filters ──────────────────────────
+        if sig and variant == 'I':
+
+            # 1. MACD histogram confirmation
+            if macd_hist[i] is None:
+                sig = None
+            elif sig == 'long'  and macd_hist[i] <= 0:
+                sig = None
+            elif sig == 'short' and macd_hist[i] >= 0:
+                sig = None
+
+            # 2. Volume spike: current bar > VOL_MULT x 20-bar avg
+            if sig and i >= VOL_PERIOD:
+                avg_vol = sum(volumes[i-VOL_PERIOD:i]) / VOL_PERIOD
+                if avg_vol > 0 and volumes[i] < VOL_MULT * avg_vol:
+                    sig = None
+
+            # 3. Higher-timeframe trend: 50EMA slope over HTF_BARS
+            #    Must agree with trade direction
+            if sig and i >= HTF_BARS:
+                htf_slope = (e50[i] - e50[i - HTF_BARS]) / e50[i - HTF_BARS]
+                if sig == 'long'  and htf_slope <= 0:
+                    sig = None
+                if sig == 'short' and htf_slope >= 0:
+                    sig = None
 
         signals.append({'i': i, 'signal': sig})
     return signals
@@ -336,24 +358,22 @@ def backtest_coin_variant(symbol, bars, vname, tp_pct, sl_pct):
     lows   = [b[3] for b in bars]
     n      = len(bars)
 
-    signals = compute_signals(bars)
+    signals = compute_signals(bars, variant=vname)
     if not signals:
         return []
-    sig_map = {s['i']: s for s in signals}
 
-    trades        = []
-    in_pos        = False
-    entry_price   = 0.0
-    entry_i       = 0
-    pos_side      = None
-    last_close_i  = -999
+    trades       = []
+    in_pos       = False
+    entry_price  = 0.0
+    entry_i      = 0
+    pos_side     = None
+    last_close_i = -999
 
     for sig in signals:
         bar_i = sig['i']
         if bar_i >= n:
             break
 
-        # Check open position
         if in_pos:
             h, l = highs[bar_i], lows[bar_i]
             hit_tp = hit_sl = False
@@ -362,24 +382,20 @@ def backtest_coin_variant(symbol, bars, vname, tp_pct, sl_pct):
             if pos_side == 'long':
                 tp_px = entry_price * (1 + tp_pct)
                 sl_px = entry_price * (1 - sl_pct)
-                if l <= sl_px:
-                    hit_sl = True; exit_px = sl_px
-                elif h >= tp_px:
-                    hit_tp = True; exit_px = tp_px
+                if l <= sl_px:   hit_sl = True; exit_px = sl_px
+                elif h >= tp_px: hit_tp = True; exit_px = tp_px
             else:
                 tp_px = entry_price * (1 - tp_pct)
                 sl_px = entry_price * (1 + sl_pct)
-                if h >= sl_px:
-                    hit_sl = True; exit_px = sl_px
-                elif l <= tp_px:
-                    hit_tp = True; exit_px = tp_px
+                if h >= sl_px:   hit_sl = True; exit_px = sl_px
+                elif l <= tp_px: hit_tp = True; exit_px = tp_px
 
             if hit_tp or hit_sl:
                 gross = ((exit_px - entry_price) / entry_price
                          if pos_side == 'long'
                          else (entry_price - exit_px) / entry_price)
-                net   = gross - (FEE_RATE + SLIP_RATE) * 2
-                size  = (CAPITAL * RISK_PCT) / sl_pct
+                net  = gross - (FEE_RATE + SLIP_RATE) * 2
+                size = (CAPITAL * RISK_PCT) / sl_pct
                 trades.append({
                     'symbol'   : symbol,
                     'variant'  : vname,
@@ -396,7 +412,6 @@ def backtest_coin_variant(symbol, bars, vname, tp_pct, sl_pct):
                 in_pos       = False
                 last_close_i = bar_i
 
-        # New entry
         if not in_pos and sig['signal'] and (bar_i - last_close_i >= COOLDOWN_BARS):
             in_pos      = True
             entry_price = closes[bar_i]
@@ -405,11 +420,11 @@ def backtest_coin_variant(symbol, bars, vname, tp_pct, sl_pct):
 
     return trades
 
-# ── Worker (subprocess) ────────────────────────────────────────────────────
+# ── Worker ─────────────────────────────────────────────────────────────────
 def worker_task(symbol):
     try:
         bars, months = fetch_symbol_data(symbol)
-        if len(bars) < 200:
+        if len(bars) < 300:
             return symbol, None, f"insufficient ({len(bars)} bars)"
         result = {}
         for vname, vcfg in VARIANTS.items():
@@ -423,13 +438,9 @@ def worker_task(symbol):
 def apply_portfolio_cap(results_raw, variant_name):
     all_trades = []
     for sym, variant_map in results_raw.items():
-        v_trades = variant_map.get(variant_name, [])
-        all_trades.extend(v_trades)
-
+        all_trades.extend(variant_map.get(variant_name, []))
     all_trades.sort(key=lambda t: t['entry_ts'])
-
-    active   = []
-    accepted = []
+    active = []; accepted = []
     for t in all_trades:
         active = [ex for ex in active if ex > t['entry_ts']]
         if len(active) < MAX_POSITIONS:
@@ -445,11 +456,10 @@ def calc_stats(trades):
     losses = [t for t in trades if t['pnl_usd'] <= 0]
     total  = len(trades)
     wr     = len(wins) / total * 100
-
-    gp = sum(t['pnl_usd'] for t in wins)
-    gl = abs(sum(t['pnl_usd'] for t in losses))
-    pf = gp / gl if gl > 0 else float('inf')
-    net = sum(t['pnl_usd'] for t in trades)
+    gp     = sum(t['pnl_usd'] for t in wins)
+    gl     = abs(sum(t['pnl_usd'] for t in losses))
+    pf     = gp / gl if gl > 0 else float('inf')
+    net    = sum(t['pnl_usd'] for t in trades)
 
     longs  = [t for t in trades if t['side'] == 'long']
     shorts = [t for t in trades if t['side'] == 'short']
@@ -502,15 +512,13 @@ def monthly_pnl(trades):
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
     t0 = time.time()
-    print("="*60)
-    print("  Backtest v8.2 — RSI-Filtered Whitelist | 7 Variants")
-    print("="*60)
+    print("="*65)
+    print("  Backtest v8.3 — G / H / I Variants | Full Binance Futures")
+    print("="*65)
     print(f"Period    : {START_YEAR}-{START_MONTH:02d} -> {END_YEAR}-{END_MONTH:02d}")
     print(f"Symbols   : {len(SYMBOLS)}")
-    print(f"Variants  : {list(VARIANTS.keys())}")
-    print(f"RSI filter: long>={RSI_LONG_MIN}, short<={RSI_SHORT_MAX}")
+    print(f"Variants  : G (baseline) | H (higher TP) | I (G + MACD+Vol+HTF)")
     print(f"Max pos   : {MAX_POSITIONS}")
-    print(f"Workers   : {WORKERS}")
     print()
 
     results_raw  = {}
@@ -538,10 +546,10 @@ def main():
     summary_lines = []
     report = {
         'meta': {
-            'version' : 'v8.2',
-            'period'  : f"{START_YEAR}-{START_MONTH:02d} -> {END_YEAR}-{END_MONTH:02d}",
+            'version'       : 'v8.3',
+            'period'        : f"{START_YEAR}-{START_MONTH:02d} -> {END_YEAR}-{END_MONTH:02d}",
             'symbols_tested': len(results_raw),
-            'variants': VARIANTS,
+            'variants'      : VARIANTS,
             'settings': {
                 'capital'      : CAPITAL,
                 'risk_pct'     : RISK_PCT,
@@ -551,6 +559,11 @@ def main():
                 'max_positions': MAX_POSITIONS,
                 'rsi_long_min' : RSI_LONG_MIN,
                 'rsi_short_max': RSI_SHORT_MAX,
+                'variant_I_filters': {
+                    'macd'  : f'{MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL} histogram confirm',
+                    'volume': f'>{VOL_MULT}x {VOL_PERIOD}-bar avg',
+                    'htf'   : f'{HTF_BARS}-bar (~{HTF_BARS*15//60}h) slope confirm',
+                }
             }
         },
         'variants': {},
@@ -570,13 +583,12 @@ def main():
 
         monthly = monthly_pnl(capped)
 
-        # Per-coin stats for this variant
+        # Per-coin stats
         coin_stats = {}
+        capped_ts  = {(t['symbol'], t['entry_ts']) for t in capped}
         for sym, vmap in results_raw.items():
-            sym_trades = vmap.get(vname, [])
-            capped_ts  = {(t['symbol'], t['entry_ts']) for t in capped}
-            filtered   = [t for t in sym_trades
-                          if (t['symbol'], t['entry_ts']) in capped_ts]
+            filtered = [t for t in vmap.get(vname, [])
+                        if (t['symbol'], t['entry_ts']) in capped_ts]
             if filtered:
                 cs = calc_stats(filtered)
                 if cs:
@@ -586,12 +598,14 @@ def main():
                              key=lambda x: x[1]['profit_factor'], reverse=True)
 
         usable  = stats['profit_factor'] >= 1.5 and stats['win_rate'] >= 42
-        verdict = "USABLE ✓" if usable else "NOT YET"
+        verdict = "USABLE ✓" if usable else ("CLOSE" if stats['profit_factor'] >= 1.0 else "NOT YET")
 
         lines = []
-        lines.append(f"\n{'='*60}")
-        lines.append(f"  VARIANT {vname} — TP {tp_pct:.0f}% / SL {sl_pct:.1f}%  [{verdict}]")
-        lines.append(f"{'='*60}")
+        lines.append(f"\n{'='*65}")
+        lines.append(f"  VARIANT {vname} — TP {tp_pct:.0f}% / SL {sl_pct:.0f}%  [{verdict}]")
+        if vname == 'I':
+            lines.append(f"  Filters: MACD hist + Volume>{VOL_MULT}x avg + {HTF_BARS*15//60}h HTF slope")
+        lines.append(f"{'='*65}")
         lines.append(f"  Trades       : {stats['total_trades']}")
         lines.append(f"  Win Rate     : {stats['win_rate']}%")
         lines.append(f"  Profit Factor: {stats['profit_factor']}")
@@ -604,10 +618,10 @@ def main():
         lines.append(f"  Short : {stats['short_trades']} trades | WR {stats['short_wr']}%")
         lines.append(f"  Gross Profit : ${stats['gross_profit']} | Loss: ${stats['gross_loss']}")
 
-        lines.append(f"\n  -- Top 20 by Profit Factor --")
+        lines.append(f"\n  -- Top 25 by Profit Factor --")
         lines.append(f"  {'Coin':<22} {'Trades':>6} {'WR%':>7} {'PF':>7} {'NetPnL':>10}")
-        lines.append(f"  {'-'*56}")
-        for sym, cs in coin_sorted[:20]:
+        lines.append(f"  {'-'*57}")
+        for sym, cs in coin_sorted[:25]:
             lines.append(f"  {sym:<22} {cs['total_trades']:>6} "
                          f"{cs['win_rate']:>6.1f}% {cs['profit_factor']:>7.3f} "
                          f"${cs['net_pnl']:>9.2f}")
@@ -620,17 +634,22 @@ def main():
 
         lines.append(f"\n  -- Monthly PnL --")
         for mo, pnl in monthly.items():
-            bar  = '#' * min(int(abs(pnl)/20), 50)
+            bar  = '#' * min(int(abs(pnl)/15), 50)
             sign = '+' if pnl >= 0 else ''
             lines.append(f"  {mo}  {sign}${pnl:>8.2f}  {bar}")
 
         good = [(s, c) for s, c in coin_sorted
                 if c['profit_factor'] >= 1.5 and c['win_rate'] >= 42
-                and c['total_trades'] >= 10]
-        lines.append(f"\n  -- Passing Coins (PF>=1.5 WR>=42% >=10 trades): {len(good)} --")
+                and c['total_trades'] >= 8]
+        lines.append(f"\n  -- Passing Coins (PF>=1.5 WR>=42% >=8 trades): {len(good)} --")
         for sym, cs in good:
             lines.append(f"  OK {sym:<22} PF={cs['profit_factor']:.3f} "
                          f"WR={cs['win_rate']:.1f}% T={cs['total_trades']}")
+
+        # Trades per day estimate
+        days = 730
+        tpd = stats['total_trades'] / days
+        lines.append(f"\n  Trades/day (portfolio): ~{tpd:.1f}")
 
         block = '\n'.join(lines)
         summary_lines.append(block)
@@ -643,29 +662,46 @@ def main():
             'per_coin'   : {s: c for s, c in coin_sorted},
             'good_coins' : [s for s, _ in good],
             'verdict'    : verdict,
+            'trades_per_day': round(tpd, 2),
             'trades'     : capped[-500:],
         }
 
-    # ── Cross-variant summary table ────────────────────────────────────────
-    summary_lines.append(f"\n{'='*60}")
+    # ── Cross-variant summary ──────────────────────────────────────────────
+    summary_lines.append(f"\n{'='*65}")
     summary_lines.append(f"  CROSS-VARIANT SUMMARY")
-    summary_lines.append(f"{'='*60}")
-    summary_lines.append(f"  {'Var':<4} {'TP':>5} {'SL':>6} {'Trades':>7} {'WR%':>7} {'PF':>7} {'NetPnL':>12} {'MaxDD':>8} {'Verdict'}")
-    summary_lines.append(f"  {'-'*70}")
+    summary_lines.append(f"{'='*65}")
+    summary_lines.append(f"  {'Var':<4} {'TP':>5} {'SL':>5} {'Trades':>7} {'T/day':>6} "
+                         f"{'WR%':>7} {'PF':>7} {'NetPnL':>12} {'MaxDD':>8} {'Verdict'}")
+    summary_lines.append(f"  {'-'*78}")
     for vname, vdata in report['variants'].items():
         cfg = vdata['config']
         st  = vdata['aggregate']
         summary_lines.append(
-            f"  {vname:<4} {cfg['tp']*100:>4.0f}% {cfg['sl']*100:>5.1f}% "
-            f"{st['total_trades']:>7} {st['win_rate']:>6.1f}% "
-            f"{st['profit_factor']:>7.3f} ${st['net_pnl']:>10.2f} "
-            f"{st['max_drawdown']:>6.1f}%  {vdata['verdict']}"
+            f"  {vname:<4} {cfg['tp']*100:>4.0f}% {cfg['sl']*100:>4.0f}% "
+            f"{st['total_trades']:>7} {vdata['trades_per_day']:>6.1f} "
+            f"{st['win_rate']:>6.1f}% {st['profit_factor']:>7.3f} "
+            f"${st['net_pnl']:>10.2f} {st['max_drawdown']:>6.1f}%  {vdata['verdict']}"
         )
 
+    # ── Whitelist recommendation ───────────────────────────────────────────
+    # Coins that pass in ALL of G, H, I = strongest candidates
+    summary_lines.append(f"\n{'='*65}")
+    summary_lines.append(f"  WHITELIST RECOMMENDATION (passing G + H + I)")
+    summary_lines.append(f"{'='*65}")
+    all_good = {}
+    for vname, vdata in report['variants'].items():
+        for sym in vdata['good_coins']:
+            all_good[sym] = all_good.get(sym, 0) + 1
+    triple = sorted([s for s, c in all_good.items() if c == 3])
+    double = sorted([s for s, c in all_good.items() if c == 2])
+    summary_lines.append(f"  Passes all 3 variants ({len(triple)} coins): {', '.join(triple)}")
+    summary_lines.append(f"  Passes 2/3 variants  ({len(double)} coins): {', '.join(double)}")
+
     # Symbol notes
-    issues = [(s, n) for s, n in symbol_notes.items() if 'error' in n or 'insufficient' in n]
+    issues = [(s, n) for s, n in symbol_notes.items()
+              if 'error' in n or 'insufficient' in n]
     summary_lines.append(f"\n-- Symbol Issues ({len(issues)}) --")
-    for s, n in issues[:30]:
+    for s, n in issues[:40]:
         summary_lines.append(f"  {s}: {n}")
 
     elapsed = time.time() - t0
@@ -674,8 +710,10 @@ def main():
 
     out = Path(os.environ.get('GITHUB_WORKSPACE', '.'))
     (out / 'backtest_summary.txt').write_text('\n'.join(summary_lines))
-    (out / 'backtest_report.json').write_text(json.dumps(report, indent=2, default=str))
+    (out / 'backtest_report.json').write_text(
+        json.dumps(report, indent=2, default=str))
     print("[OUT] backtest_summary.txt + backtest_report.json written")
 
 if __name__ == '__main__':
     main()
+
