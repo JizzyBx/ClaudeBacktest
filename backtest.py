@@ -3,7 +3,8 @@ InfinityX Multi-Strategy Backtest
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 8 strategies, each tested on their own coin list.
 Data: data.binance.vision futures archive (no API key, no geo-block).
-Workers: 10 parallel threads for data download.
+Workers: 30 parallel threads — each month ZIP is a separate job so
+         all 3600+ requests fire concurrently, not sequentially.
 Window: up to 5 years (2020-07 → 2025-06). If a coin has less history,
         uses whatever is available (min 30 candles required).
 Output: backtest_summary.txt + backtest_report.json
@@ -79,9 +80,10 @@ END_YEAR, END_MONTH   = 2025, 6
 START_YEAR, START_MONTH = 2020, 7
 
 TF_MINUTES = {'15m': 15, '30m': 30, '1h': 60}
-WORKERS = 10
+WORKERS    = 30          # parallel ZIP download threads
+DL_TIMEOUT = 20          # seconds per individual ZIP request
 
-BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
+BASE_URL  = "https://data.binance.vision/data/futures/um/monthly/klines"
 DAILY_URL = "https://data.binance.vision/data/futures/um/daily/klines"
 
 # ──────────────────────────────────────────────
@@ -94,23 +96,37 @@ def month_range(sy, sm, ey, em):
         m += 1
         if m > 12: m = 1; y += 1
 
-def fetch_monthly_csv(symbol, tf, year, month):
+def fetch_one_zip(symbol, tf, year, month):
+    """
+    Fetch a single monthly ZIP. Returns (year, month, [candle tuples]) or None on 404.
+    Each call is a separate thread job — this is where the parallelism lives.
+    """
     tag = f"{year}-{month:02d}"
     url = f"{BASE_URL}/{symbol}/{tf}/{symbol}-{tf}-{tag}.zip"
-    try:
-        with urllib.request.urlopen(url, timeout=30) as r:
-            data = r.read()
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            name = z.namelist()[0]
-            with z.open(name) as f:
-                rows = list(csv.reader(io.TextIOWrapper(f)))
-        return rows
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None   # symbol didn't exist yet or delisted
-        raise
-    except Exception:
-        return None
+    for attempt in range(2):          # 1 retry on non-404 errors
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=DL_TIMEOUT) as r:
+                data = r.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                name = z.namelist()[0]
+                with z.open(name) as f:
+                    rows = list(csv.reader(io.TextIOWrapper(f)))
+            candles = parse_rows(rows)
+            return (year, month, candles)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None           # coin didn't exist that month — normal
+            if attempt == 0:
+                time.sleep(1)
+            else:
+                return None
+        except Exception:
+            if attempt == 0:
+                time.sleep(1)
+            else:
+                return None
+    return None
 
 def parse_rows(rows):
     """Convert raw CSV rows to (open_time_ms, open, high, low, close, volume)."""
@@ -125,16 +141,12 @@ def parse_rows(rows):
             continue
     return out
 
-def download_symbol_tf(symbol, tf):
-    """Download all available monthly data for symbol/tf, return sorted candle list."""
+def assemble_candles(raw_results):
+    """Merge per-month candle lists, deduplicate, sort."""
     all_candles = []
-    for y, m in month_range(START_YEAR, START_MONTH, END_YEAR, END_MONTH):
-        rows = fetch_monthly_csv(symbol, tf, y, m)
-        if rows is not None:
-            all_candles.extend(parse_rows(rows))
-    # deduplicate and sort
-    seen = set()
-    deduped = []
+    for item in raw_results:
+        if item: all_candles.extend(item[2])
+    seen = set(); deduped = []
     for c in all_candles:
         if c[0] not in seen:
             seen.add(c[0]); deduped.append(c)
@@ -510,34 +522,64 @@ def monthly_pnl(trades):
 # 8. PARALLEL DATA DOWNLOAD
 # ──────────────────────────────────────────────
 def collect_all_data():
-    """Collect unique (symbol, tf) pairs across all strategies and download in parallel."""
-    jobs = set()
+    """
+    Fire every (symbol, tf, year, month) combination as its own thread job.
+    30 workers pulling ~3600 ZIPs in parallel — should finish in ~5-10 min.
+    """
+    # Collect unique (symbol, tf) pairs
+    sym_tf_set = set()
     for cfg in STRATEGIES.values():
         for coin in cfg['coins']:
-            jobs.add((coin, cfg['tf']))
+            sym_tf_set.add((coin, cfg['tf']))
 
-    results = {}
-    print(f"[DATA] Downloading {len(jobs)} symbol/tf combinations with {WORKERS} workers...")
+    # Build flat list of all (sym, tf, year, month) jobs
+    all_jobs = []
+    months = list(month_range(START_YEAR, START_MONTH, END_YEAR, END_MONTH))
+    for sym, tf in sym_tf_set:
+        for y, m in months:
+            all_jobs.append((sym, tf, y, m))
 
-    def worker(symbol, tf):
-        candles = download_symbol_tf(symbol, tf)
-        return (symbol, tf), candles
+    total_jobs = len(all_jobs)
+    print(f"[DATA] {len(sym_tf_set)} symbol/tf pairs × {len(months)} months = {total_jobs} ZIP requests")
+    print(f"[DATA] Firing all with {WORKERS} parallel workers...")
+
+    # Group results by (sym, tf) → list of month results
+    from collections import defaultdict
+    bucket = defaultdict(list)
+    done_count = 0
+    t_dl = time.time()
 
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(worker, sym, tf): (sym, tf) for sym, tf in jobs}
-        done = 0
-        for fut in as_completed(futures):
-            key, candles = fut.result()
-            results[key] = candles
-            done += 1
-            sym, tf = key
-            bars = len(candles)
-            if bars > 0:
-                first = datetime.utcfromtimestamp(candles[0][0]/1000).strftime('%Y-%m')
-                last  = datetime.utcfromtimestamp(candles[-1][0]/1000).strftime('%Y-%m')
-                print(f"  [{done:3d}/{len(jobs)}] {sym:20s} {tf} — {bars:6d} bars  ({first} → {last})")
-            else:
-                print(f"  [{done:3d}/{len(jobs)}] {sym:20s} {tf} — NO DATA")
+        future_map = {pool.submit(fetch_one_zip, sym, tf, y, m): (sym, tf)
+                      for sym, tf, y, m in all_jobs}
+        for fut in as_completed(future_map):
+            key = future_map[fut]
+            result = fut.result()
+            if result:
+                bucket[key].append(result)
+            done_count += 1
+            if done_count % 200 == 0 or done_count == total_jobs:
+                elapsed = time.time() - t_dl
+                print(f"  {done_count}/{total_jobs} ZIPs done  ({elapsed:.0f}s)")
+
+    print(f"[DATA] Download complete in {time.time()-t_dl:.0f}s")
+
+    # Assemble per (sym, tf)
+    results = {}
+    for (sym, tf), month_results in bucket.items():
+        candles = assemble_candles(month_results)
+        results[(sym, tf)] = candles
+        if candles:
+            first = datetime.utcfromtimestamp(candles[0][0]/1000).strftime('%Y-%m')
+            last  = datetime.utcfromtimestamp(candles[-1][0]/1000).strftime('%Y-%m')
+            print(f"  {sym:22s} {tf}  {len(candles):6d} bars  ({first} → {last})")
+        else:
+            print(f"  {sym:22s} {tf}  NO DATA")
+
+    # Fill missing pairs with empty list
+    for sym, tf in sym_tf_set:
+        if (sym, tf) not in results:
+            results[(sym, tf)] = []
 
     return results
 
