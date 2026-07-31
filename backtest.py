@@ -1,14 +1,24 @@
 """
-Backtest v8.1 — Fixed % TP/SL Multi-Variant
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Backtest v8.2 — RSI-Filtered Whitelist + Extended Variants
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Strategy : ADX>=22 + 50EMA slope + 9/21 EMA crossover (15m)
-TP/SL    : Fixed % (6 variants A-F)
-Coins    : Curated 80-coin list (L1/L2/Meme/DeFi/AI sectors)
+           + RSI-14 filter (long>45, short<55)
+Entry    : Whitelist only — coins with positive PF across 2+ variants in v8.1
+TP/SL    : Fixed % (7 variants A-G)
+Coins    : ~50 curated coins (whitelist core + expanded liquid alts)
 Period   : 2 years (coins with less history use what they have)
-Capital  : $10,000 shared | Risk 0.75%/trade | Max 6 positions
+Capital  : $10,000 shared | Risk 0.75%/trade | Max 5 positions
 Fees     : 0.05% taker per side | Slippage 0.02% per side
 Workers  : 60 ProcessPoolExecutor inside single GH Actions job
 stdlib   : only
+
+Changes vs v8.1:
+  - RSI-14 entry filter added (reduces false crossovers)
+  - Coin universe trimmed to whitelist (removes consistent losers)
+  - Expanded with new liquid coins for more trade frequency
+  - MAX_POSITIONS reduced 6→5 (drawdown reduction)
+  - Variant F SL changed 9%→7%
+  - New Variant G: TP 3% / SL 15%
 """
 
 import csv, io, json, math, os, time, urllib.request, zipfile
@@ -23,13 +33,14 @@ VARIANTS = {
     'C': {'tp': 0.03, 'sl': 0.01},
     'D': {'tp': 0.03, 'sl': 0.015},
     'E': {'tp': 0.03, 'sl': 0.02},
-    'F': {'tp': 0.03, 'sl': 0.09},
+    'F': {'tp': 0.03, 'sl': 0.07},   # SL changed 9%→7%
+    'G': {'tp': 0.03, 'sl': 0.15},   # NEW: wide SL, same TP
 }
 
 # ── Settings ──────────────────────────────────────────────────────────────
 CAPITAL       = 10_000.0
 RISK_PCT      = 0.0075
-MAX_POSITIONS = 6
+MAX_POSITIONS = 5          # reduced from 6 → helps drawdown
 FEE_RATE      = 0.0005
 SLIP_RATE     = 0.0002
 ADX_MIN       = 22
@@ -37,6 +48,11 @@ SLOPE_THRESH  = 0.0005
 COOLDOWN_BARS = 4
 WORKERS       = 60
 INTERVAL      = '15m'
+
+# RSI filter thresholds
+RSI_LONG_MIN  = 45   # only take long if RSI >= this
+RSI_SHORT_MAX = 55   # only take short if RSI <= this
+RSI_PERIOD    = 14
 
 _now = datetime.now(timezone.utc)
 _em  = _now.month - 1 if _now.month > 1 else 12
@@ -49,46 +65,97 @@ if END_MONTH == 12:
 
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
-# ── Curated coin list (80 coins, multi-sector) ─────────────────────────────
+# ── Whitelist — coins with positive PF in 2+ v8.1 variants ────────────────
+# Core whitelist from v8.1 per-coin analysis:
+# Strong performers: THETA, XRP, MATIC, AVAX, TRX, ALGO, RENDER, SNX, AAVE, LTC
+# F-variant stars:   BOME, FET, SEI, STRK, MANA, TRUMP, RATS, ETH, BTC
+# Additional liquid alts added for trade frequency (high volume, established)
 SYMBOLS = [
-    # ── Layer 1 majors ──
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'ADAUSDT', 'AVAXUSDT',
-    'DOTUSDT', 'ATOMUSDT', 'NEARUSDT', 'APTUSDT', 'SUIUSDT',
-    'SEIUSDT', 'TIAUSDT', 'INJUSDT', 'FTMUSDT', 'ALGOUSDT',
-    'ICPUSDT', 'HBARUSDT', 'XRPUSDT', 'XLMUSDT', 'TRXUSDT',
-    'BNBUSDT', 'LTCUSDT', 'BCHUSDT', 'ETCUSDT', 'FILUSDT',
+    # ── v8.1 Whitelist Core (proven positive PF) ──
+    'BTCUSDT',      # anchor, always include
+    'ETHUSDT',      # anchor
+    'XRPUSDT',      # consistent positive
+    'LTCUSDT',      # consistent positive
+    'TRXUSDT',      # consistent positive
+    'AVAXUSDT',     # consistent positive
+    'MATICUSDT',    # consistent positive
+    'ALGOUSDT',     # consistent positive
+    'THETAUSDT',    # consistent positive (top performer)
+    'RENDERUSDT',   # consistent positive
+    'AAVEUSDT',     # consistent positive, F-star
+    'SNXUSDT',      # consistent positive
+    'FETUSDT',      # F-star (PF 3.5)
+    'SEIUSDT',      # F-star
+    'STRKUSDT',     # F-star
+    'MANAUSDT',     # F-star
+    'TRUMPUSDT',    # F-star (high volatility, wide SL works)
+    '1000RATSUSDT', # F-star
+    'BOMEUSDT',     # F-star (PF 3.9, top F performer)
+    'BNBUSDT',      # large cap, liquid
 
-    # ── Layer 2 / Scaling ──
-    'ARBUSDT', 'OPUSDT', 'MATICUSDT', 'STXUSDT', 'IMXUSDT',
-    'ZKSYNCUSDT', 'MANTAUSDT', 'SCROLLUSDT', 'ZETAUSDT',
+    # ── High-volume L1/L2 additions (trade frequency) ──
+    'SOLUSDT',      # high volume, trending
+    'ADAUSDT',      # high volume
+    'DOTUSDT',      # solid volume
+    'LINKUSDT',     # DeFi anchor, high volume
+    'ATOMUSDT',     # solid
+    'NEARUSDT',     # growing volume
+    'APTUSDT',      # active
+    'SUIUSDT',      # active
+    'INJUSDT',      # active AI/L1
+    'ARBUSDT',      # L2 high volume
+    'OPUSDT',       # L2 high volume
+    'STXUSDT',      # BTC ecosystem
+    'TIAUSDT',      # modular DA sector
+    'HBARUSDT',     # stable volume
+    'XLMUSDT',      # stable volume
 
-    # ── DeFi ──
-    'UNIUSDT', 'AAVEUSDT', 'LINKUSDT', 'MKRUSDT', 'CRVUSDT',
-    'SNXUSDT', 'COMPUSDT', 'DYDXUSDT', 'GMXUSDT', 'JUPUSDT',
+    # ── DeFi (selective — removed consistent losers) ──
+    'UNIUSDT',      # DeFi blue chip
+    'MKRUSDT',      # DeFi blue chip
+    'COMPUSDT',     # stable DeFi
+    'GMXUSDT',      # perp DEX, active
+    'JUPUSDT',      # Solana DeFi, high volume
 
-    # ── AI / Data ──
-    'FETUSDT', 'RENDERUSDT', 'WLDUSDT', 'TAOUSDT', 'ARKMUSDT',
-    'AGIXUSDT', 'OCEANUSDT',
+    # ── AI sector (high momentum) ──
+    'WLDUSDT',      # AI/identity
+    'TAOUSDT',      # AI/data
+    'AGIXUSDT',     # AI sector
+    'OCEANUSDT',    # AI/data
 
-    # ── Meme coins ──
-    'DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT', 'FLOKIUSDT',
-    '1000BONKUSDT', '1000PEPEUSDT', '1000SHIBUSDT', '1000FLOKIUSDT',
-    'WIFUSDT', 'BOMEUSDT', 'NEIROUSDT', 'MEMEUSDT', 'TURBO1USDT',
-    'POPCAT1USDT', '1000RATSUSDT',
+    # ── Meme (only volume leaders — removed NEIRO, WIF, FLOW etc.) ──
+    'DOGEUSDT',     # meme anchor, massive volume
+    'PEPEUSDT',     # massive volume
+    '1000BONKUSDT', # SOL meme, high volume
+    '1000PEPEUSDT', # high volume
+    'FLOKIUSDT',    # solid volume
 
-    # ── Gaming / Metaverse ──
-    'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'GALAUSDT', 'ENJUSDT',
-    'IMMXUSDT',
+    # ── Infrastructure additions for frequency ──
+    'RUNEUSDT',     # THORChain, active
+    'LDOUSDT',      # liquid staking
+    'RPLUSDT',      # liquid staking
+    'PYTHUSDT',     # oracle, active
+    'ONDOUSDT',     # RWA sector hot
+    'ARUSDT',       # storage, consistent
+    'EGLDUSDT',     # MultiversX, solid
 
-    # ── Exchange / CEX ──
-    'OKBUSDT', 'CAKEUSDT',
+    # ── Gaming (kept performers, dropped IMMX) ──
+    'AXSUSDT',      # gaming anchor
+    'SANDUSDT',     # metaverse
+    'GALAUSDT',     # gaming
 
-    # ── Infrastructure / Other ──
-    'ARUSDT', 'RUNEUSDT', 'THETAUSDT', 'FLOWUSDT', 'EGLDUSDT',
-    'QNTUSDT', 'LDOUSDT', 'RPLUSDT', 'STRKUSDT', 'PYTHUSDT',
-    'JUPUSDT', 'ONDOUSDT', 'TRUMPUSDT',
+    # ── Additional liquid coins for trade count ──
+    'ICPUSDT',      # ICP large cap
+    'FTMUSDT',      # Fantom, active
+    'QNTUSDT',      # enterprise, stable
+    'ETCUSDT',      # ETC, liquid
+    'BCHUSDT',      # BCH, liquid
+    'FILUSDT',      # storage sector
+    'IMXUSDT',      # gaming L2
+    'CAKEUSDT',     # BSC DeFi
 ]
-# Deduplicate
+
+# Deduplicate while preserving order
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
 # ── Month iterator ─────────────────────────────────────────────────────────
@@ -182,13 +249,47 @@ def adx_series(highs, lows, closes, period=14):
             [None] + pad_di + pdi,
             [None] + pad_di + mdi)
 
-# ── Signal generation ──────────────────────────────────────────────────────
+def rsi_series(closes, period=14):
+    """Wilder RSI — same smoothing as TradingView default."""
+    n = len(closes)
+    if n < period + 1:
+        return [None] * n
+
+    gains, losses = [], []
+    for i in range(1, n):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+
+    # Initial average
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+
+    rsi = [None] * (period)  # pad with None for warmup bars
+    if avg_l == 0:
+        rsi.append(100.0)
+    else:
+        rs = avg_g / avg_l
+        rsi.append(100 - 100 / (1 + rs))
+
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+        if avg_l == 0:
+            rsi.append(100.0)
+        else:
+            rs = avg_g / avg_l
+            rsi.append(100 - 100 / (1 + rs))
+
+    return rsi
+
+# ── Signal generation (with RSI filter) ────────────────────────────────────
 def compute_signals(bars):
     closes = [b[4] for b in bars]
     highs  = [b[2] for b in bars]
     lows   = [b[3] for b in bars]
     n      = len(closes)
-    warmup = 60
+    warmup = 80   # increased slightly to allow RSI to warm up too
     if n < warmup:
         return []
 
@@ -196,25 +297,35 @@ def compute_signals(bars):
     e21 = ema_series(closes, 21)
     e50 = ema_series(closes, 50)
     adx_arr, _, _ = adx_series(highs, lows, closes, 14)
+    rsi_arr = rsi_series(closes, RSI_PERIOD)
 
     signals = []
     for i in range(warmup, n):
-        if adx_arr[i] is None:
+        if adx_arr[i] is None or rsi_arr[i] is None:
             signals.append({'i': i, 'signal': None}); continue
         if adx_arr[i] < ADX_MIN:
             signals.append({'i': i, 'signal': None}); continue
         if i < 10:
             signals.append({'i': i, 'signal': None}); continue
+
         slope = (e50[i] - e50[i-10]) / e50[i-10]
         trend_up   = slope >  SLOPE_THRESH
         trend_down = slope < -SLOPE_THRESH
         if not trend_up and not trend_down:
             signals.append({'i': i, 'signal': None}); continue
+
         cross_up   = e9[i] > e21[i] and e9[i-1] <= e21[i-1]
         cross_down = e9[i] < e21[i] and e9[i-1] >= e21[i-1]
+
         sig = None
-        if trend_up   and cross_up:   sig = 'long'
-        if trend_down and cross_down: sig = 'short'
+        rsi_val = rsi_arr[i]
+
+        # RSI filter: only enter if RSI confirms direction
+        if trend_up and cross_up and rsi_val >= RSI_LONG_MIN:
+            sig = 'long'
+        if trend_down and cross_down and rsi_val <= RSI_SHORT_MAX:
+            sig = 'short'
+
         signals.append({'i': i, 'signal': sig})
     return signals
 
@@ -300,7 +411,6 @@ def worker_task(symbol):
         bars, months = fetch_symbol_data(symbol)
         if len(bars) < 200:
             return symbol, None, f"insufficient ({len(bars)} bars)"
-        # returns: symbol -> variant -> [trade dicts]
         result = {}
         for vname, vcfg in VARIANTS.items():
             result[vname] = backtest_coin_variant(
@@ -311,20 +421,14 @@ def worker_task(symbol):
 
 # ── Portfolio cap ──────────────────────────────────────────────────────────
 def apply_portfolio_cap(results_raw, variant_name):
-    """
-    results_raw: { symbol: { variant: [trades] } }
-    Flatten all trades for this variant, sort by entry_ts,
-    enforce MAX_POSITIONS concurrent cap.
-    """
     all_trades = []
     for sym, variant_map in results_raw.items():
-        # variant_map is dict {vname: [trades]}
         v_trades = variant_map.get(variant_name, [])
         all_trades.extend(v_trades)
 
     all_trades.sort(key=lambda t: t['entry_ts'])
 
-    active   = []   # list of exit_ts still open
+    active   = []
     accepted = []
     for t in all_trades:
         active = [ex for ex in active if ex > t['entry_ts']]
@@ -399,12 +503,14 @@ def monthly_pnl(trades):
 def main():
     t0 = time.time()
     print("="*60)
-    print("  Backtest v8.1 — Fixed % TP/SL | 6 Variants")
+    print("  Backtest v8.2 — RSI-Filtered Whitelist | 7 Variants")
     print("="*60)
-    print(f"Period  : {START_YEAR}-{START_MONTH:02d} -> {END_YEAR}-{END_MONTH:02d}")
-    print(f"Symbols : {len(SYMBOLS)}")
-    print(f"Variants: {list(VARIANTS.keys())}")
-    print(f"Workers : {WORKERS}")
+    print(f"Period    : {START_YEAR}-{START_MONTH:02d} -> {END_YEAR}-{END_MONTH:02d}")
+    print(f"Symbols   : {len(SYMBOLS)}")
+    print(f"Variants  : {list(VARIANTS.keys())}")
+    print(f"RSI filter: long>={RSI_LONG_MIN}, short<={RSI_SHORT_MAX}")
+    print(f"Max pos   : {MAX_POSITIONS}")
+    print(f"Workers   : {WORKERS}")
     print()
 
     results_raw  = {}
@@ -432,13 +538,19 @@ def main():
     summary_lines = []
     report = {
         'meta': {
-            'period': f"{START_YEAR}-{START_MONTH:02d} -> {END_YEAR}-{END_MONTH:02d}",
+            'version' : 'v8.2',
+            'period'  : f"{START_YEAR}-{START_MONTH:02d} -> {END_YEAR}-{END_MONTH:02d}",
             'symbols_tested': len(results_raw),
             'variants': VARIANTS,
             'settings': {
-                'capital': CAPITAL, 'risk_pct': RISK_PCT,
-                'fee': FEE_RATE, 'slip': SLIP_RATE,
-                'adx_min': ADX_MIN, 'max_positions': MAX_POSITIONS,
+                'capital'      : CAPITAL,
+                'risk_pct'     : RISK_PCT,
+                'fee'          : FEE_RATE,
+                'slip'         : SLIP_RATE,
+                'adx_min'      : ADX_MIN,
+                'max_positions': MAX_POSITIONS,
+                'rsi_long_min' : RSI_LONG_MIN,
+                'rsi_short_max': RSI_SHORT_MAX,
             }
         },
         'variants': {},
@@ -462,10 +574,9 @@ def main():
         coin_stats = {}
         for sym, vmap in results_raw.items():
             sym_trades = vmap.get(vname, [])
-            # only count trades that made it through portfolio cap
-            capped_ts = {(t['symbol'], t['entry_ts']) for t in capped}
-            filtered  = [t for t in sym_trades
-                         if (t['symbol'], t['entry_ts']) in capped_ts]
+            capped_ts  = {(t['symbol'], t['entry_ts']) for t in capped}
+            filtered   = [t for t in sym_trades
+                          if (t['symbol'], t['entry_ts']) in capped_ts]
             if filtered:
                 cs = calc_stats(filtered)
                 if cs:
@@ -475,7 +586,7 @@ def main():
                              key=lambda x: x[1]['profit_factor'], reverse=True)
 
         usable  = stats['profit_factor'] >= 1.5 and stats['win_rate'] >= 42
-        verdict = "USABLE" if usable else "NOT YET"
+        verdict = "USABLE ✓" if usable else "NOT YET"
 
         lines = []
         lines.append(f"\n{'='*60}")
@@ -494,22 +605,22 @@ def main():
         lines.append(f"  Gross Profit : ${stats['gross_profit']} | Loss: ${stats['gross_loss']}")
 
         lines.append(f"\n  -- Top 20 by Profit Factor --")
-        lines.append(f"  {'Coin':<20} {'Trades':>6} {'WR%':>7} {'PF':>7} {'NetPnL':>10}")
-        lines.append(f"  {'-'*54}")
+        lines.append(f"  {'Coin':<22} {'Trades':>6} {'WR%':>7} {'PF':>7} {'NetPnL':>10}")
+        lines.append(f"  {'-'*56}")
         for sym, cs in coin_sorted[:20]:
-            lines.append(f"  {sym:<20} {cs['total_trades']:>6} "
+            lines.append(f"  {sym:<22} {cs['total_trades']:>6} "
                          f"{cs['win_rate']:>6.1f}% {cs['profit_factor']:>7.3f} "
                          f"${cs['net_pnl']:>9.2f}")
 
         lines.append(f"\n  -- Bottom 10 --")
         for sym, cs in coin_sorted[-10:]:
-            lines.append(f"  {sym:<20} {cs['total_trades']:>6} "
+            lines.append(f"  {sym:<22} {cs['total_trades']:>6} "
                          f"{cs['win_rate']:>6.1f}% {cs['profit_factor']:>7.3f} "
                          f"${cs['net_pnl']:>9.2f}")
 
         lines.append(f"\n  -- Monthly PnL --")
         for mo, pnl in monthly.items():
-            bar  = '#' * min(int(abs(pnl)/30), 40)
+            bar  = '#' * min(int(abs(pnl)/20), 50)
             sign = '+' if pnl >= 0 else ''
             lines.append(f"  {mo}  {sign}${pnl:>8.2f}  {bar}")
 
@@ -518,7 +629,7 @@ def main():
                 and c['total_trades'] >= 10]
         lines.append(f"\n  -- Passing Coins (PF>=1.5 WR>=42% >=10 trades): {len(good)} --")
         for sym, cs in good:
-            lines.append(f"  OK {sym:<20} PF={cs['profit_factor']:.3f} "
+            lines.append(f"  OK {sym:<22} PF={cs['profit_factor']:.3f} "
                          f"WR={cs['win_rate']:.1f}% T={cs['total_trades']}")
 
         block = '\n'.join(lines)
@@ -534,6 +645,22 @@ def main():
             'verdict'    : verdict,
             'trades'     : capped[-500:],
         }
+
+    # ── Cross-variant summary table ────────────────────────────────────────
+    summary_lines.append(f"\n{'='*60}")
+    summary_lines.append(f"  CROSS-VARIANT SUMMARY")
+    summary_lines.append(f"{'='*60}")
+    summary_lines.append(f"  {'Var':<4} {'TP':>5} {'SL':>6} {'Trades':>7} {'WR%':>7} {'PF':>7} {'NetPnL':>12} {'MaxDD':>8} {'Verdict'}")
+    summary_lines.append(f"  {'-'*70}")
+    for vname, vdata in report['variants'].items():
+        cfg = vdata['config']
+        st  = vdata['aggregate']
+        summary_lines.append(
+            f"  {vname:<4} {cfg['tp']*100:>4.0f}% {cfg['sl']*100:>5.1f}% "
+            f"{st['total_trades']:>7} {st['win_rate']:>6.1f}% "
+            f"{st['profit_factor']:>7.3f} ${st['net_pnl']:>10.2f} "
+            f"{st['max_drawdown']:>6.1f}%  {vdata['verdict']}"
+        )
 
     # Symbol notes
     issues = [(s, n) for s, n in symbol_notes.items() if 'error' in n or 'insufficient' in n]
@@ -552,4 +679,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
