@@ -1,32 +1,38 @@
 """
-Backtest — Wider ROI TP @ 10x Leverage, Compounding, NO Cap (v8.9)
+Backtest — G Wider SL + New 1:1 R:R Variant @ 10x Leverage (v8.10)
 Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL, defined in ROI terms (post-leverage)
 
-WHAT CHANGED FROM v8.8:
-v8.8 used the original TP numbers (3%/4%/4% ROI) reinterpreted at 10x
-leverage and it wiped every variant's equity to $0 — the TP was so small in
-price terms (0.3-0.4%) that round-trip fees (~0.14% price) ate nearly half
-of it, so even at ~75-80% win rate the strategy lost money overall. This
-version widens TP (SL unchanged per variant) to give real room over the fee
-drag:
+WHAT CHANGED FROM v8.9:
+1) G's SL widened from 15% ROI (1.5% price) to 40% ROI (4% price). TP stays
+   5% ROI (0.5% price). The dollar risk per trade does NOT change from
+   this — sizing is risk-based (0.75% of equity IS the loss if SL is hit,
+   no matter how wide SL is in price terms), so widening SL doesn't mean
+   losing more money per stopped-out trade. What it should do is give the
+   trade more room to breathe before 15m candle noise knocks it out on a
+   move that isn't really a trend reversal — which was the suspected cause
+   of v8.9's WR shortfall. If this works, WR should climb back toward what
+   the wide-price version showed (72-80%+).
+2) New 4th variant "OneToOne" — TP 10% ROI / SL 10% ROI (1% price / 1%
+   price) at 10x leverage. A genuine 1:1 risk:reward test: if this
+   strategy's win rate is naturally high (as every run so far has shown,
+   65-87%), a symmetric payoff should be the easiest one to turn PF > 1 on,
+   since it doesn't need a favorable win/loss ratio to work — just needs
+   WR above 50% net of fees.
 
-  G    — ADX>=22, TP 5% ROI (0.5% price) / SL 15% ROI (1.5% price)
-  H    — ADX>=22, TP 6% ROI (0.6% price) / SL 15% ROI (1.5% price)
-  New  — ADX>=22, TP 6% ROI (0.6% price) / SL 12% ROI (1.2% price)
+  G         — ADX>=22, TP 5% ROI (0.5% price)  / SL 40% ROI (4.0% price)
+  H         — ADX>=22, TP 6% ROI (0.6% price)  / SL 15% ROI (1.5% price)  [unchanged from v8.9]
+  New       — ADX>=22, TP 6% ROI (0.6% price)  / SL 12% ROI (1.2% price)  [unchanged from v8.9]
+  OneToOne  — ADX>=22, TP 10% ROI (1.0% price) / SL 10% ROI (1.0% price)  [new]
 
-Rough math before running: net of the ~0.14% round-trip cost, G's
-loss-to-win ratio drops from ~8.5:1 (v8.8) to ~3.8:1, needing ~79% win rate
-to break even — plausible given v8.8 showed G running ~80% WR, but not
-guaranteed, since win rate itself can shift when the TP distance changes
-(a farther TP is generally harder to hit before SL). Watch WR alongside PF
-in the results, not just PF alone.
+Coin universe: G/H/New keep their existing per-variant filtered whitelists
+(same staleness caveat as before — built from the original wide-price
+run, not these ROI-derived thresholds). OneToOne has no prior data to
+filter on, so it runs on the FULL 195-coin universe (unfiltered) —
+something to re-screen once you see results.
 
 Sizing stays compounding (0.75% of current equity per trade), still NO
-concurrency cap. Coin universe unchanged from v8.6/v8.7/v8.8 (G=144,
-H=134, New=133) — same caveat as before: this whitelist was built from the
-ORIGINAL wide price TP/SL, not these ROI-derived thresholds, so it may not
-reflect which coins actually perform best here.
+concurrency cap.
 """
 
 import csv, io, json, time, heapq, urllib.request, zipfile
@@ -38,11 +44,12 @@ from collections import defaultdict
 LEVERAGE = 10   # ROI% / LEVERAGE = price% — this is what actually drives TP/SL below
 
 # tp_pct/sl_pct below are PRICE percentages, derived from the ROI targets
-# you actually trade with (5%/15%, 6%/15%, 6%/12% ROI at 10x leverage).
+# you actually trade with, at 10x leverage.
 VARIANTS = {
-    "G":   {"tp_pct": 5.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.5% / 1.5% price
-    "H":   {"tp_pct": 6.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.6% / 1.5% price
-    "New": {"tp_pct": 6.0 / LEVERAGE, "sl_pct": 12.0 / LEVERAGE, "adx_min": 22},   # 0.6% / 1.2% price
+    "G":        {"tp_pct": 5.0  / LEVERAGE, "sl_pct": 40.0 / LEVERAGE, "adx_min": 22},  # 0.5% / 4.0% price
+    "H":        {"tp_pct": 6.0  / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},  # 0.6% / 1.5% price
+    "New":      {"tp_pct": 6.0  / LEVERAGE, "sl_pct": 12.0 / LEVERAGE, "adx_min": 22},  # 0.6% / 1.2% price
+    "OneToOne": {"tp_pct": 10.0 / LEVERAGE, "sl_pct": 10.0 / LEVERAGE, "adx_min": 22},  # 1.0% / 1.0% price
 }
 
 STARTING_CAPITAL = 10_000.0
@@ -141,6 +148,10 @@ VARIANT_SYMBOLS = {
         "WAXPUSDT", "XLMUSDT", "XNYUSDT", "YBUSDT", "ZECUSDT", "ZENUSDT", "ZKJUSDT",
     ],
 }
+
+# OneToOne has no prior-run data to filter on, so it trades the full
+# unfiltered universe (union of everything the other variants use).
+VARIANT_SYMBOLS["OneToOne"] = sorted(set().union(*VARIANT_SYMBOLS.values()))
 
 # Fetch data once for the union of every symbol needed by any variant.
 SYMBOLS = sorted(set().union(*VARIANT_SYMBOLS.values()))
@@ -443,7 +454,7 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print(f"  WIDER ROI TP @ {LEVERAGE}x LEVERAGE — Variants G / H / New (no cap)")
+    print(f"  G WIDER SL + 1:1 R:R VARIANT @ {LEVERAGE}x LEVERAGE (no cap)")
     print(f"  Per-variant filtered universe | Jul 2024-Jun 2026 | 15m")
     print(f"  Risk: {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding)")
     print("=" * 65)
@@ -554,7 +565,7 @@ def main():
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write(f"WIDER ROI TP @ {LEVERAGE}x LEVERAGE BACKTEST SUMMARY (no cap)\n")
+        f.write(f"G WIDER SL + 1:1 R:R VARIANT @ {LEVERAGE}x LEVERAGE BACKTEST SUMMARY (no cap)\n")
         f.write("=" * 65 + "\n")
         f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 – Jun 2026\n")
@@ -688,4 +699,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
