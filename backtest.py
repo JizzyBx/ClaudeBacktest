@@ -1,129 +1,154 @@
 """
-Backtest v12.0 — Three Pre-Live Validation Tests
-Based on v11.0 strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
-Exit: Fixed percentage TP/SL, compounding 0.75% risk sizing, real capital tracking
+Backtest — ROI-Based TP/SL @ 10x Leverage, Compounding, NO Cap (v8.8)
+Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
+Exit:      Fixed percentage TP/SL, defined in ROI terms (post-leverage)
 
-THREE TESTS IN ONE RUN:
-  TEST_WF   — Walk-Forward: trained on Jul 2024–Dec 2025, evaluated on Jan–Jun 2026 only
-              Coins and variant configs are FIXED from v11.0 whitelists — no re-selection.
-              Pass = PF >= 1.2 on the out-of-sample window (relaxed from 1.5 since it's 6 months).
-  TEST_SLIP — Slippage Stress: same period as v11 (Jul 2024–Jun 2026), slip doubled to 0.05%
-              Pass = PF still >= 1.2 (strategy survives worse fills).
-  TEST_BEAR — Bear Regime: Jul 2024–Mar 2025 only (9 months, pre-bull-run)
-              Pass = PF >= 1.0 (at minimum not losing money in a flat/bear window).
+WHAT CHANGED FROM v8.7:
+TP/SL were being applied as raw PRICE moves (e.g. G = price moves 3%/15%).
+On the live exchange at 10x isolated leverage, "3% / 15%" means ROI on
+margin, not price move on the coin — and ROI = price_move% * leverage
+(roughly, ignoring fees). So a 3% ROI target at 10x leverage is really only
+a 0.3% PRICE move, and a 15% ROI stop is a 1.5% PRICE move. This version
+converts every variant's TP/SL from ROI% to PRICE% by dividing by LEVERAGE,
+then runs the exact same detection/exit engine on those (much tighter)
+price thresholds:
 
-For each test we run all 4 variants (G, H, New, Tight) so Kimi can see which
-variant is most robust across conditions.
+  G    — ADX>=22, TP 3% ROI (0.3% price) / SL 15% ROI (1.5% price)
+  H    — ADX>=22, TP 4% ROI (0.4% price) / SL 15% ROI (1.5% price)
+  New  — ADX>=22, TP 4% ROI (0.4% price) / SL 12% ROI (1.2% price)
 
-IMPORTANT: Coin whitelists are the v11.0 per-variant whitelists (PF>=1.5, WR>=42%, >=10 trades).
-We only trade coins that already proved themselves — this is the realistic live setup.
+HEADS UP before trusting the results: round-trip trading cost (fees +
+slippage) is ~0.14% in price terms. At 10x that's 1.4% of ROI eaten by
+costs on every single trade, win or lose. G's TP is now only 0.3% price —
+cost alone is nearly half the target, so a winning trade nets very little
+(0.3% - 0.14% = 0.16% price ~ 1.6% ROI) while a losing trade still costs
+close to the full SL (1.5% - 0.14% ~ 1.36% price ~ 13.6% ROI). That's
+roughly an 8.5:1 loss-to-win ratio, which needs a very high win rate just
+to break even. Worth watching closely in the results.
+
+Sizing stays compounding (0.75% of current equity per trade) and there's
+still NO concurrency cap — every signal fires. Coin universe is unchanged
+from v8.6/v8.7 (G=144, H=134, New=133) — that whitelist was built from
+trades at the OLD wider price TP/SL, so it may not reflect which coins
+actually perform well at these much tighter thresholds. Worth re-screening
+once you see these numbers.
 """
 
-import csv, io, json, math, time, heapq, urllib.request, zipfile
+import csv, io, json, time, heapq, urllib.request, zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from collections import defaultdict
 
-# ── Strategy config (unchanged from v11.0) ────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+LEVERAGE = 10   # ROI% / LEVERAGE = price% — this is what actually drives TP/SL below
+
+# tp_pct/sl_pct below are PRICE percentages, derived from the ROI targets
+# you actually trade with (3%/15%, 4%/15%, 4%/12% ROI at 10x leverage).
 VARIANTS = {
-    "G":     {"tp_pct": 3.0, "sl_pct": 15.0, "adx_min": 22},
-    "H":     {"tp_pct": 4.0, "sl_pct": 15.0, "adx_min": 22},
-    "New":   {"tp_pct": 4.0, "sl_pct": 12.0, "adx_min": 22},
-    "Tight": {"tp_pct": 5.0, "sl_pct": 12.0, "adx_min": 22},
+    "G":   {"tp_pct": 3.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.3% / 1.5% price
+    "H":   {"tp_pct": 4.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.4% / 1.5% price
+    "New": {"tp_pct": 4.0 / LEVERAGE, "sl_pct": 12.0 / LEVERAGE, "adx_min": 22},   # 0.4% / 1.2% price
 }
 
 STARTING_CAPITAL = 10_000.0
-RISK_PER_TRADE   = 0.0075
-FEE_RATE         = 0.0005   # 0.05% per side — unchanged
-SLOPE_THRESH     = 0.05
-INTERVAL         = "15m"
-WORKERS          = 50
+RISK_PER_TRADE    = 0.0075   # 0.75% of CURRENT equity per trade (compounding)
 
-BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
+FEE_RATE       = 0.0005   # 0.05% per side
+SLIP_RATE      = 0.0002   # 0.02% per side
+COST_PER_SIDE  = FEE_RATE + SLIP_RATE
 
-# ── Test-specific date ranges ─────────────────────────────────────────────────
-# Expressed as (year, month) tuples
+SLOPE_THRESH   = 0.05     # EMA50 must move 0.05% over 10 bars
+INTERVAL       = "15m"
+WORKERS        = 50
 
-# Walk-forward OUT-OF-SAMPLE window (Jan–Jun 2026 only)
-# In-sample window Jul 2024–Dec 2025 is used only to "confirm" coin picks,
-# which we do by using the v11.0 whitelist directly — no re-fitting here.
-MONTHS_WF_OOS = [
-    (2026,1),(2026,2),(2026,3),(2026,4),(2026,5),(2026,6),
-]
-
-# Slippage stress — full period same as v11
-MONTHS_FULL = [
+MONTHS = [
     (2024,7),(2024,8),(2024,9),(2024,10),(2024,11),(2024,12),
     (2025,1),(2025,2),(2025,3),(2025,4),(2025,5),(2025,6),
     (2025,7),(2025,8),(2025,9),(2025,10),(2025,11),(2025,12),
     (2026,1),(2026,2),(2026,3),(2026,4),(2026,5),(2026,6),
 ]
+BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
-# Bear regime — Jul 2024–Mar 2025 only
-MONTHS_BEAR = [
-    (2024,7),(2024,8),(2024,9),(2024,10),(2024,11),(2024,12),
-    (2025,1),(2025,2),(2025,3),
-]
-
-# Slippage per test
-SLIP_NORMAL  = 0.0002   # 0.02% — used in WF and BEAR tests (same as v11)
-SLIP_STRESS  = 0.0005   # 0.05% — doubled, used in SLIP test
-
-# ── v11.0 Per-variant whitelists (coins that passed PF>=1.5, WR>=42%, >=10 trades) ──
-# These are the ONLY coins traded in all three tests — realistic live universe.
-VARIANT_WHITELIST = {
+# Per-variant whitelist (unchanged from v8.6): drop a symbol from a variant
+# only if it was PF<1.15 AND trades>=30 for that variant in the prior
+# 195-coin no-cap run.
+VARIANT_SYMBOLS = {
     "G": [
-        "1000000BOBUSDT","1000CATUSDT","1000RATSUSDT","A2ZUSDT","AIOTUSDT",
-        "ALGOUSDT","ALPINEUSDT","ASTERUSDT","AUSDT","BASEDUSDT","BELUSDT",
-        "BIDUSDT","BMTUSDT","BTRUSDT","CFXUSDT","CHIPUSDT","CRCLUSDT","DAMUSDT",
-        "DEXEUSDT","DIAUSDT","EPTUSDT","ETHUSDT","FLNCUSDT","FUNUSDT","GLMUSDT",
-        "GUAUSDT","ICXUSDT","IOUSDT","LIGHTUSDT","MOODENGUSDT","NFPUSDT",
-        "NMRUSDT","NOTUSDT","ORBSUSDT","PEOPLEUSDT","PIPPINUSDT","POWERUSDT",
-        "POWRUSDT","RAVEUSDT","RESOLVUSDT","RVVUSDT","SEIUSDT","SIGNUSDT",
-        "SKRUSDT","SNDKUSDT","SOMIUSDT","SPELLUSDT","TRUTHUSDT","TURBOUSDT",
-        "VANRYUSDT","VINEUSDT","VVVUSDT","XEMUSDT","XRPUSDT","ZECUSDT",
-        "ZEREBROUSDT",
+        "0GUSDT", "1000000BOBUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT",
+        "1000SATSUSDT", "A2ZUSDT", "ACHUSDT", "AI16ZUSDT", "AINUSDT", "AIOTUSDT",
+        "ALGOUSDT", "ALICEUSDT", "ALPINEUSDT", "ANKRUSDT", "ARKMUSDT", "ASRUSDT",
+        "ASTERUSDT", "ATAUSDT", "AUSDT", "AWEUSDT", "AXLUSDT", "BANDUSDT", "BANKUSDT",
+        "BASEDUSDT", "BASUSDT", "BATUSDT", "BDXNUSDT", "BELUSDT", "BIDUSDT", "BMTUSDT",
+        "BTRUSDT", "CFXUSDT", "CHIPUSDT", "COAIUSDT", "COMBOUSDT", "COMMONUSDT",
+        "COTIUSDT", "CRCLUSDT", "CUSDT", "DAMUSDT", "DEFIUSDT", "DEXEUSDT", "DIAUSDT",
+        "DMCUSDT", "EIGENUSDT", "ELSAUSDT", "ENAUSDT", "EPICUSDT", "EPTUSDT", "ESPUSDT",
+        "ETCUSDT", "ETHUSDT", "EVAAUSDT", "FIOUSDT", "FLNCUSDT", "FLUXUSDT", "FOLKSUSDT",
+        "FUNUSDT", "FXSUSDT", "GLMUSDT", "GRIFFAINUSDT", "GUAUSDT", "HANAUSDT",
+        "HEMIUSDT", "ICPUSDT", "ICXUSDT", "INITUSDT", "IOSTUSDT", "IOUSDT", "IPUSDT",
+        "KITEUSDT", "LABUSDT", "LIGHTUSDT", "LRCUSDT", "LYNUSDT", "MAGICUSDT", "MAVUSDT",
+        "MEGAUSDT", "MILKUSDT", "MOODENGUSDT", "MTLUSDT", "NFPUSDT", "NMRUSDT",
+        "NOMUSDT", "NOTUSDT", "OBOLUSDT", "OMGUSDT", "OPENUSDT", "OPNUSDT", "ORBSUSDT",
+        "PEOPLEUSDT", "PIPPINUSDT", "PIXELUSDT", "PLUMEUSDT", "POLUSDT", "POWERUSDT",
+        "POWRUSDT", "PROMPTUSDT", "PTBUSDT", "PUMPBTCUSDT", "PUNDIXUSDT", "QUICKUSDT",
+        "RAVEUSDT", "REEFUSDT", "RESOLVUSDT", "REZUSDT", "RLSUSDT", "RVVUSDT",
+        "SAGAUSDT", "SAHARAUSDT", "SANTOSUSDT", "SEIUSDT", "SIGNUSDT", "SKRUSDT",
+        "SNDKUSDT", "SOMIUSDT", "SPELLUSDT", "SPKUSDT", "STABLEUSDT", "STBLUSDT",
+        "STXUSDT", "TNSRUSDT", "TRBUSDT", "TRUTHUSDT", "TURBOUSDT", "UBUSDT",
+        "USUALUSDT", "UXLINKUSDT", "VANRYUSDT", "VINEUSDT", "VIRTUALUSDT", "VVVUSDT",
+        "WAXPUSDT", "WLDUSDT", "XCNUSDT", "XEMUSDT", "XLMUSDT", "XRPUSDT", "YBUSDT",
+        "ZECUSDT", "ZENUSDT", "ZEREBROUSDT", "ZKJUSDT",
     ],
     "H": [
-        "1000CATUSDT","1000RATSUSDT","AI16ZUSDT","AINUSDT","AIOTUSDT","ALGOUSDT",
-        "ALPINEUSDT","ASTERUSDT","AUSDT","BASEDUSDT","BTRUSDT","CFXUSDT",
-        "CHIPUSDT","COMMONUSDT","CRCLUSDT","DAMUSDT","EPTUSDT","ETHUSDT",
-        "ETHWUSDT","FISUSDT","FLUXUSDT","FOGOUSDT","FRAXUSDT","FUNUSDT",
-        "GLMUSDT","ILVUSDT","IOUSDT","KEYUSDT","KITEUSDT","LAYERUSDT",
-        "LIGHTUSDT","LYNUSDT","PEOPLEUSDT","PIPPINUSDT","PIXELUSDT","PLUMEUSDT",
-        "POLUSDT","POWERUSDT","POWRUSDT","PUFFERUSDT","QUICKUSDT","RAVEUSDT",
-        "RESOLVUSDT","RVVUSDT","SIGNUSDT","SKRUSDT","SNDKUSDT","SPELLUSDT",
-        "STXUSDT","SYRUPUSDT","TRUTHUSDT","TURBOUSDT","VANRYUSDT","VINEUSDT",
-        "XNYUSDT","XRPUSDT","ZKJUSDT",
+        "0GUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT", "A2ZUSDT", "ACEUSDT",
+        "ACXUSDT", "AI16ZUSDT", "AINUSDT", "AIOTUSDT", "AKTUSDT", "ALGOUSDT",
+        "ALPINEUSDT", "ASRUSDT", "ASTERUSDT", "ATAUSDT", "AUSDT", "AXLUSDT",
+        "BANANAUSDT", "BANDUSDT", "BANKUSDT", "BASEDUSDT", "BASUSDT", "BATUSDT",
+        "BELUSDT", "BIDUSDT", "BLZUSDT", "BOMEUSDT", "BTRUSDT", "CFXUSDT", "CHIPUSDT",
+        "COAIUSDT", "COMBOUSDT", "COMMONUSDT", "COTIUSDT", "CRCLUSDT", "CUSDT",
+        "DAMUSDT", "DEFIUSDT", "ELSAUSDT", "ENAUSDT", "EPICUSDT", "EPTUSDT", "ESPUSDT",
+        "ETCUSDT", "ETHUSDT", "ETHWUSDT", "EVAAUSDT", "FIDAUSDT", "FIOUSDT", "FISUSDT",
+        "FLNCUSDT", "FLUXUSDT", "FOGOUSDT", "FRAXUSDT", "FUNUSDT", "FXSUSDT", "GLMUSDT",
+        "GRIFFAINUSDT", "GUAUSDT", "GUNUSDT", "HAEDALUSDT", "HANAUSDT", "ICPUSDT",
+        "ICXUSDT", "ILVUSDT", "INITUSDT", "IOTXUSDT", "IOUSDT", "IPUSDT", "KEYUSDT",
+        "KITEUSDT", "LABUSDT", "LAYERUSDT", "LIGHTUSDT", "LOKAUSDT", "LRCUSDT",
+        "LYNUSDT", "MILKUSDT", "MOODENGUSDT", "MORPHOUSDT", "MYROUSDT", "NOMUSDT",
+        "NOTUSDT", "NTRNUSDT", "ONEUSDT", "ORBSUSDT", "PEOPLEUSDT", "PIPPINUSDT",
+        "PIXELUSDT", "PLAYUSDT", "PLUMEUSDT", "POLUSDT", "POWERUSDT", "POWRUSDT",
+        "PTBUSDT", "PUFFERUSDT", "PUMPBTCUSDT", "QUICKUSDT", "RAVEUSDT", "REEFUSDT",
+        "RESOLVUSDT", "RVVUSDT", "SAHARAUSDT", "SEIUSDT", "SIGNUSDT", "SKATEUSDT",
+        "SKRUSDT", "SNDKUSDT", "SPELLUSDT", "SPKUSDT", "STXUSDT", "SYRUPUSDT",
+        "TAIKOUSDT", "TRUTHUSDT", "TURBOUSDT", "UBUSDT", "USELESSUSDT", "VANRYUSDT",
+        "VINEUSDT", "VIRTUALUSDT", "VOXELUSDT", "WAXPUSDT", "WLDUSDT", "XCNUSDT",
+        "XLMUSDT", "XNYUSDT", "XPLUSDT", "XRPUSDT", "YALAUSDT", "YBUSDT", "ZECUSDT",
+        "ZENUSDT", "ZKJUSDT",
     ],
     "New": [
-        "0GUSDT","1000CATUSDT","1000RATSUSDT","AI16ZUSDT","AIOTUSDT","ALPINEUSDT",
-        "ASTERUSDT","AUSDT","BELUSDT","BIDUSDT","BTRUSDT","CFXUSDT","CHIPUSDT",
-        "COMBOUSDT","COMMONUSDT","DAMUSDT","EPTUSDT","ETHWUSDT","FLNCUSDT",
-        "FLUXUSDT","FOGOUSDT","FRAXUSDT","FUNUSDT","GLMUSDT","HAEDALUSDT",
-        "ILVUSDT","KITEUSDT","LOKAUSDT","LYNUSDT","MAGICUSDT","MOODENGUSDT",
-        "NOMUSDT","PEOPLEUSDT","PHBUSDT","PLUMEUSDT","POWRUSDT","PUMPBTCUSDT",
-        "QUICKUSDT","RAVEUSDT","RESOLVUSDT","RPLUSDT","RVVUSDT","SKLUSDT",
-        "SKRUSDT","SNDKUSDT","SYRUPUSDT","THEUSDT","TRUTHUSDT","TRUUSDT",
-        "TURBOUSDT","TWTUSDT","VANRYUSDT","VINEUSDT","XNYUSDT","ZECUSDT",
-        "ZKJUSDT",
-    ],
-    "Tight": [
-        "0GUSDT","1000CATUSDT","1000RATSUSDT","AI16ZUSDT","AIOTUSDT","ALPINEUSDT",
-        "ASTERUSDT","AUSDT","BELUSDT","BIDUSDT","BTRUSDT","CFXUSDT","CHIPUSDT",
-        "COMBOUSDT","COMMONUSDT","DAMUSDT","EPTUSDT","ETHWUSDT","FLNCUSDT",
-        "FLUXUSDT","FOGOUSDT","FRAXUSDT","FUNUSDT","GLMUSDT","HAEDALUSDT",
-        "ILVUSDT","KITEUSDT","LOKAUSDT","LYNUSDT","MAGICUSDT","MOODENGUSDT",
-        "NOMUSDT","PEOPLEUSDT","PHBUSDT","PLUMEUSDT","POWRUSDT","PUMPBTCUSDT",
-        "QUICKUSDT","RAVEUSDT","RESOLVUSDT","RPLUSDT","RVVUSDT","SKLUSDT",
-        "SKRUSDT","SNDKUSDT","SYRUPUSDT","THEUSDT","TRUTHUSDT","TRUUSDT",
-        "TURBOUSDT","TWTUSDT","VANRYUSDT","VINEUSDT","XNYUSDT","ZECUSDT",
-        "ZKJUSDT",
+        "0GUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT", "1000SHIBUSDT",
+        "A2ZUSDT", "ACEUSDT", "ADAUSDT", "AI16ZUSDT", "AINUSDT", "AIOTUSDT", "ALGOUSDT",
+        "ALPINEUSDT", "ANIMEUSDT", "API3USDT", "ASRUSDT", "ASTERUSDT", "ATAUSDT",
+        "AUSDT", "BANANAUSDT", "BANDUSDT", "BASEDUSDT", "BASUSDT", "BATUSDT", "BCHUSDT",
+        "BELUSDT", "BIDUSDT", "BLZUSDT", "BSWUSDT", "BTRUSDT", "CFXUSDT", "CHIPUSDT",
+        "COAIUSDT", "COMBOUSDT", "COMMONUSDT", "COTIUSDT", "DAMUSDT", "DEFIUSDT",
+        "DIAUSDT", "DOODUSDT", "DUSDT", "ELSAUSDT", "ENAUSDT", "EPICUSDT", "EPTUSDT",
+        "ESPUSDT", "ETHWUSDT", "EVAAUSDT", "FIDAUSDT", "FISUSDT", "FLNCUSDT", "FLUXUSDT",
+        "FOGOUSDT", "FORMUSDT", "FRAXUSDT", "FUNUSDT", "FXSUSDT", "GLMUSDT",
+        "GRIFFAINUSDT", "GUNUSDT", "HAEDALUSDT", "HANAUSDT", "ICPUSDT", "ICXUSDT",
+        "ILVUSDT", "IOTXUSDT", "IPUSDT", "KEYUSDT", "KITEUSDT", "LABUSDT", "LIGHTUSDT",
+        "LOKAUSDT", "LRCUSDT", "LYNUSDT", "MAGICUSDT", "MAVUSDT", "MITOUSDT",
+        "MOODENGUSDT", "MORPHOUSDT", "MYROUSDT", "NOMUSDT", "NOTUSDT", "NTRNUSDT",
+        "ONEUSDT", "OPENUSDT", "ORBSUSDT", "PEOPLEUSDT", "PHBUSDT", "PIPPINUSDT",
+        "PIXELUSDT", "PLAYUSDT", "PLUMEUSDT", "POWERUSDT", "POWRUSDT", "PTBUSDT",
+        "PUMPBTCUSDT", "QUICKUSDT", "RAVEUSDT", "REEFUSDT", "RENDERUSDT", "RESOLVUSDT",
+        "RPLUSDT", "RVVUSDT", "SANTOSUSDT", "SKATEUSDT", "SKLUSDT", "SKRUSDT",
+        "SNDKUSDT", "SOPHUSDT", "SPKUSDT", "STXUSDT", "SYNUSDT", "SYRUPUSDT", "THEUSDT",
+        "TNSRUSDT", "TRUTHUSDT", "TRUUSDT", "TURBOUSDT", "TWTUSDT", "UBUSDT",
+        "USELESSUSDT", "UXLINKUSDT", "VANRYUSDT", "VINEUSDT", "VIRTUALUSDT", "VOXELUSDT",
+        "WAXPUSDT", "XLMUSDT", "XNYUSDT", "YBUSDT", "ZECUSDT", "ZENUSDT", "ZKJUSDT",
     ],
 }
 
-# Union of all symbols needed
-ALL_SYMBOLS = sorted(set().union(*VARIANT_WHITELIST.values()))
+# Fetch data once for the union of every symbol needed by any variant.
+SYMBOLS = sorted(set().union(*VARIANT_SYMBOLS.values()))
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 def ema(values, period):
@@ -170,9 +195,9 @@ def adx_calc(highs, lows, closes, period=14):
     return max(0.0, min(100.0, adx_val))
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
-def fetch_candles(symbol, months):
+def fetch_candles(symbol):
     candles = []
-    for year, month in months:
+    for year, month in MONTHS:
         url = (f"{BASE_URL}/{symbol}/{INTERVAL}/"
                f"{symbol}-{INTERVAL}-{year}-{month:02d}.zip")
         try:
@@ -197,10 +222,12 @@ def fetch_candles(symbol, months):
     candles.sort(key=lambda x: x[0])
     return candles
 
-# ── Per-symbol signal scan ────────────────────────────────────────────────────
-def scan_symbol(args):
-    symbol, months = args
-    candles = fetch_candles(symbol, months)
+# ── Per-symbol signal detection ────────────────────────────────────────────────
+# Only resolves the price-path outcome (net_ret) per candidate signal — NOT
+# its dollar size. Sizing is compounding (depends on equity at entry time),
+# so it's computed afterward in Phase 2 across all symbols in time order.
+def backtest_symbol(symbol):
+    candles = fetch_candles(symbol)
     if len(candles) < 150:
         return symbol, None
 
@@ -228,7 +255,9 @@ def scan_symbol(args):
         crossed_down = e9[i] < e21[i] and e9[i-1] >= e21[i-1]
         if not crossed_up and not crossed_down:
             continue
-        if (trend_up and not crossed_up) or (trend_down and not crossed_down):
+        if trend_up and not crossed_up:
+            continue
+        if trend_down and not crossed_down:
             continue
 
         seg_h = highs[max(0, i-59): i+1]
@@ -240,7 +269,7 @@ def scan_symbol(args):
         entry  = closes[i]
 
         for vname, vcfg in VARIANTS.items():
-            if symbol not in VARIANT_WHITELIST[vname]:
+            if symbol not in VARIANT_SYMBOLS[vname]:
                 continue
             if adx < vcfg["adx_min"]:
                 continue
@@ -276,6 +305,7 @@ def scan_symbol(args):
                 raw_ret = (exit_price - entry) / entry
             else:
                 raw_ret = (entry - exit_price) / entry
+            net_ret = raw_ret - COST_PER_SIDE * 2
 
             variant_candidates[vname].append({
                 "symbol":   symbol,
@@ -283,7 +313,7 @@ def scan_symbol(args):
                 "entry":    entry,
                 "exit":     exit_price,
                 "outcome":  outcome,
-                "net_ret":  raw_ret,   # cost subtracted later per test's slip rate
+                "net_ret":  net_ret,
                 "sl_pct":   sl_pct,
                 "entry_ts": ts_arr[i],
                 "exit_ts":  ts_arr[exit_bar],
@@ -292,91 +322,46 @@ def scan_symbol(args):
 
     return symbol, variant_candidates
 
-# ── Phase 2: execution simulation (real capital tracking) ─────────────────────
-def run_execution_sim(candidates, risk_pct, starting_capital, slip_rate):
-    cost_per_side = FEE_RATE + slip_rate
+# ── Phase 2: compounding sizing simulation (NO cap) ────────────────────────────
+def run_compounding_sim(candidates, risk_pct, starting_capital):
+    """
+    Every candidate signal is taken — nothing is skipped. Trades are
+    processed in entry_ts order so each trade's dollar size reflects
+    equity AT ITS OWN ENTRY TIME (compounding). A min-heap tracks open
+    positions by exit_ts so equity gets updated as trades close, in the
+    correct chronological order, without capping how many can be open
+    at once.
+    """
     candidates_sorted = sorted(candidates, key=lambda t: (t["entry_ts"], t["symbol"]))
 
-    equity   = starting_capital
-    reserved = 0.0
-    heap     = []
+    equity = starting_capital
+    heap = []  # (exit_ts, pnl) for currently open (already-sized) trades
     executed = []
-    equity_curve = []
-    in_position  = set()
-    rej = {"same_symbol_open": 0, "insufficient_capital": 0, "executed": 0}
-
-    def settle_up_to(ts):
-        nonlocal equity, reserved
-        while heap and heap[0][0] <= ts:
-            exit_ts, sym, pnl, win, risk_dollar = heapq.heappop(heap)
-            equity   += pnl
-            reserved -= risk_dollar
-            in_position.discard(sym)
-            equity_curve.append((exit_ts, equity))
+    equity_curve = []  # (ts, equity) snapshots for drawdown calc
 
     for c in candidates_sorted:
-        settle_up_to(c["entry_ts"])
-        sym = c["symbol"]
-
-        if sym in in_position:
-            rej["same_symbol_open"] += 1
-            continue
+        # settle every position that has already closed by this entry
+        while heap and heap[0][0] <= c["entry_ts"]:
+            exit_ts, pnl = heapq.heappop(heap)
+            equity += pnl
+            equity_curve.append((exit_ts, equity))
 
         risk_dollar = equity * risk_pct
-        available   = equity - reserved
-        if risk_dollar > available:
-            rej["insufficient_capital"] += 1
-            continue
-
-        # Apply cost here so each test uses its own slip rate
-        net_ret = c["net_ret"] - cost_per_side * 2
-        pnl = risk_dollar * (net_ret / c["sl_pct"])
-        win = pnl > 0
+        pnl = risk_dollar * (c["net_ret"] / c["sl_pct"])
 
         trade = dict(c)
-        trade["net_ret"]     = net_ret
-        trade["pnl"]         = pnl
-        trade["win"]         = win
-        trade["risk_dollar"] = risk_dollar
+        trade["pnl"] = pnl
+        trade["win"] = pnl > 0
         executed.append(trade)
-        rej["executed"] += 1
+        heapq.heappush(heap, (c["exit_ts"], pnl))
 
-        in_position.add(sym)
-        reserved += risk_dollar
-        heapq.heappush(heap, (c["exit_ts"], sym, pnl, win, risk_dollar))
-
+    # settle whatever's left open at the end
     while heap:
-        exit_ts, sym, pnl, win, risk_dollar = heapq.heappop(heap)
+        exit_ts, pnl = heapq.heappop(heap)
         equity += pnl
         equity_curve.append((exit_ts, equity))
 
-    return executed, equity, equity_curve, rej
-
-# ── Sharpe / Sortino ─────────────────────────────────────────────────────────
-def calc_sharpe_sortino(equity_curve, starting_capital):
-    if not equity_curve:
-        return 0.0, 0.0
-    curve = sorted(equity_curve, key=lambda x: x[0])
-    daily = {}
-    for ts, eq in curve:
-        daily[ts // 86_400_000] = eq
-    days   = sorted(daily.keys())
-    values = [starting_capital] + [daily[d] for d in days]
-    rets   = [(values[i] - values[i-1]) / values[i-1]
-              for i in range(1, len(values)) if values[i-1] > 0]
-    if len(rets) < 2:
-        return 0.0, 0.0
-    mean_r = sum(rets) / len(rets)
-    var    = sum((r - mean_r) ** 2 for r in rets) / (len(rets) - 1)
-    std    = math.sqrt(var)
-    sharpe = (mean_r / std * math.sqrt(365)) if std > 0 else 0.0
-    downside = [r for r in rets if r < 0]
-    if downside:
-        dstd    = math.sqrt(sum(r ** 2 for r in downside) / len(downside))
-        sortino = (mean_r / dstd * math.sqrt(365)) if dstd > 0 else 0.0
-    else:
-        sortino = float("inf") if mean_r > 0 else 0.0
-    return round(sharpe, 3), round(sortino, 3)
+    return executed, equity, equity_curve
 
 # ── Aggregate stats ───────────────────────────────────────────────────────────
 def calc_stats(trades, equity_curve=None, starting_capital=None):
@@ -408,6 +393,7 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
         dt = datetime.fromtimestamp(t["exit_ts"] / 1000, tz=timezone.utc)
         monthly[f"{dt.year}-{dt.month:02d}"] += t["pnl"]
 
+    # Equity-curve based drawdown when available (true compounding DD)
     max_dd = 0.0
     if equity_curve and starting_capital:
         peak = starting_capital
@@ -436,8 +422,6 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
         else:   best_l = max(best_l, cur)
         prev_win = w
 
-    sharpe, sortino = calc_sharpe_sortino(equity_curve, starting_capital) if equity_curve else (0.0, 0.0)
-
     return {
         "total_trades":    total,
         "wins":            len(wins),
@@ -446,8 +430,6 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
         "profit_factor":   round(pf, 4),
         "net_pnl":         round(net_pnl, 2),
         "max_drawdown":    round(max_dd, 2),
-        "sharpe":          sharpe,
-        "sortino":         sortino,
         "avg_win":         round(avg_win, 4),
         "avg_loss":        round(avg_loss, 4),
         "expectancy":      round(expectancy, 4),
@@ -459,268 +441,253 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
         "best_win_streak": best_w,
         "best_loss_streak":best_l,
         "monthly":         dict(sorted(monthly.items())),
+        "usable":          pf >= 1.5 and wr >= 42,
     }
-
-# ── Run one complete test ─────────────────────────────────────────────────────
-def run_test(test_name, months, slip_rate, pass_pf, all_scan_results):
-    """
-    all_scan_results: dict {symbol: variant_candidates} — pre-scanned for this test's months.
-    pass_pf: minimum PF to label a variant as PASS.
-    """
-    print(f"\n  [{test_name}] Running execution sim…")
-    results = {}
-
-    for vname, vcfg in VARIANTS.items():
-        all_candidates = []
-        for sym, vdata in all_scan_results.items():
-            if sym not in VARIANT_WHITELIST[vname]:
-                continue
-            all_candidates.extend(vdata.get(vname, []))
-
-        if not all_candidates:
-            print(f"    {vname}: 0 candidates")
-            continue
-
-        executed, final_equity, equity_curve, rej = run_execution_sim(
-            all_candidates, RISK_PER_TRADE, STARTING_CAPITAL, slip_rate
-        )
-        agg = calc_stats(executed, equity_curve, STARTING_CAPITAL)
-        if not agg:
-            print(f"    {vname}: no executed trades")
-            continue
-
-        verdict = "PASS" if agg["profit_factor"] >= pass_pf else "FAIL"
-        tp = vcfg["tp_pct"]; sl = vcfg["sl_pct"]
-        print(f"    {vname} (TP {tp}%/SL {sl}%): {agg['total_trades']} trades | "
-              f"WR {agg['win_rate']}% | PF {agg['profit_factor']} | "
-              f"Net ${agg['net_pnl']:,.2f} | DD {agg['max_drawdown']}% | "
-              f"Final ${final_equity:,.2f} | {verdict}")
-
-        results[vname] = {
-            "aggregate":   agg,
-            "final_equity": round(final_equity, 2),
-            "filter_stats": rej,
-            "pass_pf":      pass_pf,
-            "verdict":      verdict,
-        }
-
-    return results
-
-# ── Write summary ─────────────────────────────────────────────────────────────
-def write_summary(f, test_label, test_desc, months_desc, slip_rate, pass_pf, results):
-    f.write(f"\n{'='*65}\n")
-    f.write(f"{test_label}\n")
-    f.write(f"{'='*65}\n")
-    f.write(f"Description : {test_desc}\n")
-    f.write(f"Period      : {months_desc}\n")
-    f.write(f"Slip rate   : {slip_rate*100:.3f}% per side (fee: {FEE_RATE*100:.3f}%)\n")
-    f.write(f"Pass threshold: PF >= {pass_pf}\n")
-    f.write(f"Coins       : v11.0 whitelists only (no re-fitting)\n\n")
-
-    for vname, res in results.items():
-        agg = res["aggregate"]; fs = res["filter_stats"]
-        vcfg = VARIANTS[vname]
-        f.write(f"  VARIANT {vname}  (TP {vcfg['tp_pct']}% / SL {vcfg['sl_pct']}% / ADX>={vcfg['adx_min']})  —  {res['verdict']}\n")
-        f.write(f"  {'─'*55}\n")
-        f.write(f"  Trades          : {agg['total_trades']}  ({agg['wins']}W / {agg['losses']}L)\n")
-        f.write(f"  Win Rate        : {agg['win_rate']}%\n")
-        f.write(f"  Profit Factor   : {agg['profit_factor']}\n")
-        f.write(f"  Net PnL         : ${agg['net_pnl']:,.2f}\n")
-        f.write(f"  Final Equity    : ${res['final_equity']:,.2f}\n")
-        f.write(f"  Max Drawdown    : {agg['max_drawdown']}%\n")
-        f.write(f"  Sharpe          : {agg['sharpe']}\n")
-        f.write(f"  Sortino         : {agg['sortino']}\n")
-        f.write(f"  Expectancy      : ${agg['expectancy']}\n")
-        f.write(f"  Avg Duration    : {agg['avg_bars']} bars ({agg['avg_bars']*0.25:.1f}h)\n")
-        f.write(f"  Longs           : {agg['long_trades']} | WR {agg['long_wr']}%\n")
-        f.write(f"  Shorts          : {agg['short_trades']} | WR {agg['short_wr']}%\n")
-        f.write(f"  Win Streak      : {agg['best_win_streak']}\n")
-        f.write(f"  Loss Streak     : {agg['best_loss_streak']}\n")
-        f.write(f"  Skipped (same sym open)  : {fs['same_symbol_open']}\n")
-        f.write(f"  Skipped (insuff capital) : {fs['insufficient_capital']}\n")
-        f.write(f"  Executed                 : {fs['executed']}\n")
-        f.write(f"\n  Monthly PnL:\n")
-        for mo, pnl in agg["monthly"].items():
-            sign = "+" if pnl >= 0 else ""
-            f.write(f"    {mo}: ${sign}{pnl:,.2f}\n")
-        f.write("\n")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     t0 = time.time()
     print("=" * 65)
-    print("  BACKTEST v12.0 — Pre-Live Validation (3 Tests)")
-    print("  TEST_WF   : Walk-Forward OOS (Jan–Jun 2026)")
-    print("  TEST_SLIP : Slippage Stress (full period, 2.5× slip)")
-    print("  TEST_BEAR : Bear Regime (Jul 2024–Mar 2025)")
+    print(f"  ROI-BASED TP/SL @ {LEVERAGE}x LEVERAGE — Variants G / H / New (no cap)")
+    print(f"  Per-variant filtered universe | Jul 2024-Jun 2026 | 15m")
+    print(f"  Risk: {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding)")
     print("=" * 65)
 
-    # We need three separate data fetches — different month ranges.
-    # But we fetch once per symbol per test (parallelised), using ALL_SYMBOLS
-    # so each test can filter down to its variant whitelist independently.
+    print(f"\n[Phase 1] Downloading & scanning ({WORKERS} workers)…")
+    all_results = {}
+    done = failed = 0
 
-    def fetch_all(months, label):
-        print(f"\n[Fetch] {label} — {len(ALL_SYMBOLS)} symbols, {WORKERS} workers…")
-        scan_results = {}
-        done = failed = 0
-        with ProcessPoolExecutor(max_workers=WORKERS) as ex:
-            args = [(sym, months) for sym in ALL_SYMBOLS]
-            futures = {ex.submit(scan_symbol, a): a[0] for a in args}
-            for fut in as_completed(futures):
-                sym = futures[fut]
-                done += 1
-                try:
-                    sym_out, res = fut.result()
-                    if res is not None:
-                        scan_results[sym_out] = res
-                    else:
-                        failed += 1
-                except Exception as e:
+    with ProcessPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(backtest_symbol, sym): sym for sym in SYMBOLS}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            done += 1
+            try:
+                sym_out, res = fut.result()
+                if res is None:
                     failed += 1
-                    print(f"  ERROR {sym}: {e}")
-                if done % 30 == 0 or done == len(ALL_SYMBOLS):
-                    print(f"  [{done}/{len(ALL_SYMBOLS)}] done | {len(scan_results)} with data | {failed} skipped")
+                else:
+                    all_results[sym_out] = res
+            except Exception as e:
+                failed += 1
+                print(f"  ERROR {sym}: {e}")
+            if done % 50 == 0 or done == len(SYMBOLS):
+                print(f"  [{done}/{len(SYMBOLS)}] done | {len(all_results)} with data | {failed} skipped")
 
-        if not scan_results:
-            print(f"\n⛔ ABORT: 0 symbols returned data for {label}.")
-            print("   data.binance.vision may be blocked on this runner.")
-            return None
-        if len(scan_results) < len(ALL_SYMBOLS) * 0.1:
-            print(f"\n⛔ ABORT: Only {len(scan_results)}/{len(ALL_SYMBOLS)} symbols loaded for {label}.")
-            return None
-        print(f"  ✅ {len(scan_results)} symbols loaded | {failed} skipped")
-        return scan_results
+    if not all_results:
+        print("\n⛔ ABORT: 0 symbols returned data.")
+        print("   data.binance.vision may be blocked on this runner.")
+        return
 
-    # ── Fetch data for each test ───────────────────────────────────────────────
-    data_wf   = fetch_all(MONTHS_WF_OOS,  "TEST_WF  (Jan–Jun 2026 OOS)")
-    data_slip = fetch_all(MONTHS_FULL,    "TEST_SLIP (Jul 2024–Jun 2026, full)")
-    data_bear = fetch_all(MONTHS_BEAR,    "TEST_BEAR (Jul 2024–Mar 2025)")
+    if len(all_results) < len(SYMBOLS) * 0.1:
+        print(f"\n⛔ ABORT: Only {len(all_results)}/{len(SYMBOLS)} symbols loaded.")
+        print("   Looks like data source is blocked. Check runner network.")
+        return
+
+    print(f"\n  ✅ {len(all_results)} symbols loaded | {failed} skipped")
+
+    print(f"\n[Phase 2] Compounding sizing simulation (no cap)…")
 
     report = {}
+    summary_lines = []
 
-    # ── TEST 1: Walk-Forward OOS ───────────────────────────────────────────────
-    print("\n" + "="*65)
-    print("TEST 1 — WALK-FORWARD (Jan–Jun 2026 only, OOS)")
-    print("Coin universe: v11.0 whitelists — no re-fitting on OOS data")
-    print("Pass threshold: PF >= 1.2")
-    if data_wf:
-        report["TEST_WF"] = run_test("TEST_WF", MONTHS_WF_OOS, SLIP_NORMAL, 1.2, data_wf)
-    else:
-        report["TEST_WF"] = {}
+    for vname, vcfg in VARIANTS.items():
+        tp = vcfg["tp_pct"]; sl = vcfg["sl_pct"]; adx_min = vcfg["adx_min"]
+        roi_tp = tp * LEVERAGE; roi_sl = sl * LEVERAGE
 
-    # ── TEST 3: Slippage Stress ────────────────────────────────────────────────
-    print("\n" + "="*65)
-    print("TEST 3 — SLIPPAGE STRESS (full period, slip=0.05%)")
-    print("Pass threshold: PF >= 1.2")
-    if data_slip:
-        report["TEST_SLIP"] = run_test("TEST_SLIP", MONTHS_FULL, SLIP_STRESS, 1.2, data_slip)
-    else:
-        report["TEST_SLIP"] = {}
+        all_candidates = []
+        for sym, vdata in all_results.items():
+            if sym not in VARIANT_SYMBOLS[vname]:
+                continue
+            all_candidates.extend(vdata.get(vname, []))
 
-    # ── TEST 5: Bear Regime ────────────────────────────────────────────────────
-    print("\n" + "="*65)
-    print("TEST 5 — BEAR REGIME (Jul 2024–Mar 2025 only)")
-    print("Pass threshold: PF >= 1.0")
-    if data_bear:
-        report["TEST_BEAR"] = run_test("TEST_BEAR", MONTHS_BEAR, SLIP_NORMAL, 1.0, data_bear)
-    else:
-        report["TEST_BEAR"] = {}
+        executed, final_equity, equity_curve = run_compounding_sim(
+            all_candidates, RISK_PER_TRADE, STARTING_CAPITAL
+        )
+
+        agg = calc_stats(executed, equity_curve, STARTING_CAPITAL)
+        if not agg:
+            print(f"  {vname}: no trades")
+            continue
+
+        by_symbol = defaultdict(list)
+        for t in executed:
+            by_symbol[t["symbol"]].append(t)
+        coin_stats = {}
+        for sym, trades in by_symbol.items():
+            cs = calc_stats(trades)
+            if cs:
+                coin_stats[sym] = cs
+
+        coin_table = sorted(
+            coin_stats.items(),
+            key=lambda x: (x[1]["profit_factor"] if x[1]["profit_factor"] != float("inf") else 9999, x[1]["net_pnl"]),
+            reverse=True
+        )
+
+        whitelist = [
+            sym for sym, cs in coin_stats.items()
+            if cs["profit_factor"] >= 1.5
+            and cs["win_rate"] >= 42
+            and cs["total_trades"] >= 10
+        ]
+
+        verdict = "✅ USABLE" if agg["usable"] else "❌ NOT USABLE"
+        print(f"  {vname} (ADX>={adx_min}, TP {roi_tp:.0f}%ROI/{tp}%px SL {roi_sl:.0f}%ROI/{sl}%px): {len(VARIANT_SYMBOLS[vname])} coins | "
+              f"{agg['total_trades']} trades | WR {agg['win_rate']}% | PF {agg['profit_factor']} | "
+              f"Net ${agg['net_pnl']} | DD {agg['max_drawdown']}% | Final equity ${final_equity:,.2f} | {verdict}")
+
+        report[vname] = {
+            "aggregate":     agg,
+            "coin_table":    coin_table,
+            "whitelist":     sorted(whitelist),
+            "tp_pct":        tp,
+            "sl_pct":        sl,
+            "adx_min":       adx_min,
+            "universe_size": len(VARIANT_SYMBOLS[vname]),
+            "final_equity":  round(final_equity, 2),
+        }
+        summary_lines.append(
+            f"Variant {vname} (ADX>={adx_min}, TP {roi_tp:.0f}%ROI/{tp}%px SL {roi_sl:.0f}%ROI/{sl}%px): "
+            f"{len(VARIANT_SYMBOLS[vname])} coins | {agg['total_trades']} trades | "
+            f"WR {agg['win_rate']}% | PF {agg['profit_factor']} | Net ${agg['net_pnl']} | "
+            f"DD {agg['max_drawdown']}% | Final equity ${final_equity:,.2f} | "
+            f"Whitelist: {len(whitelist)} coins | {verdict}"
+        )
 
     elapsed = time.time() - t0
 
-    # ── Write backtest_summary.txt ─────────────────────────────────────────────
+    # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write("BACKTEST v12.0 — Pre-Live Validation\n")
+        f.write(f"ROI-BASED TP/SL @ {LEVERAGE}x LEVERAGE BACKTEST SUMMARY (no cap)\n")
         f.write("=" * 65 + "\n")
-        f.write("Strategy : EMA50 slope + EMA9/21 cross + ADX>=22 (15m)\n")
-        f.write("Coins    : v11.0 whitelists per variant (no refitting)\n")
+        f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
+        f.write(f"Timeframe: 15m | Period: Jul 2024 – Jun 2026\n")
+        f.write(f"Leverage : {LEVERAGE}x — TP/SL below are entered as ROI%, converted to price% by /LEVERAGE\n")
+        f.write(f"Universe : per-variant filtered whitelist (v8.6 filter, PF<1.15 & trades>=30 removed)\n")
+        f.write(f"Mode     : NO position cap — every signal executes independently\n")
+        f.write(f"Sizing   : {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding, not fixed $)\n")
+        f.write(f"Starting capital: ${STARTING_CAPITAL:,.0f}\n")
+        f.write(f"Fees     : {FEE_RATE*100}% + {SLIP_RATE*100}% slip per side\n")
         f.write(f"Run time : {elapsed:.0f}s\n")
+        f.write("=" * 65 + "\n\n")
+
+        for vname, res in report.items():
+            agg = res["aggregate"]
+            f.write(f"{'='*65}\n")
+            f.write(f"VARIANT {vname}  —  ADX>={res['adx_min']} | TP {res['tp_pct']*LEVERAGE:.0f}% ROI ({res['tp_pct']}% price) / SL {res['sl_pct']*LEVERAGE:.0f}% ROI ({res['sl_pct']}% price) | Leverage: {LEVERAGE}x | Universe: {res['universe_size']} coins\n")
+            f.write(f"{'='*65}\n")
+            f.write(f"Total Trades    : {agg['total_trades']}\n")
+            f.write(f"Wins / Losses   : {agg['wins']} / {agg['losses']}\n")
+            f.write(f"Win Rate        : {agg['win_rate']}%\n")
+            f.write(f"Profit Factor   : {agg['profit_factor']}\n")
+            f.write(f"Net PnL         : ${agg['net_pnl']}\n")
+            f.write(f"Final Equity    : ${res['final_equity']:,.2f}\n")
+            f.write(f"Max Drawdown    : {agg['max_drawdown']}%  (equity-curve based)\n")
+            f.write(f"Avg Win         : ${agg['avg_win']}\n")
+            f.write(f"Avg Loss        : ${agg['avg_loss']}\n")
+            f.write(f"Expectancy      : ${agg['expectancy']}\n")
+            f.write(f"Avg Duration    : {agg['avg_bars']} bars ({agg['avg_bars']*0.25:.1f}h)\n")
+            f.write(f"Longs           : {agg['long_trades']} trades | WR {agg['long_wr']}%\n")
+            f.write(f"Shorts          : {agg['short_trades']} trades | WR {agg['short_wr']}%\n")
+            f.write(f"Best Win Streak : {agg['best_win_streak']}\n")
+            f.write(f"Best Loss Streak: {agg['best_loss_streak']}\n")
+            f.write(f"VERDICT         : {'✅ USABLE' if agg['usable'] else '❌ NOT USABLE'}\n\n")
+
+            f.write("Monthly PnL:\n")
+            for mo, pnl in agg["monthly"].items():
+                bar = "█" * int(abs(pnl) / 100) if abs(pnl) > 0 else ""
+                sign = "+" if pnl >= 0 else ""
+                f.write(f"  {mo}: ${sign}{pnl:,.2f}  {bar}\n")
+            f.write("\n")
+
+            f.write(f"WHITELIST (PF>=1.5, WR>=42%, >=10 trades): {len(res['whitelist'])} coins\n")
+            f.write("  " + ", ".join(res["whitelist"]) + "\n\n")
+
+            f.write(f"TOP 30 COINS by Profit Factor:\n")
+            f.write(f"  {'Symbol':<22} {'PF':>7}  {'WR':>6}  {'Trades':>7}  {'Net PnL':>10}\n")
+            f.write(f"  {'-'*57}\n")
+            for sym, cs in res["coin_table"][:30]:
+                pf_str = f"{cs['profit_factor']:.3f}" if cs["profit_factor"] != float("inf") else "  inf"
+                f.write(f"  {sym:<22} {pf_str:>7}  {cs['win_rate']:>5.1f}%  {cs['total_trades']:>7}  "
+                        f"${cs['net_pnl']:>9.2f}\n")
+            f.write("\n")
+
+            f.write(f"BOTTOM 20 COINS by Profit Factor:\n")
+            f.write(f"  {'Symbol':<22} {'PF':>7}  {'WR':>6}  {'Trades':>7}  {'Net PnL':>10}\n")
+            f.write(f"  {'-'*57}\n")
+            for sym, cs in res["coin_table"][-20:]:
+                pf_str = f"{cs['profit_factor']:.3f}" if cs["profit_factor"] != float("inf") else "  inf"
+                f.write(f"  {sym:<22} {pf_str:>7}  {cs['win_rate']:>5.1f}%  {cs['total_trades']:>7}  "
+                        f"${cs['net_pnl']:>9.2f}\n")
+            f.write("\n")
+
         f.write("=" * 65 + "\n")
-
-        f.write("\nQUICK VERDICT TABLE\n")
-        f.write(f"{'─'*65}\n")
-        f.write(f"{'Test':<12} {'Variant':<8} {'Trades':>7} {'WR':>6} {'PF':>7} {'DD':>7} {'Result'}\n")
-        f.write(f"{'─'*65}\n")
-        test_meta = {
-            "TEST_WF":   ("Walk-Forward OOS", "PF>=1.2"),
-            "TEST_SLIP": ("Slip Stress",       "PF>=1.2"),
-            "TEST_BEAR": ("Bear Regime",        "PF>=1.0"),
-        }
-        for tname, tres in report.items():
-            label = test_meta[tname][0]
-            for vname, vres in tres.items():
-                agg = vres["aggregate"]
-                f.write(f"{label:<12} {vname:<8} {agg['total_trades']:>7} "
-                        f"{agg['win_rate']:>5.1f}% {agg['profit_factor']:>7.4f} "
-                        f"{agg['max_drawdown']:>6.1f}%  {vres['verdict']}\n")
-        f.write(f"{'─'*65}\n")
-
-        write_summary(f, "TEST 1 — WALK-FORWARD OOS (Jan–Jun 2026)",
-                      "Coins fixed from v11.0 whitelist. Tests if edge holds on unseen 6-month window.",
-                      "Jan 2026 – Jun 2026", SLIP_NORMAL, 1.2, report.get("TEST_WF", {}))
-
-        write_summary(f, "TEST 3 — SLIPPAGE STRESS (Jul 2024–Jun 2026)",
-                      "Full 2-year period but slip doubled to 0.05%. Tests fill-quality sensitivity.",
-                      "Jul 2024 – Jun 2026", SLIP_STRESS, 1.2, report.get("TEST_SLIP", {}))
-
-        write_summary(f, "TEST 5 — BEAR REGIME (Jul 2024–Mar 2025)",
-                      "9-month flat/bear window before the bull run. Tests regime dependence.",
-                      "Jul 2024 – Mar 2025", SLIP_NORMAL, 1.0, report.get("TEST_BEAR", {}))
-
+        f.write("QUICK COMPARISON\n")
         f.write("=" * 65 + "\n")
-        f.write(f"Completed in {elapsed:.0f}s\n")
+        for line in summary_lines:
+            f.write(line + "\n")
+        f.write(f"\nCompleted in {elapsed:.0f}s\n")
 
-    # ── Write backtest_report.json ─────────────────────────────────────────────
+    # ── backtest_report.json ──────────────────────────────────────────────────
     json_out = {
         "meta": {
-            "version":           "v12.0",
-            "purpose":           "pre_live_validation",
-            "base_strategy":     "v11.0_EMA50slope_EMA921cross_ADX22_15m",
+            "strategy":          "EMA50slope+EMA9/21cross+ADX_per_variant",
+            "mode":              "roi_based_tpsl_compounding_no_cap",
+            "leverage":          LEVERAGE,
+            "timeframe":         INTERVAL,
+            "period":            "2024-07 to 2026-06",
+            "symbols_fetched":   len(SYMBOLS),
+            "symbols_with_data": len(all_results),
+            "starting_capital":  STARTING_CAPITAL,
             "risk_pct":          RISK_PER_TRADE * 100,
             "fee_pct":           FEE_RATE * 100,
-            "starting_capital":  STARTING_CAPITAL,
+            "slip_pct":          SLIP_RATE * 100,
+            "slope_thresh":      SLOPE_THRESH,
             "run_seconds":       round(elapsed, 1),
         },
-        "tests": {},
+        "variants": {},
     }
 
-    test_configs = {
-        "TEST_WF":   {"period": "2026-01 to 2026-06", "slip_pct": SLIP_NORMAL*100, "pass_pf": 1.2, "label": "Walk-Forward OOS"},
-        "TEST_SLIP": {"period": "2024-07 to 2026-06", "slip_pct": SLIP_STRESS*100, "pass_pf": 1.2, "label": "Slippage Stress"},
-        "TEST_BEAR": {"period": "2024-07 to 2025-03", "slip_pct": SLIP_NORMAL*100, "pass_pf": 1.0, "label": "Bear Regime"},
-    }
-
-    for tname, tres in report.items():
-        json_out["tests"][tname] = {
-            "config":   test_configs[tname],
-            "variants": {},
+    for vname, res in report.items():
+        json_out["variants"][vname] = {
+            "config": {
+                "adx_min": res["adx_min"],
+                "tp_pct":  res["tp_pct"],
+                "sl_pct":  res["sl_pct"],
+            },
+            "universe_size": res["universe_size"],
+            "aggregate":     res["aggregate"],
+            "final_equity":  res["final_equity"],
+            "whitelist":     res["whitelist"],
+            "per_coin": [
+                {
+                    "symbol":        sym,
+                    "trades":        cs["total_trades"],
+                    "wins":          cs["wins"],
+                    "losses":        cs["losses"],
+                    "win_rate":      cs["win_rate"],
+                    "profit_factor": cs["profit_factor"] if cs["profit_factor"] != float("inf") else 9999,
+                    "net_pnl":       cs["net_pnl"],
+                    "long_trades":   cs["long_trades"],
+                    "long_wr":       cs["long_wr"],
+                    "short_trades":  cs["short_trades"],
+                    "short_wr":      cs["short_wr"],
+                    "avg_bars":      cs["avg_bars"],
+                    "usable":        cs["usable"],
+                }
+                for sym, cs in res["coin_table"]
+            ],
         }
-        for vname, vres in tres.items():
-            agg = vres["aggregate"]
-            json_out["tests"][tname]["variants"][vname] = {
-                "verdict":      vres["verdict"],
-                "aggregate":    agg,
-                "final_equity": vres["final_equity"],
-                "filter_stats": vres["filter_stats"],
-            }
 
     with open("backtest_report.json", "w") as f:
         json.dump(json_out, f, indent=2)
 
-    # ── Final console output ───────────────────────────────────────────────────
     print(f"\n{'='*65}")
-    print("  FINAL VERDICT SUMMARY")
+    print("  FINAL RESULTS")
     print(f"{'='*65}")
-    for tname, tres in report.items():
-        label = test_meta[tname][0]
-        threshold = test_meta[tname][1]
-        passes = sum(1 for v in tres.values() if v["verdict"] == "PASS")
-        total  = len(tres)
-        print(f"  {label} ({threshold}): {passes}/{total} variants PASS")
-        for vname, vres in tres.items():
-            agg = vres["aggregate"]
-            print(f"    {vname}: PF={agg['profit_factor']} WR={agg['win_rate']}% DD={agg['max_drawdown']}%  → {vres['verdict']}")
-
+    for line in summary_lines:
+        print(f"  {line}")
     print(f"\n  Files: backtest_summary.txt + backtest_report.json")
     print(f"  Time : {elapsed:.0f}s")
 
