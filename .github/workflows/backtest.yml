@@ -1,15 +1,14 @@
-name: Backtest – Whitelist 195 Coins
+name: Backtest
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
-  backtest:
+  run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 120
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -17,13 +16,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run backtest
+      - name: Run backtest.py
         run: python backtest.py
 
-      - name: Upload results
+      - name: Upload backtest_summary.txt
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
-          path: |
-            backtest_summary.txt
-            backtest_report.json
+          name: backtest_summary
+          path: backtest_summary.txt
+
+      - name: Upload backtest_report.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest_report
+          path: backtest_report.json
