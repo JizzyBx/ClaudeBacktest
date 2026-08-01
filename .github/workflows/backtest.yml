@@ -1,4 +1,4 @@
-name: Backtest G/H/New
+name: Backtest G/H/New Screening
 
 on:
   workflow_dispatch:
