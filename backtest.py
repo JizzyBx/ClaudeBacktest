@@ -1,37 +1,32 @@
 """
-Backtest — ROI-Based TP/SL @ 10x Leverage, Compounding, NO Cap (v8.8)
+Backtest — Wider ROI TP @ 10x Leverage, Compounding, NO Cap (v8.9)
 Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL, defined in ROI terms (post-leverage)
 
-WHAT CHANGED FROM v8.7:
-TP/SL were being applied as raw PRICE moves (e.g. G = price moves 3%/15%).
-On the live exchange at 10x isolated leverage, "3% / 15%" means ROI on
-margin, not price move on the coin — and ROI = price_move% * leverage
-(roughly, ignoring fees). So a 3% ROI target at 10x leverage is really only
-a 0.3% PRICE move, and a 15% ROI stop is a 1.5% PRICE move. This version
-converts every variant's TP/SL from ROI% to PRICE% by dividing by LEVERAGE,
-then runs the exact same detection/exit engine on those (much tighter)
-price thresholds:
+WHAT CHANGED FROM v8.8:
+v8.8 used the original TP numbers (3%/4%/4% ROI) reinterpreted at 10x
+leverage and it wiped every variant's equity to $0 — the TP was so small in
+price terms (0.3-0.4%) that round-trip fees (~0.14% price) ate nearly half
+of it, so even at ~75-80% win rate the strategy lost money overall. This
+version widens TP (SL unchanged per variant) to give real room over the fee
+drag:
 
-  G    — ADX>=22, TP 3% ROI (0.3% price) / SL 15% ROI (1.5% price)
-  H    — ADX>=22, TP 4% ROI (0.4% price) / SL 15% ROI (1.5% price)
-  New  — ADX>=22, TP 4% ROI (0.4% price) / SL 12% ROI (1.2% price)
+  G    — ADX>=22, TP 5% ROI (0.5% price) / SL 15% ROI (1.5% price)
+  H    — ADX>=22, TP 6% ROI (0.6% price) / SL 15% ROI (1.5% price)
+  New  — ADX>=22, TP 6% ROI (0.6% price) / SL 12% ROI (1.2% price)
 
-HEADS UP before trusting the results: round-trip trading cost (fees +
-slippage) is ~0.14% in price terms. At 10x that's 1.4% of ROI eaten by
-costs on every single trade, win or lose. G's TP is now only 0.3% price —
-cost alone is nearly half the target, so a winning trade nets very little
-(0.3% - 0.14% = 0.16% price ~ 1.6% ROI) while a losing trade still costs
-close to the full SL (1.5% - 0.14% ~ 1.36% price ~ 13.6% ROI). That's
-roughly an 8.5:1 loss-to-win ratio, which needs a very high win rate just
-to break even. Worth watching closely in the results.
+Rough math before running: net of the ~0.14% round-trip cost, G's
+loss-to-win ratio drops from ~8.5:1 (v8.8) to ~3.8:1, needing ~79% win rate
+to break even — plausible given v8.8 showed G running ~80% WR, but not
+guaranteed, since win rate itself can shift when the TP distance changes
+(a farther TP is generally harder to hit before SL). Watch WR alongside PF
+in the results, not just PF alone.
 
-Sizing stays compounding (0.75% of current equity per trade) and there's
-still NO concurrency cap — every signal fires. Coin universe is unchanged
-from v8.6/v8.7 (G=144, H=134, New=133) — that whitelist was built from
-trades at the OLD wider price TP/SL, so it may not reflect which coins
-actually perform well at these much tighter thresholds. Worth re-screening
-once you see these numbers.
+Sizing stays compounding (0.75% of current equity per trade), still NO
+concurrency cap. Coin universe unchanged from v8.6/v8.7/v8.8 (G=144,
+H=134, New=133) — same caveat as before: this whitelist was built from the
+ORIGINAL wide price TP/SL, not these ROI-derived thresholds, so it may not
+reflect which coins actually perform best here.
 """
 
 import csv, io, json, time, heapq, urllib.request, zipfile
@@ -43,11 +38,11 @@ from collections import defaultdict
 LEVERAGE = 10   # ROI% / LEVERAGE = price% — this is what actually drives TP/SL below
 
 # tp_pct/sl_pct below are PRICE percentages, derived from the ROI targets
-# you actually trade with (3%/15%, 4%/15%, 4%/12% ROI at 10x leverage).
+# you actually trade with (5%/15%, 6%/15%, 6%/12% ROI at 10x leverage).
 VARIANTS = {
-    "G":   {"tp_pct": 3.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.3% / 1.5% price
-    "H":   {"tp_pct": 4.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.4% / 1.5% price
-    "New": {"tp_pct": 4.0 / LEVERAGE, "sl_pct": 12.0 / LEVERAGE, "adx_min": 22},   # 0.4% / 1.2% price
+    "G":   {"tp_pct": 5.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.5% / 1.5% price
+    "H":   {"tp_pct": 6.0 / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},   # 0.6% / 1.5% price
+    "New": {"tp_pct": 6.0 / LEVERAGE, "sl_pct": 12.0 / LEVERAGE, "adx_min": 22},   # 0.6% / 1.2% price
 }
 
 STARTING_CAPITAL = 10_000.0
@@ -448,7 +443,7 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print(f"  ROI-BASED TP/SL @ {LEVERAGE}x LEVERAGE — Variants G / H / New (no cap)")
+    print(f"  WIDER ROI TP @ {LEVERAGE}x LEVERAGE — Variants G / H / New (no cap)")
     print(f"  Per-variant filtered universe | Jul 2024-Jun 2026 | 15m")
     print(f"  Risk: {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding)")
     print("=" * 65)
@@ -559,7 +554,7 @@ def main():
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write(f"ROI-BASED TP/SL @ {LEVERAGE}x LEVERAGE BACKTEST SUMMARY (no cap)\n")
+        f.write(f"WIDER ROI TP @ {LEVERAGE}x LEVERAGE BACKTEST SUMMARY (no cap)\n")
         f.write("=" * 65 + "\n")
         f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 – Jun 2026\n")
@@ -693,3 +688,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
