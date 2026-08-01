@@ -1,4 +1,4 @@
-name: Backtest G/H/New Screening
+name: Backtest – Whitelist 195 Coins
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -27,4 +27,3 @@ jobs:
           path: |
             backtest_summary.txt
             backtest_report.json
-          retention-days: 30
