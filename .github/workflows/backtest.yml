@@ -1,17 +1,13 @@
-name: InfinityX ADX Variant Backtest
+name: InfinityX V8/V9 Backtest
 
 on:
   workflow_dispatch:
 
 jobs:
   backtest:
-    name: "Backtest Job ${{ matrix.job_id }}"
+    name: "V8/V9 Backtest | ADX22 | 10x Leverage"
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        job_id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Checkout
@@ -22,145 +18,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run backtest (Job ${{ matrix.job_id }} / 20)
-        run: |
-          python backtest.py --job_id ${{ matrix.job_id }} --total_jobs 20
+      - name: Run V8/V9 Backtest
+        run: python backtest_v8v9.py
 
-      - name: Upload artifacts
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: results-job-${{ matrix.job_id }}
+          name: V8V9_RESULTS
           path: |
-            job${{ matrix.job_id < 10 && format('0{0}', matrix.job_id) || matrix.job_id }}_summary.txt
-            job${{ matrix.job_id < 10 && format('0{0}', matrix.job_id) || matrix.job_id }}_report.json
-          if-no-files-found: warn
-
-  merge_results:
-    name: "Merge All Results"
-    runs-on: ubuntu-latest
-    needs: backtest
-    if: always()
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all job artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: results-job-*
-          merge-multiple: true
-          path: all_results/
-
-      - name: Merge and rank results
-        run: |
-          python - << 'EOF'
-          import json, os, glob
-
-          all_variants = []
-          meta = None
-
-          for fpath in sorted(glob.glob("all_results/*_report.json")):
-              with open(fpath) as f:
-                  data = json.load(f)
-              if meta is None:
-                  meta = data['meta']
-              all_variants.extend(data.get('variants', []))
-
-          all_variants.sort(key=lambda r: r.get('profit_factor', 0), reverse=True)
-          passing = [r for r in all_variants if r.get('meets_targets')]
-
-          lines = []
-          lines.append("=" * 80)
-          lines.append("INFINITYX ADX VARIANT BACKTEST — FULL RESULTS")
-          lines.append("=" * 80)
-          if meta:
-              lines.append(f"Period: {meta.get('period')} | Capital: ${meta.get('capital'):,.0f} | "
-                           f"Risk: {meta.get('risk_pct',0)*100}% | Fee: {meta.get('fee_rate',0)*100}%/side")
-              lines.append(f"ADX variants tested: {meta.get('adx_variants')}")
-              lines.append(f"TP/SL variants tested: {meta.get('tpsl_variants')}")
-          lines.append(f"\nTotal variants: {len(all_variants)} | Passing (PF>=1.5 & WR>=42%): {len(passing)}")
-          lines.append("")
-
-          lines.append(f"{'VARIANT':<35} {'PF':>6} {'WR%':>6} {'Trades':>7} {'Net$':>10} {'MaxDD$':>8} {'Status'}")
-          lines.append("-" * 85)
-          for r in all_variants:
-              tag = "PASS" if r.get('meets_targets') else "fail"
-              lines.append(
-                  f"{r.get('variant_id','?'):<35} "
-                  f"{r.get('profit_factor',0):>6.3f} "
-                  f"{r.get('win_rate',0):>6.1f} "
-                  f"{r.get('total_trades',0):>7d} "
-                  f"{r.get('net_pnl',0):>+10.2f} "
-                  f"{r.get('max_drawdown',0):>8.2f} "
-                  f"{tag}"
-              )
-
-          lines.append("")
-          lines.append("=" * 80)
-          lines.append("PASSING VARIANTS DETAIL")
-          lines.append("=" * 80)
-          if not passing:
-              lines.append("No variants met PF>=1.5 and WR>=42% simultaneously.")
-          else:
-              for r in passing:
-                  lines.append(f"\nPASS | {r['variant_id']}")
-                  lines.append(f"   TP x{r['tp_mult']} SL x{r['sl_mult']} | "
-                               f"PF={r['profit_factor']} | WR={r['win_rate']}% | "
-                               f"Trades={r['total_trades']} | Net=${r['net_pnl']:+.2f} | "
-                               f"MaxDD=${r['max_drawdown']:.2f}")
-                  if r.get('per_coin'):
-                      lines.append("   Best coins:")
-                      for pc in r['per_coin'][:5]:
-                          lines.append(f"     {pc['symbol']:20s} PF={pc['profit_factor']:.3f} "
-                                       f"WR={pc['win_rate']}% Trades={pc['trades']}")
-
-          lines.append("")
-          lines.append("=" * 80)
-          lines.append("ADX THRESHOLD COMPARISON")
-          lines.append("=" * 80)
-          from collections import defaultdict
-          adx_groups = defaultdict(list)
-          for r in all_variants:
-              adx_groups[r.get('adx_min')].append(r.get('profit_factor', 0))
-          for adx_val in sorted(adx_groups):
-              vals = adx_groups[adx_val]
-              avg_pf = sum(vals)/len(vals)
-              best_pf = max(vals)
-              n_pass = sum(1 for r in all_variants
-                           if r.get('adx_min')==adx_val and r.get('meets_targets'))
-              lines.append(f"  ADX>={adx_val:2d}  avg PF={avg_pf:.3f}  best PF={best_pf:.3f}  passing={n_pass}")
-
-          lines.append("")
-          lines.append("TP/SL CONFIG COMPARISON")
-          lines.append("-" * 50)
-          tpsl_groups = defaultdict(list)
-          for r in all_variants:
-              tpsl_groups[r.get('tpsl')].append(r.get('profit_factor', 0))
-          for tpsl_name in sorted(tpsl_groups):
-              vals = tpsl_groups[tpsl_name]
-              avg_pf = sum(vals)/len(vals)
-              n_pass = sum(1 for r in all_variants
-                           if r.get('tpsl')==tpsl_name and r.get('meets_targets'))
-              lines.append(f"  {tpsl_name:<12}  avg PF={avg_pf:.3f}  passing={n_pass}")
-
-          summary_text = "\n".join(lines)
-          with open("backtest_summary.txt", "w") as f:
-              f.write(summary_text)
-          print(summary_text)
-
-          merged = {'meta': meta, 'variants': all_variants,
-                    'passing_count': len(passing), 'total_count': len(all_variants)}
-          with open("backtest_report.json", "w") as f:
-              json.dump(merged, f, indent=2)
-
-          print(f"\nDone. {len(all_variants)} variants, {len(passing)} passing.")
-          EOF
-
-      - name: Upload merged results
-        uses: actions/upload-artifact@v4
-        with:
-          name: FINAL_RESULTS
-          path: |
-            backtest_summary.txt
-            backtest_report.json
+            v8v9_summary.txt
+            v8v9_report.json
