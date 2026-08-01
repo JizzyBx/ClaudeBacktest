@@ -1,49 +1,28 @@
 """
-Backtest — Compounding % Risk Sizing + Portfolio Guardrails (v9.0)
+Backtest — Compounding % Risk Sizing, back to NO cap (v10.0)
 Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL
 
-Variants (G / H / New unchanged, Tight is new this round):
+Variants (G / H / New unchanged, Tight retuned this round):
   G     — ADX>=22, TP 3%  / SL 15%
   H     — ADX>=22, TP 4%  / SL 15%
   New   — ADX>=22, TP 4%  / SL 12%
-  Tight — ADX>=22, TP 4%  / SL 10%   <-- NEW this round
+  Tight — ADX>=22, TP 5%  / SL 12%   <-- CHANGED this round (was TP4/SL10)
 
-WHAT CHANGED FROM v8.7 (compounding, no cap):
-v8.7 let every qualifying signal fire independently with no limit on how
-many correlated positions could stack up at once — that's what was driving
-the 29-46% drawdowns despite high win rates (alts move together, so the
-signal fires across dozens of coins on the same market move and you end up
-with one giant leveraged directional bet instead of 130 independent ones).
+WHAT CHANGED FROM v9.0 (the concurrency-cap / cooldown / loss-streak round):
+v9.0's 17-position cap, 2h post-close cooldown, and 3-loss-streak 24h bench
+are all REMOVED this round — went back to letting every qualifying signal
+fire, same as v8.7. The ONLY execution-level guardrail kept is:
 
-This version adds four portfolio-level guardrails, applied identically to
-ALL FOUR variants (G/H/New keep their original TP/SL/ADX config — only the
-execution/risk layer changed):
+  - One open trade per symbol at a time — a coin can't open a second
+    position while it already has one open. Everything else about signal
+    generation and sizing is back to v8.7 behavior.
 
-  1. MAX_CONCURRENT = 17   — hard cap on simultaneously open positions
-                              (portfolio-wide, within a variant's own sim).
-                              A signal that arrives when 17 are already open
-                              is skipped, not queued.
-  2. One trade per symbol at a time — a coin can't open a second position
-                              while it already has one open (this was NOT
-                              enforced in v8.6/v8.7).
-  3. Post-close cooldown = 2h — once a symbol's position closes (TP, SL, or
-                              timeout), that symbol can't open a new trade
-                              for 2 hours.
-  4. Loss-streak guardrail — if a symbol loses 3 trades in a row, that
-                              symbol is benched for 24h before it can trade
-                              again. The streak counter resets on either a
-                              win or a cooldown trigger.
+Tight's SL was loosened back up (10% -> 12%) and TP raised (4% -> 5%) after
+v9.0 showed tightening SL to 10% made things worse, not better (PF dropped
+to 1.11, the worst of the four variants, and drawdown went UP not down).
 
-NOTE ON THE "Tight" VARIANT'S COIN UNIVERSE: no fresh per-coin PF/WR filter
-run has been done for this variant yet (that requires downloading and
-scoring all 195 coins again, which needs network access this sandbox
-doesn't have). Tight reuses the "New" variant's already-filtered 133-coin
-whitelist as a starting point since it's the closest existing config (same
-TP, next SL step down). Re-run the PF<1.15/trades>=30 filter against Tight's
-own results once this comes back, per the standard workflow.
-
-Sizing is unchanged from v8.7: 0.75% of CURRENT equity per trade
+Sizing is unchanged throughout: 0.75% of CURRENT equity per trade
 (compounding — position size shrinks in a drawdown, grows as equity grows).
 """
 
@@ -57,17 +36,11 @@ VARIANTS = {
     "G":     {"tp_pct": 3.0, "sl_pct": 15.0, "adx_min": 22},
     "H":     {"tp_pct": 4.0, "sl_pct": 15.0, "adx_min": 22},
     "New":   {"tp_pct": 4.0, "sl_pct": 12.0, "adx_min": 22},
-    "Tight": {"tp_pct": 4.0, "sl_pct": 10.0, "adx_min": 22},
+    "Tight": {"tp_pct": 5.0, "sl_pct": 12.0, "adx_min": 22},
 }
 
 STARTING_CAPITAL = 10_000.0
 RISK_PER_TRADE    = 0.0075   # 0.75% of CURRENT equity per trade (compounding)
-
-# ── Portfolio guardrails (new this round, applies to ALL variants) ────────────
-MAX_CONCURRENT           = 17                          # hard cap, open positions
-SAME_SYMBOL_COOLDOWN_MS  = 2  * 60 * 60 * 1000          # 2h after a position closes
-LOSS_STREAK_LIMIT        = 3                            # consecutive losses
-LOSS_STREAK_COOLDOWN_MS  = 24 * 60 * 60 * 1000          # 1 day bench
 
 FEE_RATE       = 0.0005   # 0.05% per side
 SLIP_RATE      = 0.0002   # 0.02% per side
@@ -361,15 +334,15 @@ def backtest_symbol(symbol):
 
     return symbol, variant_candidates, counters
 
-# ── Phase 2: compounding sizing + portfolio guardrails ─────────────────────────
+# ── Phase 2: compounding sizing, no cap — only gate is one-trade-per-symbol ───
 def run_execution_sim(candidates, risk_pct, starting_capital):
     """
-    Every candidate signal is a *candidate* — whether it actually executes now
-    depends on four gates, checked in this order: concurrency cap, one-open-
-    trade-per-symbol, post-close cooldown, loss-streak bench. Trades are
-    processed in entry_ts order so equity/positions/cooldowns all reflect
-    state as of that exact moment (no lookahead). A min-heap tracks open
-    positions by exit_ts so state gets settled chronologically.
+    Every candidate signal executes UNLESS its symbol already has an open
+    position — that's the only gate. No concurrency cap, no cooldown, no
+    loss-streak bench (v9.0 had all three; removed this round). Trades are
+    processed in entry_ts order so equity and each symbol's open/closed
+    state reflect the moment of that exact signal (no lookahead). A min-heap
+    tracks open positions by exit_ts so state settles chronologically.
     """
     candidates_sorted = sorted(candidates, key=lambda t: (t["entry_ts"], t["symbol"]))
 
@@ -378,48 +351,24 @@ def run_execution_sim(candidates, risk_pct, starting_capital):
     executed = []
     equity_curve = []
 
-    open_count = 0
     in_position = set()
-    cooldown_until = defaultdict(int)
-    penalty_until = defaultdict(int)
-    consec_losses = defaultdict(int)
-
-    rej = {"concurrency_cap": 0, "same_symbol_open": 0, "cooldown": 0,
-           "loss_streak_penalty": 0, "executed": 0}
+    rej = {"same_symbol_open": 0, "executed": 0}
 
     def settle_up_to(ts):
-        nonlocal equity, open_count
+        nonlocal equity
         while heap and heap[0][0] <= ts:
             exit_ts, sym, pnl, win = heapq.heappop(heap)
             equity += pnl
-            open_count -= 1
             in_position.discard(sym)
-            cooldown_until[sym] = exit_ts + SAME_SYMBOL_COOLDOWN_MS
-            if win:
-                consec_losses[sym] = 0
-            else:
-                consec_losses[sym] += 1
-                if consec_losses[sym] >= LOSS_STREAK_LIMIT:
-                    penalty_until[sym] = exit_ts + LOSS_STREAK_COOLDOWN_MS
-                    consec_losses[sym] = 0
             equity_curve.append((exit_ts, equity))
 
     for c in candidates_sorted:
         settle_up_to(c["entry_ts"])
 
-        sym, ts = c["symbol"], c["entry_ts"]
+        sym = c["symbol"]
 
-        if open_count >= MAX_CONCURRENT:
-            rej["concurrency_cap"] += 1
-            continue
         if sym in in_position:
             rej["same_symbol_open"] += 1
-            continue
-        if ts < cooldown_until[sym]:
-            rej["cooldown"] += 1
-            continue
-        if ts < penalty_until[sym]:
-            rej["loss_streak_penalty"] += 1
             continue
 
         risk_dollar = equity * risk_pct
@@ -433,7 +382,6 @@ def run_execution_sim(candidates, risk_pct, starting_capital):
         rej["executed"] += 1
 
         in_position.add(sym)
-        open_count += 1
         heapq.heappush(heap, (c["exit_ts"], sym, pnl, win))
 
     while heap:
@@ -557,10 +505,9 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print("  COMPOUNDING SIZING + PORTFOLIO GUARDRAILS — v9.0")
+    print("  COMPOUNDING SIZING, NO CAP — v10.0")
     print("  Variants: G / H / New / Tight")
-    print(f"  Max concurrent: {MAX_CONCURRENT} | Same-symbol cooldown: 2h | "
-          f"Loss-streak bench: 3L -> 24h")
+    print("  Only gate: one open trade per symbol at a time")
     print("=" * 65)
 
     print(f"\n[Phase 1] Downloading & scanning ({WORKERS} workers)…")
@@ -597,7 +544,7 @@ def main():
         return
 
     print(f"\n  \u2705 {len(all_results)} symbols loaded | {failed} skipped")
-    print(f"\n[Phase 2] Execution simulation (concurrency cap + cooldowns)…")
+    print(f"\n[Phase 2] Execution simulation (no cap, one trade/symbol)…")
 
     report = {}
     summary_lines = []
@@ -678,13 +625,13 @@ def main():
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write("COMPOUNDING SIZING + PORTFOLIO GUARDRAILS — v9.0\n")
+        f.write("COMPOUNDING SIZING, NO CAP — v10.0\n")
         f.write("=" * 65 + "\n")
         f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 - Jun 2026\n")
         f.write(f"Universe : per-variant filtered whitelist (Tight reuses New's, pending its own filter run)\n")
-        f.write(f"Guardrails: max {MAX_CONCURRENT} concurrent | one open trade/symbol | "
-                f"2h post-close cooldown | 3-loss-streak -> 24h bench\n")
+        f.write(f"Mode     : NO position cap, no cooldown, no loss-streak bench — only gate is "
+                f"one open trade per symbol at a time\n")
         f.write(f"Sizing   : {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding)\n")
         f.write(f"Starting capital: ${STARTING_CAPITAL:,.0f}\n")
         f.write(f"Fees     : {FEE_RATE*100}% + {SLIP_RATE*100}% slip per side\n")
@@ -719,11 +666,8 @@ def main():
             f.write(f"  Not in this variant's universe : {fs['not_in_universe']}\n")
             f.write(f"  Rejected by ADX filter          : {fs['adx_rejected']}\n")
             f.write(f"  Candidate signals (passed ADX)  : {fs['candidates']}\n")
-            f.write(f"    -> skipped, concurrency cap ({MAX_CONCURRENT}) : {fs['concurrency_cap']}\n")
-            f.write(f"    -> skipped, symbol already open      : {fs['same_symbol_open']}\n")
-            f.write(f"    -> skipped, in 2h post-close cooldown: {fs['cooldown']}\n")
-            f.write(f"    -> skipped, 3-loss-streak bench       : {fs['loss_streak_penalty']}\n")
-            f.write(f"    -> EXECUTED                            : {fs['executed']}\n\n")
+            f.write(f"    -> skipped, symbol already open : {fs['same_symbol_open']}\n")
+            f.write(f"    -> EXECUTED                      : {fs['executed']}\n\n")
 
             f.write("Monthly PnL:\n")
             for mo, pnl in agg["monthly"].items():
@@ -774,10 +718,8 @@ def main():
             "fee_pct":             FEE_RATE * 100,
             "slip_pct":            SLIP_RATE * 100,
             "slope_thresh":        SLOPE_THRESH,
-            "max_concurrent":      MAX_CONCURRENT,
-            "same_symbol_cooldown_hours": SAME_SYMBOL_COOLDOWN_MS / 3_600_000,
-            "loss_streak_limit":   LOSS_STREAK_LIMIT,
-            "loss_streak_cooldown_hours": LOSS_STREAK_COOLDOWN_MS / 3_600_000,
+            "max_concurrent":      None,
+            "same_symbol_lock":    True,
             "run_seconds":         round(elapsed, 1),
         },
         "variants": {},
