@@ -1,4 +1,4 @@
-name: Backtest v8 — Fixed % TP/SL
+name: Backtest G/H/New
 
 on:
   workflow_dispatch:
@@ -12,19 +12,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Run Backtest
+      - name: Run backtest
         run: python backtest.py
 
-      - name: Upload Results
-        if: always()
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results-v8
+          name: backtest-results
           path: |
             backtest_summary.txt
             backtest_report.json
