@@ -1,35 +1,30 @@
 """
-Backtest — G Wider SL + New 1:1 R:R Variant @ 10x Leverage (v8.10)
+Backtest — G Sweet-Spot Search + OneToOne Variants @ 10x Leverage (v8.11)
 Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL, defined in ROI terms (post-leverage)
 
-WHAT CHANGED FROM v8.9:
-1) G's SL widened from 15% ROI (1.5% price) to 40% ROI (4% price). TP stays
-   5% ROI (0.5% price). The dollar risk per trade does NOT change from
-   this — sizing is risk-based (0.75% of equity IS the loss if SL is hit,
-   no matter how wide SL is in price terms), so widening SL doesn't mean
-   losing more money per stopped-out trade. What it should do is give the
-   trade more room to breathe before 15m candle noise knocks it out on a
-   move that isn't really a trend reversal — which was the suspected cause
-   of v8.9's WR shortfall. If this works, WR should climb back toward what
-   the wide-price version showed (72-80%+).
-2) New 4th variant "OneToOne" — TP 10% ROI / SL 10% ROI (1% price / 1%
-   price) at 10x leverage. A genuine 1:1 risk:reward test: if this
-   strategy's win rate is naturally high (as every run so far has shown,
-   65-87%), a symmetric payoff should be the easiest one to turn PF > 1 on,
-   since it doesn't need a favorable win/loss ratio to work — just needs
-   WR above 50% net of fees.
+WHAT CHANGED FROM v8.10:
+v8.10's G (TP 5% ROI / SL 40% ROI) got WR up to 88.9% but needed ~91.5% to
+break even — only 2.6 points short, the closest any config has come. This
+run narrows SL from 40% down toward that gap to see if WR holds up enough
+to close it (narrower SL lowers the breakeven bar, but may also let some
+noise back in and pull WR back down — that's exactly what these two points
+are testing):
 
-  G         — ADX>=22, TP 5% ROI (0.5% price)  / SL 40% ROI (4.0% price)
-  H         — ADX>=22, TP 6% ROI (0.6% price)  / SL 15% ROI (1.5% price)  [unchanged from v8.9]
-  New       — ADX>=22, TP 6% ROI (0.6% price)  / SL 12% ROI (1.2% price)  [unchanged from v8.9]
-  OneToOne  — ADX>=22, TP 10% ROI (1.0% price) / SL 10% ROI (1.0% price)  [new]
+  G_SL30    — ADX>=22, TP 5% ROI (0.5% price) / SL 30% ROI (3.0% price)
+  G_SL25    — ADX>=22, TP 5% ROI (0.5% price) / SL 25% ROI (2.5% price)
 
-Coin universe: G/H/New keep their existing per-variant filtered whitelists
-(same staleness caveat as before — built from the original wide-price
-run, not these ROI-derived thresholds). OneToOne has no prior data to
-filter on, so it runs on the FULL 195-coin universe (unfiltered) —
-something to re-screen once you see results.
+Also two updates to the OneToOne family (previous OneToOne was TP10%/SL10%,
+which only hit 49.2% WR — a coin-flip, no real edge at that tight a
+distance):
+
+  OneToOne  — ADX>=22, TP 6% ROI (0.6% price)  / SL 10% ROI (1.0% price)  [TP raised, SL unchanged]
+  TP5SL10   — ADX>=22, TP 5% ROI (0.5% price)  / SL 10% ROI (1.0% price)  [new]
+
+Coin universe: G_SL30/G_SL25 use G's existing filtered whitelist (144
+coins, same staleness caveat as always). OneToOne and TP5SL10 have no
+prior data at these exact thresholds, so both run on the full unfiltered
+195-coin universe.
 
 Sizing stays compounding (0.75% of current equity per trade), still NO
 concurrency cap.
@@ -46,10 +41,10 @@ LEVERAGE = 10   # ROI% / LEVERAGE = price% — this is what actually drives TP/S
 # tp_pct/sl_pct below are PRICE percentages, derived from the ROI targets
 # you actually trade with, at 10x leverage.
 VARIANTS = {
-    "G":        {"tp_pct": 5.0  / LEVERAGE, "sl_pct": 40.0 / LEVERAGE, "adx_min": 22},  # 0.5% / 4.0% price
-    "H":        {"tp_pct": 6.0  / LEVERAGE, "sl_pct": 15.0 / LEVERAGE, "adx_min": 22},  # 0.6% / 1.5% price
-    "New":      {"tp_pct": 6.0  / LEVERAGE, "sl_pct": 12.0 / LEVERAGE, "adx_min": 22},  # 0.6% / 1.2% price
-    "OneToOne": {"tp_pct": 10.0 / LEVERAGE, "sl_pct": 10.0 / LEVERAGE, "adx_min": 22},  # 1.0% / 1.0% price
+    "G_SL30":  {"tp_pct": 5.0 / LEVERAGE, "sl_pct": 30.0 / LEVERAGE, "adx_min": 22},  # 0.5% / 3.0% price
+    "G_SL25":  {"tp_pct": 5.0 / LEVERAGE, "sl_pct": 25.0 / LEVERAGE, "adx_min": 22},  # 0.5% / 2.5% price
+    "OneToOne": {"tp_pct": 6.0 / LEVERAGE, "sl_pct": 10.0 / LEVERAGE, "adx_min": 22}, # 0.6% / 1.0% price
+    "TP5SL10": {"tp_pct": 5.0 / LEVERAGE, "sl_pct": 10.0 / LEVERAGE, "adx_min": 22},  # 0.5% / 1.0% price
 }
 
 STARTING_CAPITAL = 10_000.0
@@ -74,7 +69,9 @@ BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 # Per-variant whitelist (unchanged from v8.6): drop a symbol from a variant
 # only if it was PF<1.15 AND trades>=30 for that variant in the prior
 # 195-coin no-cap run.
-VARIANT_SYMBOLS = {
+# Raw per-variant coin lists carried over from prior runs (used to build
+# the new variant universes below).
+_LEGACY_COIN_LISTS = {
     "G": [
         "0GUSDT", "1000000BOBUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT",
         "1000SATSUSDT", "A2ZUSDT", "ACHUSDT", "AI16ZUSDT", "AINUSDT", "AIOTUSDT",
@@ -149,9 +146,19 @@ VARIANT_SYMBOLS = {
     ],
 }
 
-# OneToOne has no prior-run data to filter on, so it trades the full
-# unfiltered universe (union of everything the other variants use).
-VARIANT_SYMBOLS["OneToOne"] = sorted(set().union(*VARIANT_SYMBOLS.values()))
+_G_COINS = _LEGACY_COIN_LISTS["G"]        # G's filtered whitelist (144 coins)
+_ALL_COINS = sorted(set().union(*_LEGACY_COIN_LISTS.values()))  # full 195-coin universe
+
+# G_SL30 / G_SL25 reuse G's existing filtered whitelist (built at G's TP,
+# different SL widths — no reason to re-filter for an SL-only change).
+# OneToOne and TP5SL10 have no prior data at these exact thresholds, so
+# both run on the full unfiltered universe.
+VARIANT_SYMBOLS = {
+    "G_SL30":   _G_COINS,
+    "G_SL25":   _G_COINS,
+    "OneToOne": _ALL_COINS,
+    "TP5SL10":  _ALL_COINS,
+}
 
 # Fetch data once for the union of every symbol needed by any variant.
 SYMBOLS = sorted(set().union(*VARIANT_SYMBOLS.values()))
@@ -454,7 +461,7 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print(f"  G WIDER SL + 1:1 R:R VARIANT @ {LEVERAGE}x LEVERAGE (no cap)")
+    print(f"  G SWEET-SPOT SEARCH + ONETOONE VARIANTS @ {LEVERAGE}x LEVERAGE (no cap)")
     print(f"  Per-variant filtered universe | Jul 2024-Jun 2026 | 15m")
     print(f"  Risk: {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding)")
     print("=" * 65)
@@ -565,7 +572,7 @@ def main():
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write(f"G WIDER SL + 1:1 R:R VARIANT @ {LEVERAGE}x LEVERAGE BACKTEST SUMMARY (no cap)\n")
+        f.write(f"G SWEET-SPOT SEARCH + ONETOONE VARIANTS @ {LEVERAGE}x LEVERAGE BACKTEST SUMMARY (no cap)\n")
         f.write("=" * 65 + "\n")
         f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 – Jun 2026\n")
