@@ -1,29 +1,44 @@
 """
-Backtest — Compounding % Risk Sizing, back to NO cap (v10.0)
+Backtest — Compounding % Risk Sizing, REAL capital tracking (v11.0)
 Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL
 
-Variants (G / H / New unchanged, Tight retuned this round):
+Variants (unchanged from v10.0):
   G     — ADX>=22, TP 3%  / SL 15%
   H     — ADX>=22, TP 4%  / SL 15%
   New   — ADX>=22, TP 4%  / SL 12%
-  Tight — ADX>=22, TP 5%  / SL 12%   <-- CHANGED this round (was TP4/SL10)
+  Tight — ADX>=22, TP 5%  / SL 12%
 
-WHAT CHANGED FROM v9.0 (the concurrency-cap / cooldown / loss-streak round):
-v9.0's 17-position cap, 2h post-close cooldown, and 3-loss-streak 24h bench
-are all REMOVED this round — went back to letting every qualifying signal
-fire, same as v8.7. The ONLY execution-level guardrail kept is:
+WHAT CHANGED FROM v10.0 (the "no cap" round):
+v10.0 sized every trade off `equity * risk_pct` at entry, but `equity` was
+never reduced by capital already tied up in still-open positions. With no
+concurrency cap, dozens of trades could open in the same hour and each one
+sized itself off the SAME unspent balance — none of the earlier ones had
+closed yet to actually move equity down. That's not a $10k account, it's
+unlimited leverage stacked across correlated coins. It's why v10.0's equity
+curves ($559k-$2.26M final equity) weren't trustworthy, and why drawdown
+went UP relative to the earlier capped run instead of down.
 
-  - One open trade per symbol at a time — a coin can't open a second
-    position while it already has one open. Everything else about signal
-    generation and sizing is back to v8.7 behavior.
+v11.0 fixes this WITHOUT reintroducing a hard position-count cap or a
+cooldown — both are still removed, same as v10.0 intended. Instead:
 
-Tight's SL was loosened back up (10% -> 12%) and TP raised (4% -> 5%) after
-v9.0 showed tightening SL to 10% made things worse, not better (PF dropped
-to 1.11, the worst of the four variants, and drawdown went UP not down).
+  - `reserved` tracks the sum of risk_dollar across all currently-open
+    positions (capital actually committed, not yet returned to equity
+    because those trades haven't closed).
+  - A new candidate only executes if `equity - reserved >= risk_dollar`
+    for that trade — i.e. there is real, uncommitted capital to size it
+    with. If not, it's skipped. New rejection bucket: `insufficient_capital`.
+  - One open trade per symbol at a time is still the only OTHER gate,
+    unchanged from v10.0.
 
-Sizing is unchanged throughout: 0.75% of CURRENT equity per trade
-(compounding — position size shrinks in a drawdown, grows as equity grows).
+This makes position count a natural, emergent soft cap driven by actual
+account capacity (how many 0.75%-risk bets a real $10k account can carry
+at once), instead of an arbitrary number picked by hand. Expect trade
+count and final equity to drop from v10.0, and max drawdown to come down
+too — that's the fix working as intended, not a regression.
+
+Sizing base is otherwise unchanged: 0.75% of current equity per trade,
+compounding (position size shrinks in a drawdown, grows as equity grows).
 """
 
 import csv, io, json, math, time, heapq, urllib.request, zipfile
@@ -58,7 +73,7 @@ MONTHS = [
 ]
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
-# Per-variant whitelist (G/H/New unchanged from v8.6/v8.7 filter run).
+# Per-variant whitelist (unchanged from v10.0).
 VARIANT_SYMBOLS = {
     "G": [
         "0GUSDT", "1000000BOBUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT",
@@ -133,7 +148,7 @@ VARIANT_SYMBOLS = {
         "WAXPUSDT", "XLMUSDT", "XNYUSDT", "YBUSDT", "ZECUSDT", "ZENUSDT", "ZKJUSDT",
     ],
 }
-# Tight reuses New's whitelist for now — see docstring note above.
+# Tight reuses New's whitelist for now — see docstring note in prior versions.
 VARIANT_SYMBOLS["Tight"] = list(VARIANT_SYMBOLS["New"])
 
 # Fetch data once for the union of every symbol needed by any variant.
@@ -213,10 +228,10 @@ def fetch_candles(symbol):
     candles.sort(key=lambda x: x[0])
     return candles
 
-# ── Per-symbol signal detection (unchanged mechanics from v8.7) ───────────────
+# ── Per-symbol signal detection (unchanged mechanics from v10.0) ──────────────
 # Resolves the price-path outcome (net_ret) per candidate signal only — NOT
-# its dollar size or whether it actually gets taken. Sizing AND the new
-# concurrency/cooldown/loss-streak gates are compounding + path-dependent
+# its dollar size or whether it actually gets taken. Sizing AND the
+# capital-tracking / same-symbol-lock gates are compounding + path-dependent
 # across the whole portfolio, so they're resolved afterward in Phase 2, in
 # strict time order, across all symbols in a variant at once.
 def backtest_symbol(symbol):
@@ -237,7 +252,7 @@ def backtest_symbol(symbol):
     WARMUP = 60
     variant_candidates = {v: [] for v in VARIANTS}
 
-    # Filter-rejection counters (HANDOFF 2c / 5): every bar scanned must land
+    # Filter-rejection counters (HANDOFF 2c): every bar scanned must land
     # in exactly one bucket below, so counts always reconcile.
     counters = {
         "total_bars_scanned": 0,
@@ -334,31 +349,41 @@ def backtest_symbol(symbol):
 
     return symbol, variant_candidates, counters
 
-# ── Phase 2: compounding sizing, no cap — only gate is one-trade-per-symbol ───
+# ── Phase 2: compounding sizing WITH real capital tracking (v11.0 fix) ────────
 def run_execution_sim(candidates, risk_pct, starting_capital):
     """
-    Every candidate signal executes UNLESS its symbol already has an open
-    position — that's the only gate. No concurrency cap, no cooldown, no
-    loss-streak bench (v9.0 had all three; removed this round). Trades are
-    processed in entry_ts order so equity and each symbol's open/closed
-    state reflect the moment of that exact signal (no lookahead). A min-heap
+    Every candidate signal executes UNLESS:
+      (a) its symbol already has an open position, OR
+      (b) there isn't enough real, uncommitted capital left to size it.
+
+    No hard concurrency cap and no cooldown — same as v10.0. But unlike
+    v10.0, `equity` is no longer treated as fully available at every
+    instant: `reserved` tracks capital already committed to still-open
+    trades, and a new trade can only size itself off `equity - reserved`.
+    This is what a real $10k account actually has to work with — trades
+    already open have their risk capital tied up until they close.
+
+    Trades are processed in entry_ts order so equity/reserved/open-state
+    reflect the moment of that exact signal (no lookahead). A min-heap
     tracks open positions by exit_ts so state settles chronologically.
     """
     candidates_sorted = sorted(candidates, key=lambda t: (t["entry_ts"], t["symbol"]))
 
     equity = starting_capital
-    heap = []  # (exit_ts, symbol, pnl, win)
+    reserved = 0.0  # capital committed to currently-open positions
+    heap = []  # (exit_ts, symbol, pnl, win, risk_dollar)
     executed = []
     equity_curve = []
 
     in_position = set()
-    rej = {"same_symbol_open": 0, "executed": 0}
+    rej = {"same_symbol_open": 0, "insufficient_capital": 0, "executed": 0}
 
     def settle_up_to(ts):
-        nonlocal equity
+        nonlocal equity, reserved
         while heap and heap[0][0] <= ts:
-            exit_ts, sym, pnl, win = heapq.heappop(heap)
+            exit_ts, sym, pnl, win, risk_dollar = heapq.heappop(heap)
             equity += pnl
+            reserved -= risk_dollar
             in_position.discard(sym)
             equity_curve.append((exit_ts, equity))
 
@@ -372,20 +397,27 @@ def run_execution_sim(candidates, risk_pct, starting_capital):
             continue
 
         risk_dollar = equity * risk_pct
+        available = equity - reserved
+        if risk_dollar > available:
+            rej["insufficient_capital"] += 1
+            continue
+
         pnl = risk_dollar * (c["net_ret"] / c["sl_pct"])
         win = pnl > 0
 
         trade = dict(c)
         trade["pnl"] = pnl
         trade["win"] = win
+        trade["risk_dollar"] = risk_dollar
         executed.append(trade)
         rej["executed"] += 1
 
         in_position.add(sym)
-        heapq.heappush(heap, (c["exit_ts"], sym, pnl, win))
+        reserved += risk_dollar
+        heapq.heappush(heap, (c["exit_ts"], sym, pnl, win, risk_dollar))
 
     while heap:
-        exit_ts, sym, pnl, win = heapq.heappop(heap)
+        exit_ts, sym, pnl, win, risk_dollar = heapq.heappop(heap)
         equity += pnl
         equity_curve.append((exit_ts, equity))
 
@@ -505,9 +537,9 @@ def calc_stats(trades, equity_curve=None, starting_capital=None):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print("  COMPOUNDING SIZING, NO CAP — v10.0")
+    print("  REAL CAPITAL TRACKING — v11.0")
     print("  Variants: G / H / New / Tight")
-    print("  Only gate: one open trade per symbol at a time")
+    print("  Gates: one open trade per symbol, real available-capital check")
     print("=" * 65)
 
     print(f"\n[Phase 1] Downloading & scanning ({WORKERS} workers)…")
@@ -544,7 +576,7 @@ def main():
         return
 
     print(f"\n  \u2705 {len(all_results)} symbols loaded | {failed} skipped")
-    print(f"\n[Phase 2] Execution simulation (no cap, one trade/symbol)…")
+    print(f"\n[Phase 2] Execution simulation (real capital tracking, one trade/symbol)…")
 
     report = {}
     summary_lines = []
@@ -625,13 +657,14 @@ def main():
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write("COMPOUNDING SIZING, NO CAP — v10.0\n")
+        f.write("REAL CAPITAL TRACKING — v11.0\n")
         f.write("=" * 65 + "\n")
         f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 - Jun 2026\n")
-        f.write(f"Universe : per-variant filtered whitelist (Tight reuses New's, pending its own filter run)\n")
-        f.write(f"Mode     : NO position cap, no cooldown, no loss-streak bench — only gate is "
-                f"one open trade per symbol at a time\n")
+        f.write(f"Universe : per-variant filtered whitelist (Tight reuses New's)\n")
+        f.write(f"Mode     : NO hard position cap, no cooldown — gates are (1) one open "
+                f"trade per symbol, (2) real available-capital check (equity - reserved "
+                f">= new trade's risk_dollar)\n")
         f.write(f"Sizing   : {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding)\n")
         f.write(f"Starting capital: ${STARTING_CAPITAL:,.0f}\n")
         f.write(f"Fees     : {FEE_RATE*100}% + {SLIP_RATE*100}% slip per side\n")
@@ -663,11 +696,12 @@ def main():
             f.write(f"VERDICT         : {'USABLE' if agg['usable'] else 'NOT USABLE'}\n\n")
 
             f.write("Filter rejection stats (candidates -> executed):\n")
-            f.write(f"  Not in this variant's universe : {fs['not_in_universe']}\n")
-            f.write(f"  Rejected by ADX filter          : {fs['adx_rejected']}\n")
-            f.write(f"  Candidate signals (passed ADX)  : {fs['candidates']}\n")
-            f.write(f"    -> skipped, symbol already open : {fs['same_symbol_open']}\n")
-            f.write(f"    -> EXECUTED                      : {fs['executed']}\n\n")
+            f.write(f"  Not in this variant's universe   : {fs['not_in_universe']}\n")
+            f.write(f"  Rejected by ADX filter            : {fs['adx_rejected']}\n")
+            f.write(f"  Candidate signals (passed ADX)    : {fs['candidates']}\n")
+            f.write(f"    -> skipped, symbol already open   : {fs['same_symbol_open']}\n")
+            f.write(f"    -> skipped, insufficient capital  : {fs['insufficient_capital']}\n")
+            f.write(f"    -> EXECUTED                       : {fs['executed']}\n\n")
 
             f.write("Monthly PnL:\n")
             for mo, pnl in agg["monthly"].items():
@@ -708,7 +742,7 @@ def main():
     json_out = {
         "meta": {
             "strategy":            "EMA50slope+EMA9/21cross+ADX_per_variant",
-            "mode":                "compounding_pct_sizing_with_guardrails",
+            "mode":                "compounding_pct_sizing_real_capital_tracking",
             "timeframe":           INTERVAL,
             "period":              "2024-07 to 2026-06",
             "symbols_fetched":     len(SYMBOLS),
@@ -720,6 +754,7 @@ def main():
             "slope_thresh":        SLOPE_THRESH,
             "max_concurrent":      None,
             "same_symbol_lock":    True,
+            "real_capital_track":  True,
             "run_seconds":         round(elapsed, 1),
         },
         "variants": {},
