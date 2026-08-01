@@ -1,33 +1,34 @@
 """
-Backtest — Filtered Universe, NO Cap (max trade volume)
+Backtest — Compounding % Risk Sizing, NO Cap (v8.7)
 Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL
 
-Variants (ADX18 dropped — back to the original 3):
+Variants (G / H / New only — ADX18 stays dropped):
   G    — ADX>=22, TP 3%  / SL 15%
   H    — ADX>=22, TP 4%  / SL 15%
   New  — ADX>=22, TP 4%  / SL 12%
 
-PURPOSE: No position cap — every signal on every coin (within that variant's
-own whitelist) executes independently, same as the original screening run,
-so trade volume stays high. The only change from the raw 195-coin run is a
-per-VARIANT coin filter: a coin is dropped from a variant's universe only if
-it's a proven underperformer there (PF < 1.15 AND >=30 trades — enough
-sample size to trust the number). Coins with fewer than 30 trades are kept
-regardless of PF (not enough data to judge them), and coins with PF >= 1.15
-are kept regardless of trade count. This trims genuinely weak, well-tested
-coins without cutting into trade volume the way a position cap would.
+WHAT CHANGED FROM v8.6:
+Sizing only. v8.6 risked a FIXED $75 (0.75% of a static $10k) on every
+trade regardless of how equity was doing — so during a losing streak, each
+loss ate a bigger and bigger share of what was left, which is what made the
+drawdown spiral. This version risks 0.75% of CURRENT equity instead
+(compounding): as equity shrinks during a losing streak, the dollar size of
+each new trade shrinks with it, so losses self-dampen instead of compounding
+on top of a fixed exposure. As equity grows, position size grows too.
 
-Each variant gets its OWN coin whitelist (a coin can be weak for one variant's
-TP/SL and fine for another's), so G / H / New below each run on a different
-symbol subset even though the raw data is fetched once for the union of all
-three.
+Still NO concurrency cap and NO same-symbol restriction — every signal that
+qualifies still fires, exactly like v8.6. Nothing gets skipped. The only
+mechanical difference is that trades are processed in time order so each
+trade's size reflects the equity level at its own entry time (a compounding
+equity curve), instead of every trade using the same static base amount.
 
-Each trade risks 0.75% of $10,000 fixed base (not compound) so per-coin
-PF/WR stats stay directly comparable across coins and variants.
+Coin universe: same per-variant filtered whitelist from v8.6 (drop a coin
+from a variant only if PF<1.15 AND trades>=30 in the original 195-coin
+no-cap run) — G=144, H=134, New=133 coins.
 """
 
-import csv, io, json, time, urllib.request, zipfile
+import csv, io, json, time, heapq, urllib.request, zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -39,8 +40,9 @@ VARIANTS = {
     "New": {"tp_pct": 4.0, "sl_pct": 12.0, "adx_min": 22},
 }
 
-CAPITAL        = 10_000.0
-RISK_PER_TRADE = 0.0075   # 0.75% of fixed base per trade (not compound)
+STARTING_CAPITAL = 10_000.0
+RISK_PER_TRADE    = 0.0075   # 0.75% of CURRENT equity per trade (compounding)
+
 FEE_RATE       = 0.0005   # 0.05% per side
 SLIP_RATE      = 0.0002   # 0.02% per side
 COST_PER_SIDE  = FEE_RATE + SLIP_RATE
@@ -57,9 +59,9 @@ MONTHS = [
 ]
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
-# Per-variant whitelist: a symbol is REMOVED from a variant's list only if
-# it was PF<1.15 AND trades>=30 for that specific variant in the prior
-# 195-coin no-cap run. Fetched once for the union of all three below.
+# Per-variant whitelist (unchanged from v8.6): drop a symbol from a variant
+# only if it was PF<1.15 AND trades>=30 for that variant in the prior
+# 195-coin no-cap run.
 VARIANT_SYMBOLS = {
     "G": [
         "0GUSDT", "1000000BOBUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT",
@@ -210,7 +212,10 @@ def fetch_candles(symbol):
     candles.sort(key=lambda x: x[0])
     return candles
 
-# ── Per-symbol backtest (NO position cap) ──────────────────────────────────────
+# ── Per-symbol signal detection ────────────────────────────────────────────────
+# Only resolves the price-path outcome (net_ret) per candidate signal — NOT
+# its dollar size. Sizing is compounding (depends on equity at entry time),
+# so it's computed afterward in Phase 2 across all symbols in time order.
 def backtest_symbol(symbol):
     candles = fetch_candles(symbol)
     if len(candles) < 150:
@@ -227,7 +232,7 @@ def backtest_symbol(symbol):
     e50 = ema(closes, 50)
 
     WARMUP = 60
-    variant_trades = {v: [] for v in VARIANTS}
+    variant_candidates = {v: [] for v in VARIANTS}
 
     for i in range(WARMUP, n - 1):
         slope_pct  = (e50[i] - e50[i-10]) / e50[i-10] * 100
@@ -254,7 +259,6 @@ def backtest_symbol(symbol):
         entry  = closes[i]
 
         for vname, vcfg in VARIANTS.items():
-            # skip entirely if this symbol isn't in this variant's whitelist
             if symbol not in VARIANT_SYMBOLS[vname]:
                 continue
             if adx < vcfg["adx_min"]:
@@ -287,30 +291,70 @@ def backtest_symbol(symbol):
                     if l <= tp_price:
                         outcome = "tp"; exit_price = tp_price; exit_bar = j; break
 
-            risk_dollar = CAPITAL * RISK_PER_TRADE  # $75 fixed
             if signal == "buy":
                 raw_ret = (exit_price - entry) / entry
             else:
                 raw_ret = (entry - exit_price) / entry
             net_ret = raw_ret - COST_PER_SIDE * 2
-            pnl = risk_dollar * (net_ret / sl_pct)
 
-            variant_trades[vname].append({
+            variant_candidates[vname].append({
+                "symbol":   symbol,
                 "signal":   signal,
                 "entry":    entry,
                 "exit":     exit_price,
                 "outcome":  outcome,
-                "pnl":      pnl,
-                "win":      pnl > 0,
+                "net_ret":  net_ret,
+                "sl_pct":   sl_pct,
                 "entry_ts": ts_arr[i],
                 "exit_ts":  ts_arr[exit_bar],
                 "bars":     exit_bar - i,
             })
 
-    return symbol, variant_trades
+    return symbol, variant_candidates
+
+# ── Phase 2: compounding sizing simulation (NO cap) ────────────────────────────
+def run_compounding_sim(candidates, risk_pct, starting_capital):
+    """
+    Every candidate signal is taken — nothing is skipped. Trades are
+    processed in entry_ts order so each trade's dollar size reflects
+    equity AT ITS OWN ENTRY TIME (compounding). A min-heap tracks open
+    positions by exit_ts so equity gets updated as trades close, in the
+    correct chronological order, without capping how many can be open
+    at once.
+    """
+    candidates_sorted = sorted(candidates, key=lambda t: (t["entry_ts"], t["symbol"]))
+
+    equity = starting_capital
+    heap = []  # (exit_ts, pnl) for currently open (already-sized) trades
+    executed = []
+    equity_curve = []  # (ts, equity) snapshots for drawdown calc
+
+    for c in candidates_sorted:
+        # settle every position that has already closed by this entry
+        while heap and heap[0][0] <= c["entry_ts"]:
+            exit_ts, pnl = heapq.heappop(heap)
+            equity += pnl
+            equity_curve.append((exit_ts, equity))
+
+        risk_dollar = equity * risk_pct
+        pnl = risk_dollar * (c["net_ret"] / c["sl_pct"])
+
+        trade = dict(c)
+        trade["pnl"] = pnl
+        trade["win"] = pnl > 0
+        executed.append(trade)
+        heapq.heappush(heap, (c["exit_ts"], pnl))
+
+    # settle whatever's left open at the end
+    while heap:
+        exit_ts, pnl = heapq.heappop(heap)
+        equity += pnl
+        equity_curve.append((exit_ts, equity))
+
+    return executed, equity, equity_curve
 
 # ── Aggregate stats ───────────────────────────────────────────────────────────
-def calc_stats(trades):
+def calc_stats(trades, equity_curve=None, starting_capital=None):
     if not trades:
         return None
     wins   = [t for t in trades if t["win"]]
@@ -339,14 +383,25 @@ def calc_stats(trades):
         dt = datetime.fromtimestamp(t["exit_ts"] / 1000, tz=timezone.utc)
         monthly[f"{dt.year}-{dt.month:02d}"] += t["pnl"]
 
-    running = 0.0; peak = 0.0; max_dd = 0.0
-    for t in sorted(trades, key=lambda x: x["exit_ts"]):
-        running += t["pnl"]
-        if running > peak:
-            peak = running
-        dd = (peak - running) / peak * 100 if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
+    # Equity-curve based drawdown when available (true compounding DD)
+    max_dd = 0.0
+    if equity_curve and starting_capital:
+        peak = starting_capital
+        for _, eq in sorted(equity_curve, key=lambda x: x[0]):
+            if eq > peak:
+                peak = eq
+            dd = (peak - eq) / peak * 100 if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+    else:
+        running = 0.0; peak = 0.0
+        for t in sorted(trades, key=lambda x: x["exit_ts"]):
+            running += t["pnl"]
+            if running > peak:
+                peak = running
+            dd = (peak - running) / peak * 100 if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
 
     best_w = best_l = cur = 0
     prev_win = None
@@ -383,9 +438,9 @@ def calc_stats(trades):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print("  FILTERED UNIVERSE — Variants G / H / New (ADX18 dropped, NO cap)")
-    print(f"  {len(SYMBOLS)} coins fetched | per-variant whitelist filter")
-    print("  Filter: drop coin from a variant only if PF<1.15 AND trades>=30")
+    print("  COMPOUNDING % SIZING — Variants G / H / New (no cap)")
+    print(f"  Per-variant filtered universe | Jul 2024-Jun 2026 | 15m")
+    print(f"  Risk: {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding)")
     print("=" * 65)
 
     print(f"\n[Phase 1] Downloading & scanning ({WORKERS} workers)…")
@@ -421,7 +476,7 @@ def main():
 
     print(f"\n  ✅ {len(all_results)} symbols loaded | {failed} skipped")
 
-    print("\n[Phase 2] Computing stats…")
+    print(f"\n[Phase 2] Compounding sizing simulation (no cap)…")
 
     report = {}
     summary_lines = []
@@ -429,24 +484,29 @@ def main():
     for vname, vcfg in VARIANTS.items():
         tp = vcfg["tp_pct"]; sl = vcfg["sl_pct"]; adx_min = vcfg["adx_min"]
 
-        all_trades = []
-        coin_stats = {}
-
+        all_candidates = []
         for sym, vdata in all_results.items():
             if sym not in VARIANT_SYMBOLS[vname]:
                 continue
-            trades = vdata.get(vname, [])
-            if not trades:
-                continue
-            all_trades.extend(trades)
-            cs = calc_stats(trades)
-            if cs:
-                coin_stats[sym] = cs
+            all_candidates.extend(vdata.get(vname, []))
 
-        agg = calc_stats(all_trades)
+        executed, final_equity, equity_curve = run_compounding_sim(
+            all_candidates, RISK_PER_TRADE, STARTING_CAPITAL
+        )
+
+        agg = calc_stats(executed, equity_curve, STARTING_CAPITAL)
         if not agg:
             print(f"  {vname}: no trades")
             continue
+
+        by_symbol = defaultdict(list)
+        for t in executed:
+            by_symbol[t["symbol"]].append(t)
+        coin_stats = {}
+        for sym, trades in by_symbol.items():
+            cs = calc_stats(trades)
+            if cs:
+                coin_stats[sym] = cs
 
         coin_table = sorted(
             coin_stats.items(),
@@ -464,7 +524,7 @@ def main():
         verdict = "✅ USABLE" if agg["usable"] else "❌ NOT USABLE"
         print(f"  {vname} (ADX>={adx_min}, TP {tp}% SL {sl}%): {len(VARIANT_SYMBOLS[vname])} coins | "
               f"{agg['total_trades']} trades | WR {agg['win_rate']}% | PF {agg['profit_factor']} | "
-              f"Net ${agg['net_pnl']} | DD {agg['max_drawdown']}% | {len(whitelist)} whitelisted | {verdict}")
+              f"Net ${agg['net_pnl']} | DD {agg['max_drawdown']}% | Final equity ${final_equity:,.2f} | {verdict}")
 
         report[vname] = {
             "aggregate":     agg,
@@ -474,26 +534,28 @@ def main():
             "sl_pct":        sl,
             "adx_min":       adx_min,
             "universe_size": len(VARIANT_SYMBOLS[vname]),
+            "final_equity":  round(final_equity, 2),
         }
         summary_lines.append(
             f"Variant {vname} (ADX>={adx_min}, TP {tp}% SL {sl}%): "
             f"{len(VARIANT_SYMBOLS[vname])} coins | {agg['total_trades']} trades | "
             f"WR {agg['win_rate']}% | PF {agg['profit_factor']} | Net ${agg['net_pnl']} | "
-            f"DD {agg['max_drawdown']}% | Whitelist: {len(whitelist)} coins | {verdict}"
+            f"DD {agg['max_drawdown']}% | Final equity ${final_equity:,.2f} | "
+            f"Whitelist: {len(whitelist)} coins | {verdict}"
         )
 
     elapsed = time.time() - t0
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write("FILTERED UNIVERSE BACKTEST SUMMARY (no cap, max trade volume)\n")
+        f.write("COMPOUNDING % SIZING BACKTEST SUMMARY (no cap)\n")
         f.write("=" * 65 + "\n")
         f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 – Jun 2026\n")
-        f.write(f"Universe : {len(SYMBOLS)} coins fetched, per-variant whitelist applied\n")
-        f.write(f"Filter   : drop coin from a variant only if PF<1.15 AND trades>=30 in prior run\n")
+        f.write(f"Universe : per-variant filtered whitelist (v8.6 filter, PF<1.15 & trades>=30 removed)\n")
         f.write(f"Mode     : NO position cap — every signal executes independently\n")
-        f.write(f"Risk/trade: {RISK_PER_TRADE*100}% of ${CAPITAL:,.0f} fixed = ${CAPITAL*RISK_PER_TRADE:.0f}/trade\n")
+        f.write(f"Sizing   : {RISK_PER_TRADE*100}% of CURRENT equity per trade (compounding, not fixed $)\n")
+        f.write(f"Starting capital: ${STARTING_CAPITAL:,.0f}\n")
         f.write(f"Fees     : {FEE_RATE*100}% + {SLIP_RATE*100}% slip per side\n")
         f.write(f"Run time : {elapsed:.0f}s\n")
         f.write("=" * 65 + "\n\n")
@@ -508,7 +570,8 @@ def main():
             f.write(f"Win Rate        : {agg['win_rate']}%\n")
             f.write(f"Profit Factor   : {agg['profit_factor']}\n")
             f.write(f"Net PnL         : ${agg['net_pnl']}\n")
-            f.write(f"Max Drawdown    : {agg['max_drawdown']}%\n")
+            f.write(f"Final Equity    : ${res['final_equity']:,.2f}\n")
+            f.write(f"Max Drawdown    : {agg['max_drawdown']}%  (equity-curve based)\n")
             f.write(f"Avg Win         : ${agg['avg_win']}\n")
             f.write(f"Avg Loss        : ${agg['avg_loss']}\n")
             f.write(f"Expectancy      : ${agg['expectancy']}\n")
@@ -530,12 +593,12 @@ def main():
             f.write("  " + ", ".join(res["whitelist"]) + "\n\n")
 
             f.write(f"TOP 30 COINS by Profit Factor:\n")
-            f.write(f"  {'Symbol':<22} {'PF':>7}  {'WR':>6}  {'Trades':>7}  {'Net PnL':>10}  {'DD':>6}\n")
-            f.write(f"  {'-'*64}\n")
+            f.write(f"  {'Symbol':<22} {'PF':>7}  {'WR':>6}  {'Trades':>7}  {'Net PnL':>10}\n")
+            f.write(f"  {'-'*57}\n")
             for sym, cs in res["coin_table"][:30]:
                 pf_str = f"{cs['profit_factor']:.3f}" if cs["profit_factor"] != float("inf") else "  inf"
                 f.write(f"  {sym:<22} {pf_str:>7}  {cs['win_rate']:>5.1f}%  {cs['total_trades']:>7}  "
-                        f"${cs['net_pnl']:>9.2f}  {cs['max_drawdown']:>5.1f}%\n")
+                        f"${cs['net_pnl']:>9.2f}\n")
             f.write("\n")
 
             f.write(f"BOTTOM 20 COINS by Profit Factor:\n")
@@ -558,17 +621,16 @@ def main():
     json_out = {
         "meta": {
             "strategy":          "EMA50slope+EMA9/21cross+ADX_per_variant",
-            "mode":              "filtered_universe_no_cap",
+            "mode":              "compounding_pct_sizing_no_cap",
             "timeframe":         INTERVAL,
             "period":            "2024-07 to 2026-06",
             "symbols_fetched":   len(SYMBOLS),
             "symbols_with_data": len(all_results),
-            "capital_base":      CAPITAL,
+            "starting_capital":  STARTING_CAPITAL,
             "risk_pct":          RISK_PER_TRADE * 100,
             "fee_pct":           FEE_RATE * 100,
             "slip_pct":          SLIP_RATE * 100,
             "slope_thresh":      SLOPE_THRESH,
-            "coin_filter":       "drop from variant if PF<1.15 AND trades>=30 in prior run",
             "run_seconds":       round(elapsed, 1),
         },
         "variants": {},
@@ -583,6 +645,7 @@ def main():
             },
             "universe_size": res["universe_size"],
             "aggregate":     res["aggregate"],
+            "final_equity":  res["final_equity"],
             "whitelist":     res["whitelist"],
             "per_coin": [
                 {
@@ -593,7 +656,6 @@ def main():
                     "win_rate":      cs["win_rate"],
                     "profit_factor": cs["profit_factor"] if cs["profit_factor"] != float("inf") else 9999,
                     "net_pnl":       cs["net_pnl"],
-                    "max_drawdown":  cs["max_drawdown"],
                     "long_trades":   cs["long_trades"],
                     "long_wr":       cs["long_wr"],
                     "short_trades":  cs["short_trades"],
