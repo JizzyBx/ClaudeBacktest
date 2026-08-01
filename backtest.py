@@ -1,20 +1,30 @@
 """
-Backtest — Whitelist Screening (195 coins, no position cap)
+Backtest — Filtered Universe, NO Cap (max trade volume)
 Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL
 
-Variants:
-  G    — ADX≥22, TP 3%  / SL 15%
-  H    — ADX≥22, TP 4%  / SL 15%
-  New  — ADX≥22, TP 4%  / SL 12%
-  ADX18 — ADX≥18, TP 4%  / SL 12%  (looser ADX, same TP/SL as New)
+Variants (ADX18 dropped — back to the original 3):
+  G    — ADX>=22, TP 3%  / SL 15%
+  H    — ADX>=22, TP 4%  / SL 15%
+  New  — ADX>=22, TP 4%  / SL 12%
 
-PURPOSE: No position cap — every signal on every coin executes independently.
-Find which variants/coins perform best before applying any portfolio constraints.
+PURPOSE: No position cap — every signal on every coin (within that variant's
+own whitelist) executes independently, same as the original screening run,
+so trade volume stays high. The only change from the raw 195-coin run is a
+per-VARIANT coin filter: a coin is dropped from a variant's universe only if
+it's a proven underperformer there (PF < 1.15 AND >=30 trades — enough
+sample size to trust the number). Coins with fewer than 30 trades are kept
+regardless of PF (not enough data to judge them), and coins with PF >= 1.15
+are kept regardless of trade count. This trims genuinely weak, well-tested
+coins without cutting into trade volume the way a position cap would.
+
+Each variant gets its OWN coin whitelist (a coin can be weak for one variant's
+TP/SL and fine for another's), so G / H / New below each run on a different
+symbol subset even though the raw data is fetched once for the union of all
+three.
+
 Each trade risks 0.75% of $10,000 fixed base (not compound) so per-coin
-PF/WR stats are directly comparable across coins and variants.
-
-Universe: 195 pre-screened coins | Period: Jul 2024 – Jun 2026 | 15m candles
+PF/WR stats stay directly comparable across coins and variants.
 """
 
 import csv, io, json, time, urllib.request, zipfile
@@ -24,14 +34,13 @@ from collections import defaultdict
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VARIANTS = {
-    "G":     {"tp_pct": 3.0,  "sl_pct": 15.0, "adx_min": 22},
-    "H":     {"tp_pct": 4.0,  "sl_pct": 15.0, "adx_min": 22},
-    "New":   {"tp_pct": 4.0,  "sl_pct": 12.0, "adx_min": 22},
-    "ADX18": {"tp_pct": 4.0,  "sl_pct": 12.0, "adx_min": 18},
+    "G":   {"tp_pct": 3.0, "sl_pct": 15.0, "adx_min": 22},
+    "H":   {"tp_pct": 4.0, "sl_pct": 15.0, "adx_min": 22},
+    "New": {"tp_pct": 4.0, "sl_pct": 12.0, "adx_min": 22},
 }
 
 CAPITAL        = 10_000.0
-RISK_PER_TRADE = 0.0075   # 0.75% of fixed base per trade
+RISK_PER_TRADE = 0.0075   # 0.75% of fixed base per trade (not compound)
 FEE_RATE       = 0.0005   # 0.05% per side
 SLIP_RATE      = 0.0002   # 0.02% per side
 COST_PER_SIDE  = FEE_RATE + SLIP_RATE
@@ -48,47 +57,86 @@ MONTHS = [
 ]
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
-SYMBOLS = [
-    "0GUSDT","1000000BOBUSDT","1000BONKUSDT","1000CATUSDT","1000RATSUSDT",
-    "1000SATSUSDT","1000SHIBUSDT","A2ZUSDT","ACEUSDT","ACHUSDT",
-    "ACXUSDT","ADAUSDT","AI16ZUSDT","AINUSDT","AIOTUSDT",
-    "AKTUSDT","ALGOUSDT","ALICEUSDT","ALPINEUSDT","ANIMEUSDT",
-    "ANKRUSDT","API3USDT","ARKMUSDT","ASRUSDT","ASTERUSDT",
-    "ATAUSDT","AUSDT","AWEUSDT","AXLUSDT","BANANAUSDT",
-    "BANDUSDT","BANKUSDT","BASEDUSDT","BASUSDT","BATUSDT",
-    "BCHUSDT","BDXNUSDT","BELUSDT","BIDUSDT","BLZUSDT",
-    "BMTUSDT","BOMEUSDT","BSWUSDT","BTRUSDT","CFXUSDT",
-    "CHIPUSDT","COAIUSDT","COMBOUSDT","COMMONUSDT","COTIUSDT",
-    "CRCLUSDT","CUSDT","DAMUSDT","DEFIUSDT","DEXEUSDT",
-    "DIAUSDT","DMCUSDT","DOODUSDT","DUSDT","EIGENUSDT",
-    "ELSAUSDT","ENAUSDT","EPICUSDT","EPTUSDT","ESPUSDT",
-    "ETCUSDT","ETHUSDT","ETHWUSDT","EVAAUSDT","FIDAUSDT",
-    "FIOUSDT","FISUSDT","FLNCUSDT","FLUXUSDT","FOGOUSDT",
-    "FOLKSUSDT","FORMUSDT","FRAXUSDT","FUNUSDT","FXSUSDT",
-    "GLMUSDT","GRIFFAINUSDT","GUAUSDT","GUNUSDT","HAEDALUSDT",
-    "HANAUSDT","HEMIUSDT","ICPUSDT","ICXUSDT","ILVUSDT",
-    "INITUSDT","IOSTUSDT","IOTXUSDT","IOUSDT","IPUSDT",
-    "KEYUSDT","KITEUSDT","LABUSDT","LAYERUSDT","LIGHTUSDT",
-    "LOKAUSDT","LRCUSDT","LYNUSDT","MAGICUSDT","MAVUSDT",
-    "MEGAUSDT","MILKUSDT","MITOUSDT","MOODENGUSDT","MORPHOUSDT",
-    "MTLUSDT","MYROUSDT","NFPUSDT","NMRUSDT","NOMUSDT",
-    "NOTUSDT","NTRNUSDT","OBOLUSDT","OMGUSDT","ONEUSDT",
-    "OPENUSDT","OPNUSDT","ORBSUSDT","PEOPLEUSDT","PHBUSDT",
-    "PIPPINUSDT","PIXELUSDT","PLAYUSDT","PLUMEUSDT","POLUSDT",
-    "POWERUSDT","POWRUSDT","PROMPTUSDT","PTBUSDT","PUFFERUSDT",
-    "PUMPBTCUSDT","PUNDIXUSDT","QUICKUSDT","RAVEUSDT","REEFUSDT",
-    "RENDERUSDT","RESOLVUSDT","REZUSDT","RLSUSDT","RPLUSDT",
-    "RVVUSDT","SAGAUSDT","SAHARAUSDT","SANTOSUSDT","SEIUSDT",
-    "SIGNUSDT","SKATEUSDT","SKLUSDT","SKRUSDT","SNDKUSDT",
-    "SOMIUSDT","SOPHUSDT","SPELLUSDT","SPKUSDT","STABLEUSDT",
-    "STBLUSDT","STXUSDT","SYNUSDT","SYRUPUSDT","TAIKOUSDT",
-    "THEUSDT","TNSRUSDT","TRBUSDT","TRUTHUSDT","TRUUSDT",
-    "TURBOUSDT","TWTUSDT","UBUSDT","USELESSUSDT","USUALUSDT",
-    "UXLINKUSDT","VANRYUSDT","VINEUSDT","VIRTUALUSDT","VOXELUSDT",
-    "VVVUSDT","WAXPUSDT","WLDUSDT","XCNUSDT","XEMUSDT",
-    "XLMUSDT","XNYUSDT","XPLUSDT","XRPUSDT","YALAUSDT",
-    "YBUSDT","ZECUSDT","ZENUSDT","ZEREBROUSDT","ZKJUSDT",
-]
+# Per-variant whitelist: a symbol is REMOVED from a variant's list only if
+# it was PF<1.15 AND trades>=30 for that specific variant in the prior
+# 195-coin no-cap run. Fetched once for the union of all three below.
+VARIANT_SYMBOLS = {
+    "G": [
+        "0GUSDT", "1000000BOBUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT",
+        "1000SATSUSDT", "A2ZUSDT", "ACHUSDT", "AI16ZUSDT", "AINUSDT", "AIOTUSDT",
+        "ALGOUSDT", "ALICEUSDT", "ALPINEUSDT", "ANKRUSDT", "ARKMUSDT", "ASRUSDT",
+        "ASTERUSDT", "ATAUSDT", "AUSDT", "AWEUSDT", "AXLUSDT", "BANDUSDT", "BANKUSDT",
+        "BASEDUSDT", "BASUSDT", "BATUSDT", "BDXNUSDT", "BELUSDT", "BIDUSDT", "BMTUSDT",
+        "BTRUSDT", "CFXUSDT", "CHIPUSDT", "COAIUSDT", "COMBOUSDT", "COMMONUSDT",
+        "COTIUSDT", "CRCLUSDT", "CUSDT", "DAMUSDT", "DEFIUSDT", "DEXEUSDT", "DIAUSDT",
+        "DMCUSDT", "EIGENUSDT", "ELSAUSDT", "ENAUSDT", "EPICUSDT", "EPTUSDT", "ESPUSDT",
+        "ETCUSDT", "ETHUSDT", "EVAAUSDT", "FIOUSDT", "FLNCUSDT", "FLUXUSDT", "FOLKSUSDT",
+        "FUNUSDT", "FXSUSDT", "GLMUSDT", "GRIFFAINUSDT", "GUAUSDT", "HANAUSDT",
+        "HEMIUSDT", "ICPUSDT", "ICXUSDT", "INITUSDT", "IOSTUSDT", "IOUSDT", "IPUSDT",
+        "KITEUSDT", "LABUSDT", "LIGHTUSDT", "LRCUSDT", "LYNUSDT", "MAGICUSDT", "MAVUSDT",
+        "MEGAUSDT", "MILKUSDT", "MOODENGUSDT", "MTLUSDT", "NFPUSDT", "NMRUSDT",
+        "NOMUSDT", "NOTUSDT", "OBOLUSDT", "OMGUSDT", "OPENUSDT", "OPNUSDT", "ORBSUSDT",
+        "PEOPLEUSDT", "PIPPINUSDT", "PIXELUSDT", "PLUMEUSDT", "POLUSDT", "POWERUSDT",
+        "POWRUSDT", "PROMPTUSDT", "PTBUSDT", "PUMPBTCUSDT", "PUNDIXUSDT", "QUICKUSDT",
+        "RAVEUSDT", "REEFUSDT", "RESOLVUSDT", "REZUSDT", "RLSUSDT", "RVVUSDT",
+        "SAGAUSDT", "SAHARAUSDT", "SANTOSUSDT", "SEIUSDT", "SIGNUSDT", "SKRUSDT",
+        "SNDKUSDT", "SOMIUSDT", "SPELLUSDT", "SPKUSDT", "STABLEUSDT", "STBLUSDT",
+        "STXUSDT", "TNSRUSDT", "TRBUSDT", "TRUTHUSDT", "TURBOUSDT", "UBUSDT",
+        "USUALUSDT", "UXLINKUSDT", "VANRYUSDT", "VINEUSDT", "VIRTUALUSDT", "VVVUSDT",
+        "WAXPUSDT", "WLDUSDT", "XCNUSDT", "XEMUSDT", "XLMUSDT", "XRPUSDT", "YBUSDT",
+        "ZECUSDT", "ZENUSDT", "ZEREBROUSDT", "ZKJUSDT",
+    ],
+    "H": [
+        "0GUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT", "A2ZUSDT", "ACEUSDT",
+        "ACXUSDT", "AI16ZUSDT", "AINUSDT", "AIOTUSDT", "AKTUSDT", "ALGOUSDT",
+        "ALPINEUSDT", "ASRUSDT", "ASTERUSDT", "ATAUSDT", "AUSDT", "AXLUSDT",
+        "BANANAUSDT", "BANDUSDT", "BANKUSDT", "BASEDUSDT", "BASUSDT", "BATUSDT",
+        "BELUSDT", "BIDUSDT", "BLZUSDT", "BOMEUSDT", "BTRUSDT", "CFXUSDT", "CHIPUSDT",
+        "COAIUSDT", "COMBOUSDT", "COMMONUSDT", "COTIUSDT", "CRCLUSDT", "CUSDT",
+        "DAMUSDT", "DEFIUSDT", "ELSAUSDT", "ENAUSDT", "EPICUSDT", "EPTUSDT", "ESPUSDT",
+        "ETCUSDT", "ETHUSDT", "ETHWUSDT", "EVAAUSDT", "FIDAUSDT", "FIOUSDT", "FISUSDT",
+        "FLNCUSDT", "FLUXUSDT", "FOGOUSDT", "FRAXUSDT", "FUNUSDT", "FXSUSDT", "GLMUSDT",
+        "GRIFFAINUSDT", "GUAUSDT", "GUNUSDT", "HAEDALUSDT", "HANAUSDT", "ICPUSDT",
+        "ICXUSDT", "ILVUSDT", "INITUSDT", "IOTXUSDT", "IOUSDT", "IPUSDT", "KEYUSDT",
+        "KITEUSDT", "LABUSDT", "LAYERUSDT", "LIGHTUSDT", "LOKAUSDT", "LRCUSDT",
+        "LYNUSDT", "MILKUSDT", "MOODENGUSDT", "MORPHOUSDT", "MYROUSDT", "NOMUSDT",
+        "NOTUSDT", "NTRNUSDT", "ONEUSDT", "ORBSUSDT", "PEOPLEUSDT", "PIPPINUSDT",
+        "PIXELUSDT", "PLAYUSDT", "PLUMEUSDT", "POLUSDT", "POWERUSDT", "POWRUSDT",
+        "PTBUSDT", "PUFFERUSDT", "PUMPBTCUSDT", "QUICKUSDT", "RAVEUSDT", "REEFUSDT",
+        "RESOLVUSDT", "RVVUSDT", "SAHARAUSDT", "SEIUSDT", "SIGNUSDT", "SKATEUSDT",
+        "SKRUSDT", "SNDKUSDT", "SPELLUSDT", "SPKUSDT", "STXUSDT", "SYRUPUSDT",
+        "TAIKOUSDT", "TRUTHUSDT", "TURBOUSDT", "UBUSDT", "USELESSUSDT", "VANRYUSDT",
+        "VINEUSDT", "VIRTUALUSDT", "VOXELUSDT", "WAXPUSDT", "WLDUSDT", "XCNUSDT",
+        "XLMUSDT", "XNYUSDT", "XPLUSDT", "XRPUSDT", "YALAUSDT", "YBUSDT", "ZECUSDT",
+        "ZENUSDT", "ZKJUSDT",
+    ],
+    "New": [
+        "0GUSDT", "1000BONKUSDT", "1000CATUSDT", "1000RATSUSDT", "1000SHIBUSDT",
+        "A2ZUSDT", "ACEUSDT", "ADAUSDT", "AI16ZUSDT", "AINUSDT", "AIOTUSDT", "ALGOUSDT",
+        "ALPINEUSDT", "ANIMEUSDT", "API3USDT", "ASRUSDT", "ASTERUSDT", "ATAUSDT",
+        "AUSDT", "BANANAUSDT", "BANDUSDT", "BASEDUSDT", "BASUSDT", "BATUSDT", "BCHUSDT",
+        "BELUSDT", "BIDUSDT", "BLZUSDT", "BSWUSDT", "BTRUSDT", "CFXUSDT", "CHIPUSDT",
+        "COAIUSDT", "COMBOUSDT", "COMMONUSDT", "COTIUSDT", "DAMUSDT", "DEFIUSDT",
+        "DIAUSDT", "DOODUSDT", "DUSDT", "ELSAUSDT", "ENAUSDT", "EPICUSDT", "EPTUSDT",
+        "ESPUSDT", "ETHWUSDT", "EVAAUSDT", "FIDAUSDT", "FISUSDT", "FLNCUSDT", "FLUXUSDT",
+        "FOGOUSDT", "FORMUSDT", "FRAXUSDT", "FUNUSDT", "FXSUSDT", "GLMUSDT",
+        "GRIFFAINUSDT", "GUNUSDT", "HAEDALUSDT", "HANAUSDT", "ICPUSDT", "ICXUSDT",
+        "ILVUSDT", "IOTXUSDT", "IPUSDT", "KEYUSDT", "KITEUSDT", "LABUSDT", "LIGHTUSDT",
+        "LOKAUSDT", "LRCUSDT", "LYNUSDT", "MAGICUSDT", "MAVUSDT", "MITOUSDT",
+        "MOODENGUSDT", "MORPHOUSDT", "MYROUSDT", "NOMUSDT", "NOTUSDT", "NTRNUSDT",
+        "ONEUSDT", "OPENUSDT", "ORBSUSDT", "PEOPLEUSDT", "PHBUSDT", "PIPPINUSDT",
+        "PIXELUSDT", "PLAYUSDT", "PLUMEUSDT", "POWERUSDT", "POWRUSDT", "PTBUSDT",
+        "PUMPBTCUSDT", "QUICKUSDT", "RAVEUSDT", "REEFUSDT", "RENDERUSDT", "RESOLVUSDT",
+        "RPLUSDT", "RVVUSDT", "SANTOSUSDT", "SKATEUSDT", "SKLUSDT", "SKRUSDT",
+        "SNDKUSDT", "SOPHUSDT", "SPKUSDT", "STXUSDT", "SYNUSDT", "SYRUPUSDT", "THEUSDT",
+        "TNSRUSDT", "TRUTHUSDT", "TRUUSDT", "TURBOUSDT", "TWTUSDT", "UBUSDT",
+        "USELESSUSDT", "UXLINKUSDT", "VANRYUSDT", "VINEUSDT", "VIRTUALUSDT", "VOXELUSDT",
+        "WAXPUSDT", "XLMUSDT", "XNYUSDT", "YBUSDT", "ZECUSDT", "ZENUSDT", "ZKJUSDT",
+    ],
+}
+
+# Fetch data once for the union of every symbol needed by any variant.
+SYMBOLS = sorted(set().union(*VARIANT_SYMBOLS.values()))
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 def ema(values, period):
@@ -162,7 +210,7 @@ def fetch_candles(symbol):
     candles.sort(key=lambda x: x[0])
     return candles
 
-# ── Per-symbol backtest (NO position cap — screening mode) ────────────────────
+# ── Per-symbol backtest (NO position cap) ──────────────────────────────────────
 def backtest_symbol(symbol):
     candles = fetch_candles(symbol)
     if len(candles) < 150:
@@ -179,31 +227,24 @@ def backtest_symbol(symbol):
     e50 = ema(closes, 50)
 
     WARMUP = 60
-
-    # Pre-compute ADX once at ADX18 threshold (lowest), reuse for ADX22 check
-    # Actually compute per-bar ADX value and compare per variant
     variant_trades = {v: [] for v in VARIANTS}
 
     for i in range(WARMUP, n - 1):
-        # EMA50 slope
         slope_pct  = (e50[i] - e50[i-10]) / e50[i-10] * 100
         trend_up   = slope_pct >  SLOPE_THRESH
         trend_down = slope_pct < -SLOPE_THRESH
         if not trend_up and not trend_down:
             continue
 
-        # EMA9/21 crossover
         crossed_up   = e9[i] > e21[i] and e9[i-1] <= e21[i-1]
         crossed_down = e9[i] < e21[i] and e9[i-1] >= e21[i-1]
         if not crossed_up and not crossed_down:
             continue
-
         if trend_up and not crossed_up:
             continue
         if trend_down and not crossed_down:
             continue
 
-        # Compute ADX once per qualifying bar (used by all variants)
         seg_h = highs[max(0, i-59): i+1]
         seg_l = lows [max(0, i-59): i+1]
         seg_c = closes[max(0, i-59): i+1]
@@ -213,7 +254,9 @@ def backtest_symbol(symbol):
         entry  = closes[i]
 
         for vname, vcfg in VARIANTS.items():
-            # Each variant applies its own ADX threshold
+            # skip entirely if this symbol isn't in this variant's whitelist
+            if symbol not in VARIANT_SYMBOLS[vname]:
+                continue
             if adx < vcfg["adx_min"]:
                 continue
 
@@ -267,7 +310,7 @@ def backtest_symbol(symbol):
     return symbol, variant_trades
 
 # ── Aggregate stats ───────────────────────────────────────────────────────────
-def calc_stats(trades, sl_pct):
+def calc_stats(trades):
     if not trades:
         return None
     wins   = [t for t in trades if t["win"]]
@@ -340,8 +383,9 @@ def calc_stats(trades, sl_pct):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print("  WHITELIST SCREENING — Variants G / H / New / ADX18")
-    print(f"  {len(SYMBOLS)} coins | Jul 2024–Jun 2026 | 15m | NO position cap")
+    print("  FILTERED UNIVERSE — Variants G / H / New (ADX18 dropped, NO cap)")
+    print(f"  {len(SYMBOLS)} coins fetched | per-variant whitelist filter")
+    print("  Filter: drop coin from a variant only if PF<1.15 AND trades>=30")
     print("=" * 65)
 
     print(f"\n[Phase 1] Downloading & scanning ({WORKERS} workers)…")
@@ -389,15 +433,17 @@ def main():
         coin_stats = {}
 
         for sym, vdata in all_results.items():
+            if sym not in VARIANT_SYMBOLS[vname]:
+                continue
             trades = vdata.get(vname, [])
             if not trades:
                 continue
             all_trades.extend(trades)
-            cs = calc_stats(trades, sl)
+            cs = calc_stats(trades)
             if cs:
                 coin_stats[sym] = cs
 
-        agg = calc_stats(all_trades, sl)
+        agg = calc_stats(all_trades)
         if not agg:
             print(f"  {vname}: no trades")
             continue
@@ -416,22 +462,23 @@ def main():
         ]
 
         verdict = "✅ USABLE" if agg["usable"] else "❌ NOT USABLE"
-        print(f"  {vname} (ADX≥{adx_min}, TP {tp}% SL {sl}%): {agg['total_trades']} trades | "
-              f"WR {agg['win_rate']}% | PF {agg['profit_factor']} | "
-              f"Net ${agg['net_pnl']} | {len(whitelist)} whitelisted | {verdict}")
+        print(f"  {vname} (ADX>={adx_min}, TP {tp}% SL {sl}%): {len(VARIANT_SYMBOLS[vname])} coins | "
+              f"{agg['total_trades']} trades | WR {agg['win_rate']}% | PF {agg['profit_factor']} | "
+              f"Net ${agg['net_pnl']} | DD {agg['max_drawdown']}% | {len(whitelist)} whitelisted | {verdict}")
 
         report[vname] = {
-            "aggregate":  agg,
-            "coin_table": coin_table,
-            "whitelist":  sorted(whitelist),
-            "tp_pct":     tp,
-            "sl_pct":     sl,
-            "adx_min":    adx_min,
+            "aggregate":     agg,
+            "coin_table":    coin_table,
+            "whitelist":     sorted(whitelist),
+            "tp_pct":        tp,
+            "sl_pct":        sl,
+            "adx_min":       adx_min,
+            "universe_size": len(VARIANT_SYMBOLS[vname]),
         }
         summary_lines.append(
-            f"Variant {vname} (ADX≥{adx_min}, TP {tp}% SL {sl}%): "
-            f"{agg['total_trades']} trades | WR {agg['win_rate']}% | "
-            f"PF {agg['profit_factor']} | Net ${agg['net_pnl']} | "
+            f"Variant {vname} (ADX>={adx_min}, TP {tp}% SL {sl}%): "
+            f"{len(VARIANT_SYMBOLS[vname])} coins | {agg['total_trades']} trades | "
+            f"WR {agg['win_rate']}% | PF {agg['profit_factor']} | Net ${agg['net_pnl']} | "
             f"DD {agg['max_drawdown']}% | Whitelist: {len(whitelist)} coins | {verdict}"
         )
 
@@ -439,12 +486,13 @@ def main():
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write("WHITELIST SCREENING SUMMARY\n")
+        f.write("FILTERED UNIVERSE BACKTEST SUMMARY (no cap, max trade volume)\n")
         f.write("=" * 65 + "\n")
         f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 – Jun 2026\n")
-        f.write(f"Universe : {len(SYMBOLS)} coins (pre-screened PF≥1.15 & ≥20 trades)\n")
-        f.write(f"Mode     : SCREENING (no position cap — every signal executes)\n")
+        f.write(f"Universe : {len(SYMBOLS)} coins fetched, per-variant whitelist applied\n")
+        f.write(f"Filter   : drop coin from a variant only if PF<1.15 AND trades>=30 in prior run\n")
+        f.write(f"Mode     : NO position cap — every signal executes independently\n")
         f.write(f"Risk/trade: {RISK_PER_TRADE*100}% of ${CAPITAL:,.0f} fixed = ${CAPITAL*RISK_PER_TRADE:.0f}/trade\n")
         f.write(f"Fees     : {FEE_RATE*100}% + {SLIP_RATE*100}% slip per side\n")
         f.write(f"Run time : {elapsed:.0f}s\n")
@@ -453,7 +501,7 @@ def main():
         for vname, res in report.items():
             agg = res["aggregate"]
             f.write(f"{'='*65}\n")
-            f.write(f"VARIANT {vname}  —  ADX≥{res['adx_min']} | TP {res['tp_pct']}% / SL {res['sl_pct']}%\n")
+            f.write(f"VARIANT {vname}  —  ADX>={res['adx_min']} | TP {res['tp_pct']}% / SL {res['sl_pct']}% | Universe: {res['universe_size']} coins\n")
             f.write(f"{'='*65}\n")
             f.write(f"Total Trades    : {agg['total_trades']}\n")
             f.write(f"Wins / Losses   : {agg['wins']} / {agg['losses']}\n")
@@ -478,7 +526,7 @@ def main():
                 f.write(f"  {mo}: ${sign}{pnl:,.2f}  {bar}\n")
             f.write("\n")
 
-            f.write(f"WHITELIST (PF≥1.5, WR≥42%, ≥10 trades): {len(res['whitelist'])} coins\n")
+            f.write(f"WHITELIST (PF>=1.5, WR>=42%, >=10 trades): {len(res['whitelist'])} coins\n")
             f.write("  " + ", ".join(res["whitelist"]) + "\n\n")
 
             f.write(f"TOP 30 COINS by Profit Factor:\n")
@@ -510,16 +558,17 @@ def main():
     json_out = {
         "meta": {
             "strategy":          "EMA50slope+EMA9/21cross+ADX_per_variant",
-            "mode":              "screening_no_cap",
+            "mode":              "filtered_universe_no_cap",
             "timeframe":         INTERVAL,
             "period":            "2024-07 to 2026-06",
-            "symbols_total":     len(SYMBOLS),
+            "symbols_fetched":   len(SYMBOLS),
             "symbols_with_data": len(all_results),
             "capital_base":      CAPITAL,
             "risk_pct":          RISK_PER_TRADE * 100,
             "fee_pct":           FEE_RATE * 100,
             "slip_pct":          SLIP_RATE * 100,
             "slope_thresh":      SLOPE_THRESH,
+            "coin_filter":       "drop from variant if PF<1.15 AND trades>=30 in prior run",
             "run_seconds":       round(elapsed, 1),
         },
         "variants": {},
@@ -532,8 +581,9 @@ def main():
                 "tp_pct":  res["tp_pct"],
                 "sl_pct":  res["sl_pct"],
             },
-            "aggregate": res["aggregate"],
-            "whitelist": res["whitelist"],
+            "universe_size": res["universe_size"],
+            "aggregate":     res["aggregate"],
+            "whitelist":     res["whitelist"],
             "per_coin": [
                 {
                     "symbol":        sym,
