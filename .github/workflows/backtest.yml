@@ -1,32 +1,28 @@
-name: Backtest
+name: Backtest v12.0 - Pre-Live Validation
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
-  run-backtest:
+  backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    timeout-minutes: 60
 
-      - name: Set up Python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Run backtest.py
+      - name: Run backtest
         run: python backtest.py
 
-      - name: Upload backtest_summary.txt
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: backtest_summary
-          path: backtest_summary.txt
-
-      - name: Upload backtest_report.json
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest_report
-          path: backtest_report.json
+          name: backtest-v12-results
+          path: |
+            backtest_summary.txt
+            backtest_report.json
