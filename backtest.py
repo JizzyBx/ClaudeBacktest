@@ -1,16 +1,20 @@
 """
-Backtest — Whitelist Run (195 coins, PF≥1.15, ≥20 trades from screening)
-Strategy: ADX≥22 + EMA50 slope + EMA9/21 crossover (15m)
+Backtest — Whitelist Screening (195 coins, no position cap)
+Strategy: ADX filter + EMA50 slope + EMA9/21 crossover (15m)
 Exit:      Fixed percentage TP/SL
-Variants:
-  G   — TP 3%  / SL 15%
-  H   — TP 4%  / SL 15%
-  New — TP 4%  / SL 12%
 
-Universe: 195 pre-screened coins (PF≥1.15 & ≥20 trades in screening run)
-Period:   Jul 2024 – Jun 2026 | 15m candles
-Capital:  $10,000 shared portfolio | Max 6 concurrent positions
-Risk:     0.75% of current equity per trade
+Variants:
+  G    — ADX≥22, TP 3%  / SL 15%
+  H    — ADX≥22, TP 4%  / SL 15%
+  New  — ADX≥22, TP 4%  / SL 12%
+  ADX18 — ADX≥18, TP 4%  / SL 12%  (looser ADX, same TP/SL as New)
+
+PURPOSE: No position cap — every signal on every coin executes independently.
+Find which variants/coins perform best before applying any portfolio constraints.
+Each trade risks 0.75% of $10,000 fixed base (not compound) so per-coin
+PF/WR stats are directly comparable across coins and variants.
+
+Universe: 195 pre-screened coins | Period: Jul 2024 – Jun 2026 | 15m candles
 """
 
 import csv, io, json, time, urllib.request, zipfile
@@ -20,22 +24,21 @@ from collections import defaultdict
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VARIANTS = {
-    "G":   {"tp_pct": 3.0,  "sl_pct": 15.0},
-    "H":   {"tp_pct": 4.0,  "sl_pct": 15.0},
-    "New": {"tp_pct": 4.0,  "sl_pct": 12.0},
+    "G":     {"tp_pct": 3.0,  "sl_pct": 15.0, "adx_min": 22},
+    "H":     {"tp_pct": 4.0,  "sl_pct": 15.0, "adx_min": 22},
+    "New":   {"tp_pct": 4.0,  "sl_pct": 12.0, "adx_min": 22},
+    "ADX18": {"tp_pct": 4.0,  "sl_pct": 12.0, "adx_min": 18},
 }
 
-CAPITAL         = 10_000.0
-RISK_PER_TRADE  = 0.0075    # 0.75% of current equity
-FEE_RATE        = 0.0005    # 0.05% per side
-SLIP_RATE       = 0.0002    # 0.02% per side
-COST_PER_SIDE   = FEE_RATE + SLIP_RATE
-MAX_POSITIONS   = 6         # portfolio-wide cap
+CAPITAL        = 10_000.0
+RISK_PER_TRADE = 0.0075   # 0.75% of fixed base per trade
+FEE_RATE       = 0.0005   # 0.05% per side
+SLIP_RATE      = 0.0002   # 0.02% per side
+COST_PER_SIDE  = FEE_RATE + SLIP_RATE
 
-ADX_MIN         = 22
-SLOPE_THRESH    = 0.05      # EMA50 must move 0.05% over 10 bars
-INTERVAL        = "15m"
-WORKERS         = 50
+SLOPE_THRESH   = 0.05     # EMA50 must move 0.05% over 10 bars
+INTERVAL       = "15m"
+WORKERS        = 50
 
 MONTHS = [
     (2024,7),(2024,8),(2024,9),(2024,10),(2024,11),(2024,12),
@@ -159,32 +162,37 @@ def fetch_candles(symbol):
     candles.sort(key=lambda x: x[0])
     return candles
 
-# ── Per-symbol signal generation (returns signals, NOT resolved trades) ───────
-def generate_signals(symbol):
+# ── Per-symbol backtest (NO position cap — screening mode) ────────────────────
+def backtest_symbol(symbol):
     candles = fetch_candles(symbol)
     if len(candles) < 150:
         return symbol, None
 
-    ts_arr  = [c[0] for c in candles]
-    highs   = [c[1] for c in candles]
-    lows    = [c[2] for c in candles]
-    closes  = [c[3] for c in candles]
-    n       = len(candles)
+    ts_arr = [c[0] for c in candles]
+    highs  = [c[1] for c in candles]
+    lows   = [c[2] for c in candles]
+    closes = [c[3] for c in candles]
+    n      = len(candles)
 
     e9  = ema(closes, 9)
     e21 = ema(closes, 21)
     e50 = ema(closes, 50)
 
     WARMUP = 60
-    signals = []  # list of (bar_idx, signal, entry_price, highs, lows, ts_arr)
+
+    # Pre-compute ADX once at ADX18 threshold (lowest), reuse for ADX22 check
+    # Actually compute per-bar ADX value and compare per variant
+    variant_trades = {v: [] for v in VARIANTS}
 
     for i in range(WARMUP, n - 1):
+        # EMA50 slope
         slope_pct  = (e50[i] - e50[i-10]) / e50[i-10] * 100
         trend_up   = slope_pct >  SLOPE_THRESH
         trend_down = slope_pct < -SLOPE_THRESH
         if not trend_up and not trend_down:
             continue
 
+        # EMA9/21 crossover
         crossed_up   = e9[i] > e21[i] and e9[i-1] <= e21[i-1]
         crossed_down = e9[i] < e21[i] and e9[i-1] >= e21[i-1]
         if not crossed_up and not crossed_down:
@@ -195,131 +203,71 @@ def generate_signals(symbol):
         if trend_down and not crossed_down:
             continue
 
+        # Compute ADX once per qualifying bar (used by all variants)
         seg_h = highs[max(0, i-59): i+1]
         seg_l = lows [max(0, i-59): i+1]
         seg_c = closes[max(0, i-59): i+1]
         adx = adx_calc(seg_h, seg_l, seg_c, 14)
-        if adx < ADX_MIN:
-            continue
 
         signal = "buy" if crossed_up else "sell"
-        signals.append((i, signal, closes[i]))
+        entry  = closes[i]
 
-    return symbol, signals, highs, lows, ts_arr, n, closes
-
-# ── Portfolio-level simulation with position cap ──────────────────────────────
-def run_portfolio(all_signals_data, vname, vcfg):
-    """
-    Merge all coin signals by timestamp, enforce MAX_POSITIONS cap,
-    simulate trades with shared equity, compound risk.
-    Returns list of trade dicts.
-    """
-    tp_pct = vcfg["tp_pct"] / 100.0
-    sl_pct = vcfg["sl_pct"] / 100.0
-
-    # Build a global event list: (entry_ts, symbol, signal, entry_price, highs, lows, ts_arr, entry_bar, n, closes)
-    all_entries = []
-    for sym, (signals, highs, lows, ts_arr, n, closes) in all_signals_data.items():
-        for (bar_idx, signal, entry_price) in signals:
-            # Entry on NEXT bar after signal bar
-            entry_bar = bar_idx + 1
-            if entry_bar >= n:
+        for vname, vcfg in VARIANTS.items():
+            # Each variant applies its own ADX threshold
+            if adx < vcfg["adx_min"]:
                 continue
-            actual_entry = closes[entry_bar]
-            all_entries.append((
-                ts_arr[entry_bar], sym, signal, actual_entry,
-                highs, lows, ts_arr, entry_bar, n, closes
-            ))
 
-    # Sort by entry timestamp
-    all_entries.sort(key=lambda x: x[0])
+            tp_pct = vcfg["tp_pct"] / 100.0
+            sl_pct = vcfg["sl_pct"] / 100.0
 
-    equity = CAPITAL
-    open_positions = []   # list of position dicts
-    trades = []
-
-    for event in all_entries:
-        entry_ts, sym, signal, entry_price, highs, lows, ts_arr, entry_bar, n, closes = event
-
-        # First: close any open positions that have resolved by this entry_ts
-        still_open = []
-        for pos in open_positions:
-            if pos["exit_ts"] <= entry_ts:
-                # Position closed before this new entry
-                equity += pos["pnl"]
-                trades.append(pos["trade"])
-            else:
-                still_open.append(pos)
-        open_positions = still_open
-
-        # Enforce position cap
-        if len(open_positions) >= MAX_POSITIONS:
-            continue
-
-        # Compute TP/SL prices
-        if signal == "buy":
-            tp_price = entry_price * (1 + tp_pct)
-            sl_price = entry_price * (1 - sl_pct)
-        else:
-            tp_price = entry_price * (1 - tp_pct)
-            sl_price = entry_price * (1 + sl_pct)
-
-        # Forward-scan to resolve this trade
-        outcome    = "timeout"
-        exit_price = closes[-1]
-        exit_bar   = n - 1
-        exit_ts    = ts_arr[exit_bar]
-
-        for j in range(entry_bar + 1, n):
-            h = highs[j]; l = lows[j]
             if signal == "buy":
-                if l <= sl_price:
-                    outcome = "sl"; exit_price = sl_price; exit_bar = j; exit_ts = ts_arr[j]; break
-                if h >= tp_price:
-                    outcome = "tp"; exit_price = tp_price; exit_bar = j; exit_ts = ts_arr[j]; break
+                tp_price = entry * (1 + tp_pct)
+                sl_price = entry * (1 - sl_pct)
             else:
-                if h >= sl_price:
-                    outcome = "sl"; exit_price = sl_price; exit_bar = j; exit_ts = ts_arr[j]; break
-                if l <= tp_price:
-                    outcome = "tp"; exit_price = tp_price; exit_bar = j; exit_ts = ts_arr[j]; break
+                tp_price = entry * (1 - tp_pct)
+                sl_price = entry * (1 + sl_pct)
 
-        # PnL with compound equity
-        risk_dollar = equity * RISK_PER_TRADE
-        if signal == "buy":
-            raw_ret = (exit_price - entry_price) / entry_price
-        else:
-            raw_ret = (entry_price - exit_price) / entry_price
-        net_ret = raw_ret - COST_PER_SIDE * 2
-        pnl = risk_dollar * (net_ret / sl_pct)
+            outcome    = "timeout"
+            exit_price = closes[-1]
+            exit_bar   = n - 1
 
-        trade = {
-            "symbol":    sym,
-            "signal":    signal,
-            "entry":     entry_price,
-            "exit":      exit_price,
-            "outcome":   outcome,
-            "pnl":       round(pnl, 4),
-            "win":       pnl > 0,
-            "entry_ts":  entry_ts,
-            "exit_ts":   exit_ts,
-            "bars":      exit_bar - entry_bar,
-        }
+            for j in range(i + 1, n):
+                h = highs[j]; l = lows[j]
+                if signal == "buy":
+                    if l <= sl_price:
+                        outcome = "sl"; exit_price = sl_price; exit_bar = j; break
+                    if h >= tp_price:
+                        outcome = "tp"; exit_price = tp_price; exit_bar = j; break
+                else:
+                    if h >= sl_price:
+                        outcome = "sl"; exit_price = sl_price; exit_bar = j; break
+                    if l <= tp_price:
+                        outcome = "tp"; exit_price = tp_price; exit_bar = j; break
 
-        open_positions.append({
-            "exit_ts": exit_ts,
-            "pnl":     pnl,
-            "trade":   trade,
-        })
+            risk_dollar = CAPITAL * RISK_PER_TRADE  # $75 fixed
+            if signal == "buy":
+                raw_ret = (exit_price - entry) / entry
+            else:
+                raw_ret = (entry - exit_price) / entry
+            net_ret = raw_ret - COST_PER_SIDE * 2
+            pnl = risk_dollar * (net_ret / sl_pct)
 
-    # Flush remaining open positions
-    for pos in open_positions:
-        equity += pos["pnl"]
-        trades.append(pos["trade"])
+            variant_trades[vname].append({
+                "signal":   signal,
+                "entry":    entry,
+                "exit":     exit_price,
+                "outcome":  outcome,
+                "pnl":      pnl,
+                "win":      pnl > 0,
+                "entry_ts": ts_arr[i],
+                "exit_ts":  ts_arr[exit_bar],
+                "bars":     exit_bar - i,
+            })
 
-    return trades
+    return symbol, variant_trades
 
 # ── Aggregate stats ───────────────────────────────────────────────────────────
-def calc_stats(trades):
+def calc_stats(trades, sl_pct):
     if not trades:
         return None
     wins   = [t for t in trades if t["win"]]
@@ -348,8 +296,7 @@ def calc_stats(trades):
         dt = datetime.fromtimestamp(t["exit_ts"] / 1000, tz=timezone.utc)
         monthly[f"{dt.year}-{dt.month:02d}"] += t["pnl"]
 
-    # Max drawdown on running equity
-    running = CAPITAL; peak = CAPITAL; max_dd = 0.0
+    running = 0.0; peak = 0.0; max_dd = 0.0
     for t in sorted(trades, key=lambda x: x["exit_ts"]):
         running += t["pnl"]
         if running > peak:
@@ -358,7 +305,6 @@ def calc_stats(trades):
         if dd > max_dd:
             max_dd = dd
 
-    # Streaks
     best_w = best_l = cur = 0
     prev_win = None
     for t in sorted(trades, key=lambda x: x["exit_ts"]):
@@ -367,29 +313,6 @@ def calc_stats(trades):
         if w:   best_w = max(best_w, cur)
         else:   best_l = max(best_l, cur)
         prev_win = w
-
-    # Per-coin stats
-    coin_trades = defaultdict(list)
-    for t in trades:
-        coin_trades[t["symbol"]].append(t)
-
-    per_coin = {}
-    for sym, ctrades in coin_trades.items():
-        cw = [t for t in ctrades if t["win"]]
-        cl = [t for t in ctrades if not t["win"]]
-        ct = len(ctrades)
-        cwr = len(cw) / ct * 100
-        cgp = sum(t["pnl"] for t in cw)
-        cgl = abs(sum(t["pnl"] for t in cl))
-        cpf = cgp / cgl if cgl else float("inf")
-        per_coin[sym] = {
-            "total_trades": ct,
-            "wins":         len(cw),
-            "losses":       len(cl),
-            "win_rate":     round(cwr, 2),
-            "profit_factor": round(cpf, 4) if cpf != float("inf") else 9999,
-            "net_pnl":      round(cgp - cgl, 2),
-        }
 
     return {
         "total_trades":    total,
@@ -410,7 +333,6 @@ def calc_stats(trades):
         "best_win_streak": best_w,
         "best_loss_streak":best_l,
         "monthly":         dict(sorted(monthly.items())),
-        "per_coin":        per_coin,
         "usable":          pf >= 1.5 and wr >= 42,
     }
 
@@ -418,94 +340,112 @@ def calc_stats(trades):
 def main():
     t0 = time.time()
     print("=" * 65)
-    print("  WHITELIST BACKTEST — Variants G / H / New")
-    print(f"  {len(SYMBOLS)} coins | Jul 2024–Jun 2026 | 15m | Max {MAX_POSITIONS} positions")
+    print("  WHITELIST SCREENING — Variants G / H / New / ADX18")
+    print(f"  {len(SYMBOLS)} coins | Jul 2024–Jun 2026 | 15m | NO position cap")
     print("=" * 65)
 
-    # Phase 1 — parallel fetch + signal generation
-    print(f"\n[Phase 1] Downloading & generating signals ({WORKERS} workers)…")
-    all_signals_data = {}  # symbol -> (signals, highs, lows, ts_arr, n, closes)
+    print(f"\n[Phase 1] Downloading & scanning ({WORKERS} workers)…")
+    all_results = {}
     done = failed = 0
 
     with ProcessPoolExecutor(max_workers=WORKERS) as ex:
-        futures = {ex.submit(generate_signals, sym): sym for sym in SYMBOLS}
+        futures = {ex.submit(backtest_symbol, sym): sym for sym in SYMBOLS}
         for fut in as_completed(futures):
             sym = futures[fut]
             done += 1
             try:
-                result = fut.result()
-                if result[1] is None:
+                sym_out, res = fut.result()
+                if res is None:
                     failed += 1
                 else:
-                    sym_out, signals, highs, lows, ts_arr, n, closes = result
-                    all_signals_data[sym_out] = (signals, highs, lows, ts_arr, n, closes)
+                    all_results[sym_out] = res
             except Exception as e:
                 failed += 1
                 print(f"  ERROR {sym}: {e}")
             if done % 50 == 0 or done == len(SYMBOLS):
-                print(f"  [{done}/{len(SYMBOLS)}] done | {len(all_signals_data)} with data | {failed} skipped")
+                print(f"  [{done}/{len(SYMBOLS)}] done | {len(all_results)} with data | {failed} skipped")
 
-    if not all_signals_data:
+    if not all_results:
         print("\n⛔ ABORT: 0 symbols returned data.")
         print("   data.binance.vision may be blocked on this runner.")
         return
 
-    if len(all_signals_data) < len(SYMBOLS) * 0.1:
-        print(f"\n⛔ ABORT: Only {len(all_signals_data)}/{len(SYMBOLS)} symbols loaded.")
+    if len(all_results) < len(SYMBOLS) * 0.1:
+        print(f"\n⛔ ABORT: Only {len(all_results)}/{len(SYMBOLS)} symbols loaded.")
         print("   Looks like data source is blocked. Check runner network.")
         return
 
-    print(f"\n  ✅ {len(all_signals_data)} symbols loaded | {failed} skipped")
+    print(f"\n  ✅ {len(all_results)} symbols loaded | {failed} skipped")
 
-    # Phase 2 — portfolio simulation per variant
-    print("\n[Phase 2] Running portfolio simulation…")
+    print("\n[Phase 2] Computing stats…")
+
     report = {}
     summary_lines = []
 
     for vname, vcfg in VARIANTS.items():
-        tp = vcfg["tp_pct"]; sl = vcfg["sl_pct"]
-        trades = run_portfolio(all_signals_data, vname, vcfg)
-        agg = calc_stats(trades)
+        tp = vcfg["tp_pct"]; sl = vcfg["sl_pct"]; adx_min = vcfg["adx_min"]
+
+        all_trades = []
+        coin_stats = {}
+
+        for sym, vdata in all_results.items():
+            trades = vdata.get(vname, [])
+            if not trades:
+                continue
+            all_trades.extend(trades)
+            cs = calc_stats(trades, sl)
+            if cs:
+                coin_stats[sym] = cs
+
+        agg = calc_stats(all_trades, sl)
         if not agg:
             print(f"  {vname}: no trades")
             continue
 
-        verdict = "✅ USABLE" if agg["usable"] else "❌ NOT USABLE"
-        print(f"  {vname} (TP {tp}% SL {sl}%): {agg['total_trades']} trades | "
-              f"WR {agg['win_rate']}% | PF {agg['profit_factor']} | "
-              f"Net ${agg['net_pnl']} | {verdict}")
-
-        # Sort per-coin by PF descending
         coin_table = sorted(
-            agg["per_coin"].items(),
-            key=lambda x: (x[1]["profit_factor"] if x[1]["profit_factor"] != 9999 else 99999, x[1]["net_pnl"]),
+            coin_stats.items(),
+            key=lambda x: (x[1]["profit_factor"] if x[1]["profit_factor"] != float("inf") else 9999, x[1]["net_pnl"]),
             reverse=True
         )
+
+        whitelist = [
+            sym for sym, cs in coin_stats.items()
+            if cs["profit_factor"] >= 1.5
+            and cs["win_rate"] >= 42
+            and cs["total_trades"] >= 10
+        ]
+
+        verdict = "✅ USABLE" if agg["usable"] else "❌ NOT USABLE"
+        print(f"  {vname} (ADX≥{adx_min}, TP {tp}% SL {sl}%): {agg['total_trades']} trades | "
+              f"WR {agg['win_rate']}% | PF {agg['profit_factor']} | "
+              f"Net ${agg['net_pnl']} | {len(whitelist)} whitelisted | {verdict}")
 
         report[vname] = {
             "aggregate":  agg,
             "coin_table": coin_table,
+            "whitelist":  sorted(whitelist),
             "tp_pct":     tp,
             "sl_pct":     sl,
+            "adx_min":    adx_min,
         }
         summary_lines.append(
-            f"Variant {vname} (TP {tp}% SL {sl}%): "
+            f"Variant {vname} (ADX≥{adx_min}, TP {tp}% SL {sl}%): "
             f"{agg['total_trades']} trades | WR {agg['win_rate']}% | "
             f"PF {agg['profit_factor']} | Net ${agg['net_pnl']} | "
-            f"DD {agg['max_drawdown']}% | {verdict}"
+            f"DD {agg['max_drawdown']}% | Whitelist: {len(whitelist)} coins | {verdict}"
         )
 
     elapsed = time.time() - t0
 
     # ── backtest_summary.txt ──────────────────────────────────────────────────
     with open("backtest_summary.txt", "w") as f:
-        f.write("WHITELIST BACKTEST SUMMARY\n")
+        f.write("WHITELIST SCREENING SUMMARY\n")
         f.write("=" * 65 + "\n")
-        f.write(f"Strategy : ADX≥{ADX_MIN} + EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross\n")
+        f.write(f"Strategy : EMA50 slope({SLOPE_THRESH}%) + EMA9/21 cross (ADX per variant)\n")
         f.write(f"Timeframe: 15m | Period: Jul 2024 – Jun 2026\n")
         f.write(f"Universe : {len(SYMBOLS)} coins (pre-screened PF≥1.15 & ≥20 trades)\n")
-        f.write(f"Mode     : PORTFOLIO (max {MAX_POSITIONS} concurrent, shared $10k equity)\n")
-        f.write(f"Risk/trade: {RISK_PER_TRADE*100}% of current equity (compound)\n")
+        f.write(f"Mode     : SCREENING (no position cap — every signal executes)\n")
+        f.write(f"Risk/trade: {RISK_PER_TRADE*100}% of ${CAPITAL:,.0f} fixed = ${CAPITAL*RISK_PER_TRADE:.0f}/trade\n")
         f.write(f"Fees     : {FEE_RATE*100}% + {SLIP_RATE*100}% slip per side\n")
         f.write(f"Run time : {elapsed:.0f}s\n")
         f.write("=" * 65 + "\n\n")
@@ -513,7 +453,7 @@ def main():
         for vname, res in report.items():
             agg = res["aggregate"]
             f.write(f"{'='*65}\n")
-            f.write(f"VARIANT {vname}  —  TP {res['tp_pct']}% / SL {res['sl_pct']}%\n")
+            f.write(f"VARIANT {vname}  —  ADX≥{res['adx_min']} | TP {res['tp_pct']}% / SL {res['sl_pct']}%\n")
             f.write(f"{'='*65}\n")
             f.write(f"Total Trades    : {agg['total_trades']}\n")
             f.write(f"Wins / Losses   : {agg['wins']} / {agg['losses']}\n")
@@ -533,16 +473,28 @@ def main():
 
             f.write("Monthly PnL:\n")
             for mo, pnl in agg["monthly"].items():
-                bar = "█" * int(abs(pnl) / 50) if abs(pnl) > 0 else ""
+                bar = "█" * int(abs(pnl) / 100) if abs(pnl) > 0 else ""
                 sign = "+" if pnl >= 0 else ""
                 f.write(f"  {mo}: ${sign}{pnl:,.2f}  {bar}\n")
             f.write("\n")
 
-            f.write(f"ALL COINS by Profit Factor:\n")
+            f.write(f"WHITELIST (PF≥1.5, WR≥42%, ≥10 trades): {len(res['whitelist'])} coins\n")
+            f.write("  " + ", ".join(res["whitelist"]) + "\n\n")
+
+            f.write(f"TOP 30 COINS by Profit Factor:\n")
+            f.write(f"  {'Symbol':<22} {'PF':>7}  {'WR':>6}  {'Trades':>7}  {'Net PnL':>10}  {'DD':>6}\n")
+            f.write(f"  {'-'*64}\n")
+            for sym, cs in res["coin_table"][:30]:
+                pf_str = f"{cs['profit_factor']:.3f}" if cs["profit_factor"] != float("inf") else "  inf"
+                f.write(f"  {sym:<22} {pf_str:>7}  {cs['win_rate']:>5.1f}%  {cs['total_trades']:>7}  "
+                        f"${cs['net_pnl']:>9.2f}  {cs['max_drawdown']:>5.1f}%\n")
+            f.write("\n")
+
+            f.write(f"BOTTOM 20 COINS by Profit Factor:\n")
             f.write(f"  {'Symbol':<22} {'PF':>7}  {'WR':>6}  {'Trades':>7}  {'Net PnL':>10}\n")
-            f.write(f"  {'-'*58}\n")
-            for sym, cs in res["coin_table"]:
-                pf_str = f"{cs['profit_factor']:.3f}" if cs["profit_factor"] != 9999 else "  inf"
+            f.write(f"  {'-'*57}\n")
+            for sym, cs in res["coin_table"][-20:]:
+                pf_str = f"{cs['profit_factor']:.3f}" if cs["profit_factor"] != float("inf") else "  inf"
                 f.write(f"  {sym:<22} {pf_str:>7}  {cs['win_rate']:>5.1f}%  {cs['total_trades']:>7}  "
                         f"${cs['net_pnl']:>9.2f}\n")
             f.write("\n")
@@ -557,30 +509,48 @@ def main():
     # ── backtest_report.json ──────────────────────────────────────────────────
     json_out = {
         "meta": {
-            "strategy":          "ADX+EMA50slope+EMA9/21cross",
-            "mode":              "portfolio_whitelist",
+            "strategy":          "EMA50slope+EMA9/21cross+ADX_per_variant",
+            "mode":              "screening_no_cap",
             "timeframe":         INTERVAL,
             "period":            "2024-07 to 2026-06",
             "symbols_total":     len(SYMBOLS),
+            "symbols_with_data": len(all_results),
             "capital_base":      CAPITAL,
             "risk_pct":          RISK_PER_TRADE * 100,
             "fee_pct":           FEE_RATE * 100,
             "slip_pct":          SLIP_RATE * 100,
-            "max_positions":     MAX_POSITIONS,
-            "adx_min":           ADX_MIN,
             "slope_thresh":      SLOPE_THRESH,
-            "entry_rule":        "next_bar_close_after_signal",
             "run_seconds":       round(elapsed, 1),
         },
         "variants": {},
     }
 
     for vname, res in report.items():
-        agg = res["aggregate"]
         json_out["variants"][vname] = {
-            "aggregate": {k: v for k, v in agg.items() if k not in ("per_coin",)},
+            "config": {
+                "adx_min": res["adx_min"],
+                "tp_pct":  res["tp_pct"],
+                "sl_pct":  res["sl_pct"],
+            },
+            "aggregate": res["aggregate"],
+            "whitelist": res["whitelist"],
             "per_coin": [
-                {"symbol": sym, **cs}
+                {
+                    "symbol":        sym,
+                    "trades":        cs["total_trades"],
+                    "wins":          cs["wins"],
+                    "losses":        cs["losses"],
+                    "win_rate":      cs["win_rate"],
+                    "profit_factor": cs["profit_factor"] if cs["profit_factor"] != float("inf") else 9999,
+                    "net_pnl":       cs["net_pnl"],
+                    "max_drawdown":  cs["max_drawdown"],
+                    "long_trades":   cs["long_trades"],
+                    "long_wr":       cs["long_wr"],
+                    "short_trades":  cs["short_trades"],
+                    "short_wr":      cs["short_wr"],
+                    "avg_bars":      cs["avg_bars"],
+                    "usable":        cs["usable"],
+                }
                 for sym, cs in res["coin_table"]
             ],
         }
