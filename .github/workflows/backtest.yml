@@ -1,13 +1,12 @@
-name: InfinityX V8/V9 Backtest
+name: GMax V1 Backtest
 
 on:
   workflow_dispatch:
 
 jobs:
   backtest:
-    name: "V8/V9 Backtest | ADX22 | 10x Leverage"
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -18,13 +17,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run V8/V9 Backtest
-        run: python backtest_v8v9.py
+      - name: Run GMax Backtest
+        run: python backtest.py
 
-      - name: Upload results
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: V8V9_RESULTS
+          name: gmax-backtest-results
           path: |
-            v8v9_summary.txt
-            v8v9_report.json
+            backtest_summary.txt
+            backtest_report.json
+          retention-days: 30
