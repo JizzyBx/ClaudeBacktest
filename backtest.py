@@ -1,7 +1,7 @@
 """
 GMax V1 Backtest — 4 Variants (VAR_D / VAR_A / VAR_B / VAR_C)
 Strategy: EMA50 slope + EMA9/21 crossover + ADX(14) >= 22 — 15m timeframe
-Leverage: 5x | Capital: $10,000 | Risk: 0.75% per trade
+Leverage: 5x | Capital: $10,000 | Risk: 0.75% per trade | No position cap
 Coins: 117-coin Universe list | Period: 2 years (or full available history)
 Workers: 20 parallel processes
 Data: data.binance.vision monthly archives
@@ -49,10 +49,9 @@ RISK_PCT       = 0.0075          # 0.75% risk per trade
 LEVERAGE       = 5
 FEE_RATE       = 0.0005          # 0.05% per side
 SLIP_RATE      = 0.0002          # 0.02% per side
-MAX_POSITIONS  = 6
 MAX_HOLD_BARS  = 960             # 10 days at 15m
 INTERVAL       = '15m'
-WORKERS        = 20
+WORKERS        = 50
 
 # ── Date range: last 2 years from today ───────────────────────────────────────
 _NOW      = datetime.now(timezone.utc)
@@ -113,27 +112,39 @@ def _parse_rows(rows):
             continue
     return out
 
-def fetch_symbol_data(symbol):
-    """
-    Fetch all available monthly klines for `symbol` within the 2-year window.
-    Returns sorted list of (ts, open, high, low, close).
-    Falls back gracefully — coins with fewer months of history just get fewer bars.
-    """
-    all_bars = []
-    for year, month in _months_in_range():
-        rows = _fetch_month(symbol, year, month)
-        if rows is None:
-            continue
-        all_bars.extend(_parse_rows(rows))
+def fetch_symbol_month(args):
+    """Worker task: fetch a single (symbol, year, month) chunk."""
+    symbol, year, month = args
+    rows = _fetch_month(symbol, year, month)
+    if rows is None:
+        return symbol, []
+    return symbol, _parse_rows(rows)
 
-    if not all_bars:
-        return []
 
-    # Deduplicate and sort
-    seen = {}
-    for bar in all_bars:
-        seen[bar[0]] = bar
-    return sorted(seen.values(), key=lambda x: x[0])
+def fetch_all_data_parallel(coins):
+    """
+    Fire every (symbol, year, month) as its own task — ~2800 tasks at once.
+    50 workers hammering the downloads simultaneously.
+    Returns dict: symbol -> sorted list of bars.
+    """
+    tasks = [(sym, y, m) for sym in coins for y, m in _months_in_range()]
+    buckets = {sym: {} for sym in coins}
+
+    with ProcessPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(fetch_symbol_month, t): t for t in tasks}
+        done = 0
+        for fut in as_completed(futs):
+            sym, bars = fut.result()
+            for bar in bars:
+                buckets[sym][bar[0]] = bar
+            done += 1
+            if done % 200 == 0 or done == len(tasks):
+                print(f"  [Phase 1] {done}/{len(tasks)} month-chunks done...")
+
+    result = {}
+    for sym in coins:
+        result[sym] = sorted(buckets[sym].values(), key=lambda x: x[0])
+    return result
 
 # ── Indicators (pure Python, no numpy) ───────────────────────────────────────
 def _ema(values, period):
@@ -267,7 +278,7 @@ def backtest_symbol(args):
 
         # Rejection counters
         rej = {'warmup': 0, 'no_trend': 0, 'no_cross': 0,
-               'dir_mismatch': 0, 'adx_low': 0, 'max_pos': 0,
+               'dir_mismatch': 0, 'adx_low': 0,
                'in_trade': 0, 'signals': 0}
         candles_scanned = 0
 
@@ -444,8 +455,8 @@ def _build_result(symbol, vk, trades, gp, gl, net_pnl, candles_scanned, rej, bar
 # ── Portfolio-level simulation ────────────────────────────────────────────────
 def run_portfolio_simulation(all_symbol_results):
     """
-    Re-run a single portfolio pass per variant respecting MAX_POSITIONS = 6.
-    Merges all trades across symbols, sorts by entry_ts, enforces the cap.
+    Aggregate all trades across symbols per variant, sorted by entry_ts.
+    No position cap — every signal trades freely.
     Returns per-variant aggregate stats.
     """
     portfolio_results = {}
@@ -462,22 +473,10 @@ def run_portfolio_simulation(all_symbol_results):
         # Sort by entry timestamp
         all_trades.sort(key=lambda t: t['entry_ts'])
 
-        equity      = CAPITAL
-        open_count  = 0
-        accepted    = []
-        skipped_cap = 0
-        open_positions = []   # list of exit_ts for currently open trades
+        equity   = CAPITAL
+        accepted = []
 
         for t in all_trades:
-            # Remove positions that have already closed
-            open_positions = [ep for ep in open_positions if ep > t['entry_ts']]
-            open_count = len(open_positions)
-
-            if open_count >= MAX_POSITIONS:
-                skipped_cap += 1
-                continue
-
-            open_positions.append(t['exit_ts'])
             equity += t['pnl']
             accepted.append(t)
 
@@ -535,7 +534,6 @@ def run_portfolio_simulation(all_symbol_results):
             'shorts'        : len(shorts),
             'long_wr'       : round(long_wr, 2),
             'short_wr'      : round(short_wr, 2),
-            'skipped_cap'   : skipped_cap,
             'monthly_pnl'   : {k: round(v, 4) for k, v in sorted(monthly.items())},
             'accepted_trades': accepted,
         }
@@ -568,7 +566,7 @@ def write_report(all_symbol_results, portfolio):
     lines.append(f"  Coins  : {len(COINS)} (Universe list)")
     lines.append(f"  Capital: ${CAPITAL:,.0f} | Risk: {RISK_PCT*100:.2f}% | Leverage: {LEVERAGE}x")
     lines.append(f"  Fees   : {FEE_RATE*100:.3f}%/side | Slippage: {SLIP_RATE*100:.3f}%/side")
-    lines.append(f"  Max Positions: {MAX_POSITIONS} | Max Hold: {MAX_HOLD_BARS} bars")
+    lines.append(f"  No position cap | Max Hold: {MAX_HOLD_BARS} bars")
     lines.append("=" * 72)
 
     for vk, vcfg in VARIANTS.items():
@@ -596,7 +594,6 @@ def write_report(all_symbol_results, portfolio):
         lines.append(f"  Avg Loss       : ${p['avg_loss']:+.4f}")
         lines.append(f"  Longs          : {p['longs']}  WR {p['long_wr']:.2f}%")
         lines.append(f"  Shorts         : {p['shorts']}  WR {p['short_wr']:.2f}%")
-        lines.append(f"  Skipped (cap)  : {p['skipped_cap']}  (max {MAX_POSITIONS} positions hit)")
         lines.append(f"  Verdict        : {'✅ USABLE (meets PF + WR targets)' if usable else '❌ NOT USABLE'}")
 
         lines.append("")
@@ -651,19 +648,12 @@ def main():
     print(f"[GMax Backtest] Fetching data for {len(COINS)} coins | {WORKERS} workers")
     print(f"[GMax Backtest] Period: {START_DT.strftime('%Y-%m')} → {END_YEAR}-{END_MONTH:02d}")
 
-    # Phase 1: Fetch all data
-    print("[Phase 1] Downloading kline data...")
-    symbol_bars = {}
-    with ProcessPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(fetch_symbol_data, sym): sym for sym in COINS}
-        done = 0
-        for fut in as_completed(futs):
-            sym  = futs[fut]
-            bars = fut.result()
-            symbol_bars[sym] = bars
-            done += 1
-            status = f"{len(bars)} bars" if bars else "NO DATA"
-            print(f"  [{done:>3}/{len(COINS)}] {sym:<26} {status}")
+    # Phase 1: Fetch all data — every (symbol, month) is its own parallel task
+    print(f"[Phase 1] Downloading kline data — {WORKERS} workers, all months in parallel...")
+    symbol_bars = fetch_all_data_parallel(COINS)
+    for sym, bars in symbol_bars.items():
+        status = f"{len(bars)} bars" if bars else "NO DATA"
+        print(f"  {sym:<26} {status}")
 
     live_symbols = {s: b for s, b in symbol_bars.items() if len(b) >= 100}
     dead_symbols = [s for s, b in symbol_bars.items() if len(b) < 100]
@@ -691,8 +681,8 @@ def main():
             pf_str = f"PF={vd.get('profit_factor','?')}" if vd.get('total', 0) > 0 else "0 trades"
             print(f"  [{done:>3}/{len(live_symbols)}] {sym:<26} VAR_D {pf_str}")
 
-    # Phase 3: Portfolio simulation (enforce MAX_POSITIONS across symbols)
-    print("\n[Phase 3] Portfolio simulation (max 6 concurrent positions)...")
+    # Phase 3: Portfolio simulation — aggregate all trades, no position cap
+    print("\n[Phase 3] Portfolio aggregation...")
     portfolio = run_portfolio_simulation(all_symbol_results)
 
     # Phase 4: Write outputs
