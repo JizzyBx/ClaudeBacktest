@@ -6,7 +6,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -17,13 +17,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run GMax Backtest
+      - name: Run backtest
         run: python backtest.py
 
-      - name: Upload Results
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: gmax-backtest-results
+          name: backtest-results
           path: |
             backtest_summary.txt
             backtest_report.json
