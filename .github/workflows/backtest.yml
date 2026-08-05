@@ -1,4 +1,4 @@
-name: GMax V1 Backtest
+name: FVG Liquidity Sweep Backtest
 
 on:
   workflow_dispatch:
@@ -6,16 +6,16 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Run backtest
         run: python backtest.py
