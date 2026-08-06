@@ -1,4 +1,4 @@
-name: FVG Liquidity Sweep Backtest
+name: GMax V1 Backtest
 
 on:
   workflow_dispatch:
@@ -6,21 +6,51 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Run backtest
-        run: python backtest.py
+      - name: Run shard ${{ matrix.shard }}
+        run: python backtest.py ${{ matrix.shard }}
 
-      - name: Upload results
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard_${{ matrix.shard }}.json
+          retention-days: 1
+
+  merge:
+    needs: backtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download all shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          merge-multiple: true
+
+      - name: Merge and generate report
+        run: python backtest.py merge
+
+      - name: Upload final report
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
