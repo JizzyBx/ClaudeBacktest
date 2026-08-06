@@ -413,7 +413,7 @@ def backtest_symbol(sym, candles, var_cfg):
             else:
                 gross = (ep_pos - exit_p) / ep_pos
             net_pct = gross - (FEE + SLIP) * 2
-            pnl = notional * net_pct * LEVERAGE
+            pnl = notional * net_pct
 
             trades.append({
                 "symbol":      sym,
@@ -440,7 +440,7 @@ def backtest_symbol(sym, candles, var_cfg):
         else:
             gross = (ep_pos - exit_p) / ep_pos
         net_pct = gross - (FEE + SLIP) * 2
-        pnl = notional * net_pct * LEVERAGE
+        pnl = notional * net_pct
         bars_held = j - pos["bar_in"]
         trades.append({
             "symbol":      sym,
