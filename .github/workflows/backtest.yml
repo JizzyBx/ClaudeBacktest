@@ -1,4 +1,4 @@
-name: GMax V1 Backtest
+name: G Max V1 — Variant G Backtest
 
 on:
   workflow_dispatch:
