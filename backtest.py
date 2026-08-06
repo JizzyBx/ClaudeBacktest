@@ -1,20 +1,16 @@
 """
-FVG + Liquidity Sweep Backtest
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FVG + Liquidity Sweep Backtest — FLIPPED VERSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Timeframe  : 5m
-Data       : Binance Vision futures monthly zips (stdlib only)
-Strategy   :
-  LONG  — price sweeps below recent swing low (liquidity grab),
-          closes back above it, bullish FVG exists below current price,
-          enter when price retraces into FVG zone.
-  SHORT — mirror opposite.
+Strategy   : FLIPPED — if original says LONG we go SHORT, SHORT we go LONG
+             Sweep + FVG signal fires → trade in CONTINUATION direction
 TP: 1.5% | SL: 2.5% | Leverage: 5x | Max hold: 48 bars (4h)
 Capital    : $10,000 shared | Risk/trade: 0.75% | Fees: 0.05%/side | Slip: 0.02%/side
 Max positions: 6 portfolio-wide
 """
 
 import json, csv, zipfile, io, urllib.request, urllib.error
-import os, math
+import math
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -128,7 +124,7 @@ def find_bearish_fvg(candles, i):
         return (gap_top, gap_bot)
     return None
 
-# ── SIGNAL EXTRACTION ─────────────────────────────────────
+# ── SIGNAL EXTRACTION (FLIPPED) ───────────────────────────
 def extract_signals(symbol, candles):
     signals = []
     warmup = SWING_LOOKBACK + 3
@@ -159,16 +155,17 @@ def extract_signals(symbol, candles):
                 fvg = find_bearish_fvg(candles, fi)
                 if fvg: bear_fvg = fvg; break
 
+        # ✅ FLIPPED — long sweep = SHORT, short sweep = LONG
         if long_sweep and bull_fvg:
             gap_top, gap_bot = bull_fvg
             if entry_price <= gap_top * 1.002:
                 signals.append({
                     'symbol'      : symbol,
-                    'side'        : 'LONG',
+                    'side'        : 'SHORT',                    # flipped
                     'entry_ts'    : entry_bar['ts'],
                     'entry_price' : entry_price,
-                    'tp'          : entry_price * (1 + TP_PCT),
-                    'sl'          : entry_price * (1 - SL_PCT),
+                    'tp'          : entry_price * (1 - TP_PCT), # flipped
+                    'sl'          : entry_price * (1 + SL_PCT), # flipped
                     'entry_bar_i' : i,
                 })
 
@@ -177,11 +174,11 @@ def extract_signals(symbol, candles):
             if entry_price >= gap_bot * 0.998:
                 signals.append({
                     'symbol'      : symbol,
-                    'side'        : 'SHORT',
+                    'side'        : 'LONG',                     # flipped
                     'entry_ts'    : entry_bar['ts'],
                     'entry_price' : entry_price,
-                    'tp'          : entry_price * (1 - TP_PCT),
-                    'sl'          : entry_price * (1 + SL_PCT),
+                    'tp'          : entry_price * (1 + TP_PCT), # flipped
+                    'sl'          : entry_price * (1 - SL_PCT), # flipped
                     'entry_bar_i' : i,
                 })
 
@@ -195,7 +192,6 @@ def simulate_with_sizing(coin_data, raw_signals):
     open_pos = []
     closed   = []
 
-    # Build full event timeline (ts, symbol, bar_idx)
     all_events = []
     for sym, candles in coin_data.items():
         for idx, c in enumerate(candles):
@@ -210,16 +206,16 @@ def simulate_with_sizing(coin_data, raw_signals):
         candles = coin_data[sym]
         bar     = candles[bar_idx]
 
-        # ── Close positions for this symbol ──────────────
+        # ── Close positions ───────────────────────────────
         still_open = []
         for pos in open_pos:
             if pos['symbol'] != sym:
                 still_open.append(pos)
                 continue
 
-            age          = bar_idx - pos['entry_bar_i']
-            close_price  = None
-            result       = None
+            age         = bar_idx - pos['entry_bar_i']
+            close_price = None
+            result      = None
 
             if pos['side'] == 'LONG':
                 if bar['h'] >= pos['tp']:
@@ -240,8 +236,7 @@ def simulate_with_sizing(coin_data, raw_signals):
                 raw_ret = (close_price - pos['entry_price']) / pos['entry_price']
                 if pos['side'] == 'SHORT': raw_ret = -raw_ret
                 net_ret = raw_ret - (FEE + SLIP) * 2
-                # Leverage amplifies both gains and losses
-                pnl = pos['risk_usd'] * LEVERAGE * (net_ret / (SL_PCT + FEE + SLIP))
+                pnl     = pos['risk_usd'] * LEVERAGE * (net_ret / (SL_PCT + FEE + SLIP))
                 equity += pnl
                 month_key = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime('%Y-%m')
                 closed.append({
@@ -260,7 +255,7 @@ def simulate_with_sizing(coin_data, raw_signals):
                 still_open.append(pos)
         open_pos = still_open
 
-        # ── New signal at this bar ────────────────────────
+        # ── New signal ────────────────────────────────────
         key = (ts, sym)
         if key in sig_by_ts_sym:
             for sig in sig_by_ts_sym[key]:
@@ -342,25 +337,24 @@ def compute_and_print_results(trades, filter_stats):
 
     # Per coin
     coin_pf_list = []
-    syms = set(t['symbol'] for t in trades)
-    for sym in syms:
-        st = [t for t in trades if t['symbol'] == sym]
-        sw = sum(t['pnl'] for t in st if t['pnl'] > 0)
-        sl = abs(sum(t['pnl'] for t in st if t['pnl'] <= 0))
-        pf_c = sw / sl if sl > 0 else float('inf')
-        wc   = len([t for t in st if t['result'] == 'WIN'])
+    for sym in set(t['symbol'] for t in trades):
+        st  = [t for t in trades if t['symbol'] == sym]
+        sw  = sum(t['pnl'] for t in st if t['pnl'] > 0)
+        sl  = abs(sum(t['pnl'] for t in st if t['pnl'] <= 0))
+        pfc = sw / sl if sl > 0 else float('inf')
+        wc  = len([t for t in st if t['result'] == 'WIN'])
         coin_pf_list.append({
             'symbol': sym,
             'trades': len(st),
             'wr'    : wc / len(st) * 100,
             'pnl'   : round(sum(t['pnl'] for t in st), 2),
-            'pf'    : round(pf_c, 3),
+            'pf'    : round(pfc, 3),
         })
     coin_pf_list.sort(key=lambda x: x['pf'], reverse=True)
 
     # Print
     print("\n" + "="*60)
-    print("AGGREGATE RESULTS")
+    print("AGGREGATE RESULTS — FLIPPED VERSION")
     print("="*60)
     print(f"Total Trades   : {total}")
     print(f"Win Rate       : {wr:.1f}%")
@@ -387,7 +381,6 @@ def compute_and_print_results(trades, filter_stats):
         print(f"{c['symbol']:<22} {c['trades']:>6} {c['wr']:>5.1f}% {c['pnl']:>10.2f} {pf_str:>6}")
 
     print("\nMONTHLY PnL:")
-    max_abs = max(abs(v) for v in mv) if mv else 1
     for mo in sorted(monthly.keys()):
         sign = '+' if monthly[mo] >= 0 else ''
         print(f"  {mo}: {sign}${monthly[mo]:,.2f}")
@@ -402,11 +395,12 @@ def compute_and_print_results(trades, filter_stats):
 
 def save_outputs(trades, coin_pf_list, filter_stats, monthly):
     lines = [
-        "FVG + LIQUIDITY SWEEP BACKTEST SUMMARY",
+        "FVG + LIQUIDITY SWEEP — FLIPPED — BACKTEST SUMMARY",
         f"Generated : {datetime.now(timezone.utc).isoformat()}",
         f"Leverage  : {LEVERAGE}x",
         f"TP        : {TP_PCT*100:.1f}%  SL: {SL_PCT*100:.1f}%",
         f"Timeframe : {INTERVAL}",
+        f"Direction : FLIPPED (long sweep = SHORT, short sweep = LONG)",
         "",
     ]
     if trades:
@@ -416,12 +410,13 @@ def save_outputs(trades, coin_pf_list, filter_stats, monthly):
         gw    = sum(t['pnl'] for t in wins)
         gl    = abs(sum(t['pnl'] for t in trades if t['pnl'] <= 0))
         pf    = gw / gl if gl > 0 else 0
+        wr    = len(wins) / total * 100
         lines += [
             f"Trades    : {total}",
-            f"Win Rate  : {len(wins)/total*100:.1f}%",
+            f"Win Rate  : {wr:.1f}%",
             f"PF        : {pf:.3f}",
             f"Net PnL   : ${net:,.2f}",
-            f"Result    : {'PASS' if pf >= 1.5 and len(wins)/total*100 >= 42 else 'FAIL'}",
+            f"Result    : {'PASS' if pf >= 1.5 and wr >= 42 else 'FAIL'}",
         ]
     else:
         lines.append("ZERO TRADES")
@@ -431,11 +426,12 @@ def save_outputs(trades, coin_pf_list, filter_stats, monthly):
 
     report = {
         "meta": {
-            "strategy" : "FVG_LiquiditySweep_5m",
+            "strategy" : "FVG_LiquiditySweep_5m_FLIPPED",
             "leverage" : LEVERAGE,
             "tp_pct"   : TP_PCT,
             "sl_pct"   : SL_PCT,
             "interval" : INTERVAL,
+            "direction": "FLIPPED",
             "period"   : f"{START_YEAR}-{START_MONTH:02d} to {END_YEAR}-{END_MONTH:02d}",
             "coins"    : len(COINS),
             "max_pos"  : MAX_POS,
@@ -460,8 +456,6 @@ def save_outputs(trades, coin_pf_list, filter_stats, monthly):
             "win_rate"      : round(len(wins)/total*100, 2),
             "profit_factor" : round(pf, 3),
             "net_pnl"       : round(net, 2),
-            "max_dd_pct"    : 0,
-            "sharpe"        : 0,
         }
 
     with open("backtest_report.json", "w") as f:
@@ -472,9 +466,10 @@ def save_outputs(trades, coin_pf_list, filter_stats, monthly):
 # ── MAIN ──────────────────────────────────────────────────
 def run_portfolio():
     print(f"\n{'='*60}")
-    print(f"FVG + LIQUIDITY SWEEP — {INTERVAL} — {len(COINS)} coins — {LEVERAGE}x leverage")
+    print(f"FVG + LIQUIDITY SWEEP FLIPPED — {INTERVAL} — {len(COINS)} coins — {LEVERAGE}x")
     print(f"Period : {START_YEAR}-{START_MONTH:02d} to {END_YEAR}-{END_MONTH:02d}")
     print(f"TP: {TP_PCT*100:.1f}%  SL: {SL_PCT*100:.1f}%  MaxPos: {MAX_POS}")
+    print(f"Direction: FLIPPED 🔄")
     print(f"{'='*60}\n")
 
     print("Phase 1: Fetching data...")
@@ -492,7 +487,7 @@ def run_portfolio():
         return
 
     print(f"\nFetched {len(coin_data)}/{len(COINS)} coins")
-    print("\nPhase 2: Extracting signals...")
+    print("\nPhase 2: Extracting signals (FLIPPED)...")
 
     all_signals   = []
     filter_totals = defaultdict(int)
@@ -500,7 +495,6 @@ def run_portfolio():
     for sym, candles in coin_data.items():
         sigs = extract_signals(sym, candles)
         all_signals.extend(sigs)
-        # Count filter stats per coin
         warmup = SWING_LOOKBACK + 3
         filter_totals['total_bars']    += len(candles)
         filter_totals['warmup']        += min(warmup, len(candles))
@@ -510,8 +504,8 @@ def run_portfolio():
 
     print("\nPhase 3: Portfolio simulation...")
     trades = simulate_with_sizing(coin_data, all_signals)
-
     print(f"  Closed trades: {len(trades)}")
+
     print("\nPhase 4: Results...")
     compute_and_print_results(trades, filter_totals)
 
