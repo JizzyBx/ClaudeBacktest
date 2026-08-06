@@ -1,9 +1,15 @@
 """
-FVG + Liquidity Sweep Backtest — FLIPPED VERSION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FVG + Liquidity Sweep + Volume Spike + Engulfing Candle Backtest
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Timeframe  : 5m
-Strategy   : FLIPPED — if original says LONG we go SHORT, SHORT we go LONG
-             Sweep + FVG signal fires → trade in CONTINUATION direction
+Data       : Binance Vision futures monthly zips (stdlib only)
+Strategy   :
+  LONG  — price sweeps below recent swing low (liquidity grab)
+          + sweep candle volume > 1.5x 20bar avg volume
+          + next candle (confirmation) fully engulfs sweep candle body
+          + bullish FVG exists within last 20 bars
+          → Enter LONG at open of bar after confirmation candle
+  SHORT — mirror opposite
 TP: 1.5% | SL: 2.5% | Leverage: 5x | Max hold: 48 bars (4h)
 Capital    : $10,000 shared | Risk/trade: 0.75% | Fees: 0.05%/side | Slip: 0.02%/side
 Max positions: 6 portfolio-wide
@@ -28,9 +34,11 @@ MAX_POS         = 6
 TP_PCT          = 0.015
 SL_PCT          = 0.025
 MAX_HOLD_BARS   = 48
-SWING_LOOKBACK  = 10
-FVG_MIN_GAP     = 0.0002
+SWING_LOOKBACK  = 20
+FVG_MIN_GAP     = 0.001
 LEVERAGE        = 5
+VOL_MULT        = 1.5      # sweep candle volume must be > this x avg20
+VOL_AVG_PERIOD  = 20       # bars for volume average
 
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
 
@@ -58,7 +66,7 @@ COINS = [
 
 # ── DATA FETCH ────────────────────────────────────────────
 def fetch_monthly(symbol, year, month):
-    ym = f"{year}-{month:02d}"
+    ym  = f"{year}-{month:02d}"
     url = f"{BASE_URL}/{symbol}/{INTERVAL}/{symbol}-{INTERVAL}-{ym}.zip"
     try:
         with urllib.request.urlopen(url, timeout=30) as r:
@@ -74,11 +82,11 @@ def fetch_monthly(symbol, year, month):
             if ts > 10**14: ts //= 1000
             candles.append({
                 'ts': ts,
-                'o': float(row[1]),
-                'h': float(row[2]),
-                'l': float(row[3]),
-                'c': float(row[4]),
-                'v': float(row[5]),
+                'o' : float(row[1]),
+                'h' : float(row[2]),
+                'l' : float(row[3]),
+                'c' : float(row[4]),
+                'v' : float(row[5]),
             })
         return candles
     except urllib.error.HTTPError as e:
@@ -102,87 +110,159 @@ def fetch_symbol(symbol):
 # ── INDICATORS ────────────────────────────────────────────
 def swing_low(candles, i, lookback):
     if i < lookback: return None
-    return min(c['l'] for c in candles[i-lookback:i])
+    return min(c['l'] for c in candles[i - lookback:i])
 
 def swing_high(candles, i, lookback):
     if i < lookback: return None
-    return max(c['h'] for c in candles[i-lookback:i])
+    return max(c['h'] for c in candles[i - lookback:i])
 
-def find_bullish_fvg(candles, i):
-    if i < 2: return None
-    gap_bot = candles[i-2]['h']
-    gap_top = candles[i]['l']
-    if gap_top > gap_bot and (gap_top - gap_bot) / gap_bot >= FVG_MIN_GAP:
-        return (gap_top, gap_bot)
+def avg_volume(candles, i, period):
+    if i < period: return None
+    return sum(c['v'] for c in candles[i - period:i]) / period
+
+def find_bullish_fvg(candles, i, lookback=20):
+    """Bullish FVG: candle[i-2].high < candle[i].low"""
+    for fi in range(i, max(i - lookback, 2), -1):
+        gap_bot = candles[fi - 2]['h']
+        gap_top = candles[fi]['l']
+        if gap_top > gap_bot and (gap_top - gap_bot) / gap_bot >= FVG_MIN_GAP:
+            return (gap_top, gap_bot)
     return None
 
-def find_bearish_fvg(candles, i):
-    if i < 2: return None
-    gap_top = candles[i-2]['l']
-    gap_bot = candles[i]['h']
-    if gap_top > gap_bot and (gap_top - gap_bot) / gap_bot >= FVG_MIN_GAP:
-        return (gap_top, gap_bot)
+def find_bearish_fvg(candles, i, lookback=20):
+    """Bearish FVG: candle[i-2].low > candle[i].high"""
+    for fi in range(i, max(i - lookback, 2), -1):
+        gap_top = candles[fi - 2]['l']
+        gap_bot = candles[fi]['h']
+        if gap_top > gap_bot and (gap_top - gap_bot) / gap_bot >= FVG_MIN_GAP:
+            return (gap_top, gap_bot)
     return None
 
-# ── SIGNAL EXTRACTION (FLIPPED) ───────────────────────────
+def is_bullish_engulf(sweep_bar, confirm_bar):
+    """
+    Confirmation candle fully engulfs sweep candle body.
+    Confirm must be bullish (close > open).
+    Confirm open <= sweep open, confirm close >= sweep close.
+    """
+    sweep_body_top = max(sweep_bar['o'], sweep_bar['c'])
+    sweep_body_bot = min(sweep_bar['o'], sweep_bar['c'])
+    confirm_bullish = confirm_bar['c'] > confirm_bar['o']
+    engulfs = (confirm_bar['o'] <= sweep_body_bot and
+               confirm_bar['c'] >= sweep_body_top)
+    return confirm_bullish and engulfs
+
+def is_bearish_engulf(sweep_bar, confirm_bar):
+    """
+    Confirmation candle fully engulfs sweep candle body.
+    Confirm must be bearish (close < open).
+    Confirm open >= sweep open, confirm close <= sweep close.
+    """
+    sweep_body_top = max(sweep_bar['o'], sweep_bar['c'])
+    sweep_body_bot = min(sweep_bar['o'], sweep_bar['c'])
+    confirm_bearish = confirm_bar['c'] < confirm_bar['o']
+    engulfs = (confirm_bar['o'] >= sweep_body_top and
+               confirm_bar['c'] <= sweep_body_bot)
+    return confirm_bearish and engulfs
+
+# ── SIGNAL EXTRACTION ─────────────────────────────────────
 def extract_signals(symbol, candles):
+    """
+    Signal structure:
+      bar[i-2] = sweep bar       (liquidity grab)
+      bar[i-1] = confirm bar     (engulfing candle)
+      bar[i]   = entry bar       (enter at open)
+
+    Filters in order:
+      1. Warmup guard
+      2. Swing level exists
+      3. Sweep occurred on bar[i-2]
+      4. Volume spike on sweep bar
+      5. FVG exists within 20 bars of sweep
+      6. Engulfing confirmation on bar[i-1]
+    """
     signals = []
-    warmup = SWING_LOOKBACK + 3
+    warmup  = SWING_LOOKBACK + VOL_AVG_PERIOD + 3
+
+    # filter counters
+    stats = defaultdict(int)
 
     for i in range(warmup, len(candles)):
-        si = i - 1
-        signal_bar  = candles[si]
+        stats['total_bars'] += 1
+
+        sweep_bar   = candles[i - 2]
+        confirm_bar = candles[i - 1]
         entry_bar   = candles[i]
         entry_price = entry_bar['o']
 
-        s_low  = swing_low(candles, si, SWING_LOOKBACK)
-        s_high = swing_high(candles, si, SWING_LOOKBACK)
+        # ── 1. Swing levels ───────────────────────────────
+        s_low  = swing_low(candles,  i - 2, SWING_LOOKBACK)
+        s_high = swing_high(candles, i - 2, SWING_LOOKBACK)
         if s_low is None or s_high is None:
+            stats['no_swing'] += 1
             continue
 
-        long_sweep  = signal_bar['l'] < s_low  and signal_bar['c'] > s_low
-        short_sweep = signal_bar['h'] > s_high and signal_bar['c'] < s_high
+        # ── 2. Sweep detection ────────────────────────────
+        long_sweep  = sweep_bar['l'] < s_low  and sweep_bar['c'] > s_low
+        short_sweep = sweep_bar['h'] > s_high and sweep_bar['c'] < s_high
 
-        bull_fvg = bear_fvg = None
+        if not long_sweep and not short_sweep:
+            stats['no_sweep'] += 1
+            continue
 
+        # ── 3. Volume spike on sweep bar ──────────────────
+        avg_vol = avg_volume(candles, i - 2, VOL_AVG_PERIOD)
+        if avg_vol is None or avg_vol == 0:
+            stats['no_vol_data'] += 1
+            continue
+
+        vol_ok = sweep_bar['v'] >= avg_vol * VOL_MULT
+        if not vol_ok:
+            stats['vol_too_low'] += 1
+            continue
+
+        # ── 4. FVG check ──────────────────────────────────
+        bull_fvg = find_bullish_fvg(candles, i - 2) if long_sweep  else None
+        bear_fvg = find_bearish_fvg(candles, i - 2) if short_sweep else None
+
+        if long_sweep  and not bull_fvg:
+            stats['no_fvg'] += 1
+            continue
+        if short_sweep and not bear_fvg:
+            stats['no_fvg'] += 1
+            continue
+
+        # ── 5. Engulfing confirmation ─────────────────────
         if long_sweep:
-            for fi in range(si, max(si - 20, 2), -1):
-                fvg = find_bullish_fvg(candles, fi)
-                if fvg: bull_fvg = fvg; break
+            if not is_bullish_engulf(sweep_bar, confirm_bar):
+                stats['no_engulf'] += 1
+                continue
+            stats['signals_long'] += 1
+            signals.append({
+                'symbol'      : symbol,
+                'side'        : 'LONG',
+                'entry_ts'    : entry_bar['ts'],
+                'entry_price' : entry_price,
+                'tp'          : entry_price * (1 + TP_PCT),
+                'sl'          : entry_price * (1 - SL_PCT),
+                'entry_bar_i' : i,
+            })
 
-        if short_sweep:
-            for fi in range(si, max(si - 20, 2), -1):
-                fvg = find_bearish_fvg(candles, fi)
-                if fvg: bear_fvg = fvg; break
+        elif short_sweep:
+            if not is_bearish_engulf(sweep_bar, confirm_bar):
+                stats['no_engulf'] += 1
+                continue
+            stats['signals_short'] += 1
+            signals.append({
+                'symbol'      : symbol,
+                'side'        : 'SHORT',
+                'entry_ts'    : entry_bar['ts'],
+                'entry_price' : entry_price,
+                'tp'          : entry_price * (1 - TP_PCT),
+                'sl'          : entry_price * (1 + SL_PCT),
+                'entry_bar_i' : i,
+            })
 
-        # ✅ FLIPPED — long sweep = SHORT, short sweep = LONG
-        if long_sweep and bull_fvg:
-            gap_top, gap_bot = bull_fvg
-            if entry_price <= gap_top * 1.002:
-                signals.append({
-                    'symbol'      : symbol,
-                    'side'        : 'SHORT',                    # flipped
-                    'entry_ts'    : entry_bar['ts'],
-                    'entry_price' : entry_price,
-                    'tp'          : entry_price * (1 - TP_PCT), # flipped
-                    'sl'          : entry_price * (1 + SL_PCT), # flipped
-                    'entry_bar_i' : i,
-                })
-
-        elif short_sweep and bear_fvg:
-            gap_top, gap_bot = bear_fvg
-            if entry_price >= gap_bot * 0.998:
-                signals.append({
-                    'symbol'      : symbol,
-                    'side'        : 'LONG',                     # flipped
-                    'entry_ts'    : entry_bar['ts'],
-                    'entry_price' : entry_price,
-                    'tp'          : entry_price * (1 + TP_PCT), # flipped
-                    'sl'          : entry_price * (1 - SL_PCT), # flipped
-                    'entry_bar_i' : i,
-                })
-
-    return signals
+    return signals, stats
 
 # ── PORTFOLIO SIMULATION ──────────────────────────────────
 def simulate_with_sizing(coin_data, raw_signals):
@@ -238,7 +318,8 @@ def simulate_with_sizing(coin_data, raw_signals):
                 net_ret = raw_ret - (FEE + SLIP) * 2
                 pnl     = pos['risk_usd'] * LEVERAGE * (net_ret / (SL_PCT + FEE + SLIP))
                 equity += pnl
-                month_key = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime('%Y-%m')
+                month_key = datetime.fromtimestamp(
+                    ts / 1000, tz=timezone.utc).strftime('%Y-%m')
                 closed.append({
                     'symbol'      : sym,
                     'side'        : pos['side'],
@@ -278,8 +359,9 @@ def simulate_with_sizing(coin_data, raw_signals):
 # ── RESULTS ───────────────────────────────────────────────
 def compute_and_print_results(trades, filter_stats):
     if not trades:
-        print("\n⚠️  ZERO TRADES — check filter stats:")
-        print(json.dumps(dict(filter_stats), indent=2))
+        print("\n⚠️  ZERO TRADES — filter breakdown:")
+        for k, v in filter_stats.items():
+            print(f"  {k:<25}: {v:,}")
         save_outputs([], [], filter_stats, {})
         return
 
@@ -346,15 +428,14 @@ def compute_and_print_results(trades, filter_stats):
         coin_pf_list.append({
             'symbol': sym,
             'trades': len(st),
-            'wr'    : wc / len(st) * 100,
+            'wr'    : round(wc / len(st) * 100, 1),
             'pnl'   : round(sum(t['pnl'] for t in st), 2),
             'pf'    : round(pfc, 3),
         })
     coin_pf_list.sort(key=lambda x: x['pf'], reverse=True)
 
-    # Print
     print("\n" + "="*60)
-    print("AGGREGATE RESULTS — FLIPPED VERSION")
+    print("AGGREGATE RESULTS — FVG + SWEEP + VOLUME + ENGULF")
     print("="*60)
     print(f"Total Trades   : {total}")
     print(f"Win Rate       : {wr:.1f}%")
@@ -385,22 +466,24 @@ def compute_and_print_results(trades, filter_stats):
         sign = '+' if monthly[mo] >= 0 else ''
         print(f"  {mo}: {sign}${monthly[mo]:,.2f}")
 
-    print("\nFILTER STATS:")
+    print("\nFILTER REJECTION STATS:")
     tb = filter_stats.get('total_bars', 1)
     for k, v in filter_stats.items():
         if k == 'total_bars': continue
-        print(f"  {k:<25}: {v:>8,}  ({v/tb*100:.1f}%)")
+        print(f"  {k:<25}: {v:>8,}  ({v/tb*100:.2f}%)")
 
     save_outputs(trades, coin_pf_list, filter_stats, monthly)
 
 def save_outputs(trades, coin_pf_list, filter_stats, monthly):
     lines = [
-        "FVG + LIQUIDITY SWEEP — FLIPPED — BACKTEST SUMMARY",
-        f"Generated : {datetime.now(timezone.utc).isoformat()}",
-        f"Leverage  : {LEVERAGE}x",
-        f"TP        : {TP_PCT*100:.1f}%  SL: {SL_PCT*100:.1f}%",
-        f"Timeframe : {INTERVAL}",
-        f"Direction : FLIPPED (long sweep = SHORT, short sweep = LONG)",
+        "FVG + LIQUIDITY SWEEP + VOLUME + ENGULF BACKTEST",
+        f"Generated  : {datetime.now(timezone.utc).isoformat()}",
+        f"Leverage   : {LEVERAGE}x",
+        f"TP/SL      : {TP_PCT*100:.1f}% / {SL_PCT*100:.1f}%",
+        f"Timeframe  : {INTERVAL}",
+        f"Vol Filter : {VOL_MULT}x avg{VOL_AVG_PERIOD}",
+        f"FVG Gap Min: {FVG_MIN_GAP*100:.2f}%",
+        f"Swing LB   : {SWING_LOOKBACK} bars",
         "",
     ]
     if trades:
@@ -412,30 +495,33 @@ def save_outputs(trades, coin_pf_list, filter_stats, monthly):
         pf    = gw / gl if gl > 0 else 0
         wr    = len(wins) / total * 100
         lines += [
-            f"Trades    : {total}",
-            f"Win Rate  : {wr:.1f}%",
-            f"PF        : {pf:.3f}",
-            f"Net PnL   : ${net:,.2f}",
-            f"Result    : {'PASS' if pf >= 1.5 and wr >= 42 else 'FAIL'}",
+            f"Trades     : {total}",
+            f"Win Rate   : {wr:.1f}%",
+            f"PF         : {pf:.3f}",
+            f"Net PnL    : ${net:,.2f}",
+            f"Result     : {'PASS' if pf >= 1.5 and wr >= 42 else 'FAIL'}",
         ]
     else:
-        lines.append("ZERO TRADES")
+        lines.append("ZERO TRADES — check filter stats")
 
     with open("backtest_summary.txt", "w") as f:
         f.write("\n".join(lines))
 
     report = {
         "meta": {
-            "strategy" : "FVG_LiquiditySweep_5m_FLIPPED",
-            "leverage" : LEVERAGE,
-            "tp_pct"   : TP_PCT,
-            "sl_pct"   : SL_PCT,
-            "interval" : INTERVAL,
-            "direction": "FLIPPED",
-            "period"   : f"{START_YEAR}-{START_MONTH:02d} to {END_YEAR}-{END_MONTH:02d}",
-            "coins"    : len(COINS),
-            "max_pos"  : MAX_POS,
-            "risk_pct" : RISK_PCT,
+            "strategy"   : "FVG_Sweep_Volume_Engulf_5m",
+            "leverage"   : LEVERAGE,
+            "tp_pct"     : TP_PCT,
+            "sl_pct"     : SL_PCT,
+            "interval"   : INTERVAL,
+            "vol_mult"   : VOL_MULT,
+            "vol_period" : VOL_AVG_PERIOD,
+            "fvg_gap"    : FVG_MIN_GAP,
+            "swing_lb"   : SWING_LOOKBACK,
+            "period"     : f"{START_YEAR}-{START_MONTH:02d} to {END_YEAR}-{END_MONTH:02d}",
+            "coins"      : len(COINS),
+            "max_pos"    : MAX_POS,
+            "risk_pct"   : RISK_PCT,
         },
         "aggregate"    : {},
         "per_coin"     : coin_pf_list,
@@ -453,7 +539,7 @@ def save_outputs(trades, coin_pf_list, filter_stats, monthly):
         pf    = gw / gl if gl > 0 else 0
         report["aggregate"] = {
             "total_trades"  : total,
-            "win_rate"      : round(len(wins)/total*100, 2),
+            "win_rate"      : round(len(wins) / total * 100, 2),
             "profit_factor" : round(pf, 3),
             "net_pnl"       : round(net, 2),
         }
@@ -466,17 +552,18 @@ def save_outputs(trades, coin_pf_list, filter_stats, monthly):
 # ── MAIN ──────────────────────────────────────────────────
 def run_portfolio():
     print(f"\n{'='*60}")
-    print(f"FVG + LIQUIDITY SWEEP FLIPPED — {INTERVAL} — {len(COINS)} coins — {LEVERAGE}x")
-    print(f"Period : {START_YEAR}-{START_MONTH:02d} to {END_YEAR}-{END_MONTH:02d}")
-    print(f"TP: {TP_PCT*100:.1f}%  SL: {SL_PCT*100:.1f}%  MaxPos: {MAX_POS}")
-    print(f"Direction: FLIPPED 🔄")
+    print(f"FVG + SWEEP + VOLUME + ENGULF — {INTERVAL} — {len(COINS)} coins — {LEVERAGE}x")
+    print(f"Period    : {START_YEAR}-{START_MONTH:02d} to {END_YEAR}-{END_MONTH:02d}")
+    print(f"TP/SL     : {TP_PCT*100:.1f}% / {SL_PCT*100:.1f}%  MaxPos: {MAX_POS}")
+    print(f"Vol Filter: {VOL_MULT}x avg{VOL_AVG_PERIOD}  FVG gap: {FVG_MIN_GAP*100:.2f}%")
+    print(f"Swing LB  : {SWING_LOOKBACK} bars")
     print(f"{'='*60}\n")
 
     print("Phase 1: Fetching data...")
     coin_data = {}
     for sym in COINS:
         candles = fetch_symbol(sym)
-        if len(candles) < 100:
+        if len(candles) < 200:
             print(f"  SKIP {sym} — {len(candles)} candles")
             continue
         coin_data[sym] = candles
@@ -487,20 +574,29 @@ def run_portfolio():
         return
 
     print(f"\nFetched {len(coin_data)}/{len(COINS)} coins")
-    print("\nPhase 2: Extracting signals (FLIPPED)...")
+    print("\nPhase 2: Extracting signals...")
 
     all_signals   = []
     filter_totals = defaultdict(int)
 
     for sym, candles in coin_data.items():
-        sigs = extract_signals(sym, candles)
+        sigs, stats = extract_signals(sym, candles)
         all_signals.extend(sigs)
-        warmup = SWING_LOOKBACK + 3
-        filter_totals['total_bars']    += len(candles)
-        filter_totals['warmup']        += min(warmup, len(candles))
-        filter_totals['signals_fired'] += len(sigs)
+        for k, v in stats.items():
+            filter_totals[k] += v
 
-    print(f"  Total signals: {len(all_signals)}")
+    total_sigs = filter_totals.get('signals_long', 0) + filter_totals.get('signals_short', 0)
+    print(f"  Raw signals : {total_sigs}")
+    print(f"  Long        : {filter_totals.get('signals_long', 0)}")
+    print(f"  Short       : {filter_totals.get('signals_short', 0)}")
+    print(f"  Killed by vol filter   : {filter_totals.get('vol_too_low', 0):,}")
+    print(f"  Killed by FVG filter   : {filter_totals.get('no_fvg', 0):,}")
+    print(f"  Killed by engulf filter: {filter_totals.get('no_engulf', 0):,}")
+
+    if total_sigs == 0:
+        print("\n⚠️  ZERO SIGNALS — filters too strict or data issue")
+        save_outputs([], [], dict(filter_totals), {})
+        return
 
     print("\nPhase 3: Portfolio simulation...")
     trades = simulate_with_sizing(coin_data, all_signals)
