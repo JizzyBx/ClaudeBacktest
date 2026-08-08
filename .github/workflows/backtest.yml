@@ -1,4 +1,4 @@
-name: Strategy G VAR_D — ADX TP Variant Backtest
+name: Strategy G VAR_D — Indicator TP Exit Backtest
 
 on:
   workflow_dispatch:
