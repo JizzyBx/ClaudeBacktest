@@ -49,14 +49,16 @@ TIMEFRAMES_NEEDED = ['15m', '1h']  # union of all TFs used by the 8 strategies
 # ── Strategy Definitions ──────────────────────────────────────────
 # Each strategy declares: id, name, primary tf, secondary tf (or None), tp/sl pct
 STRATEGIES = {
-    'S1_EMA_RIBBON':   {'name': 'EMA Ribbon Trend + ADX',        'tf': '15m', 'tf2': None,  'tp': 0.035, 'sl': 0.14},
-    'S2_FVG_SWEEP':    {'name': 'FVG + Liquidity Sweep',         'tf': '15m', 'tf2': None,  'tp': 0.03,  'sl': 0.12},
-    'S3_SR_PINBAR':    {'name': 'S/R Zone + Pin Bar Rejection',  'tf': '1h',  'tf2': None,  'tp': 0.04,  'sl': 0.15},
-    'S4_BB_MEANREV':   {'name': 'BB Mean-Reversion (regime)',    'tf': '15m', 'tf2': None,  'tp': 0.025, 'sl': 0.10},
-    'S5_DONCHIAN_VOL': {'name': 'Donchian Breakout + Volume',    'tf': '1h',  'tf2': None,  'tp': 0.05,  'sl': 0.16},
-    'S6_VWAP_REV':     {'name': 'VWAP Session Reversion',        'tf': '15m', 'tf2': None,  'tp': 0.02,  'sl': 0.09},
-    'S7_VOL_SQUEEZE':  {'name': 'Volatility Squeeze Breakout',   'tf': '1h',  'tf2': None,  'tp': 0.045, 'sl': 0.15},
-    'S8_MTF_CONFLUENCE':{'name': 'MTF Confluence (1h bias+15m)', 'tf': '15m', 'tf2': '1h',  'tp': 0.03,  'sl': 0.13},
+    'S1_EMA_RIBBON':    {'name': 'EMA Ribbon Trend + ADX (tightened)',   'tf': '15m', 'tf2': None, 'tp': 0.06,  'sl': 0.045},
+    'S2_FVG_SWEEP':     {'name': 'FVG + Liquidity Sweep (tightened)',    'tf': '15m', 'tf2': None, 'tp': 0.05,  'sl': 0.035},
+    'S3_SR_PINBAR':     {'name': 'S/R Zone + Pin Bar Rejection (tight)', 'tf': '1h',  'tf2': None, 'tp': 0.055, 'sl': 0.04},
+    'S4_BB_MEANREV':    {'name': 'BB Mean-Reversion (regime, tight)',    'tf': '15m', 'tf2': None, 'tp': 0.035, 'sl': 0.03},
+    'S5_DONCHIAN_VOL':  {'name': 'Donchian Breakout + Volume (tight)',   'tf': '1h',  'tf2': None, 'tp': 0.07,  'sl': 0.05},
+    'S6_VWAP_REV':      {'name': 'VWAP Session Reversion (tightened)',   'tf': '15m', 'tf2': None, 'tp': 0.03,  'sl': 0.02},
+    'S7_VOL_SQUEEZE':   {'name': 'Volatility Squeeze Breakout (tight)',  'tf': '1h',  'tf2': None, 'tp': 0.065, 'sl': 0.045},
+    'S8_MTF_CONFLUENCE':{'name': 'MTF Confluence (1h bias+15m, tight)',  'tf': '15m', 'tf2': '1h', 'tp': 0.05,  'sl': 0.035},
+    'S9_ICT_OB_BOS':    {'name': 'ICT Order Block + Break of Structure', 'tf': '15m', 'tf2': None, 'tp': 0.045, 'sl': 0.03},
+    'S10_ICT_OTE':      {'name': 'ICT OTE (Fib 62-79%) + Liquidity Sweep','tf': '15m','tf2': None, 'tp': 0.05,  'sl': 0.032},
 }
 
 MAX_BARS_BY_TF = {'15m': 60, '1h': 40}   # max hold bars before force-close
@@ -255,128 +257,271 @@ def percentile_rank(values, idx, lookback=200):
 # ── Signal functions — each returns 'buy' / 'sell' / None on bar i (closed bar) ──
 
 def sig_ema_ribbon(ctx, i):
-    e9, e21, e50, adx = ctx['e9'], ctx['e21'], ctx['e50'], ctx['adx']
+    # Tightened: higher ADX floor, stronger EMA50 slope requirement, and price must
+    # already be on the correct side of EMA50 (trend confirmed, not just crossing).
+    e9, e21, e50, adx, closes = ctx['e9'], ctx['e21'], ctx['e50'], ctx['adx'], ctx['closes']
     if None in (e9[i], e21[i], e50[i], adx[i], e9[i-1], e21[i-1]):
         return None
-    if adx[i] < 22:
+    if adx[i] < 26:
         return None
-    slope = (e50[i] - e50[i-5]) / e50[i-5] * 100 if i >= 5 and e50[i-5] else 0
+    if i < 5 or e50[i-5] is None:
+        return None
+    slope = (e50[i] - e50[i-5]) / e50[i-5] * 100
     crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
     crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
-    if crossed_up and slope > 0:
+    if crossed_up and slope > 0.15 and closes[i] > e50[i]:
         return 'buy'
-    if crossed_dn and slope < 0:
+    if crossed_dn and slope < -0.15 and closes[i] < e50[i]:
         return 'sell'
     return None
 
 def sig_fvg_sweep(ctx, i):
+    # Tightened: require a genuinely fresh sweep (min penetration depth) and a
+    # meaningful FVG gap size (not a 1-tick noise gap), plus EMA50 trend agreement.
     highs, lows, closes = ctx['highs'], ctx['lows'], ctx['closes']
-    e21 = ctx['e21']
-    if i < 25 or e21[i] is None:
+    e21, e50 = ctx['e21'], ctx['e50']
+    if i < 25 or e21[i] is None or e50[i] is None:
         return None
     lookback_high = max(highs[i-20:i-2])
     lookback_low = min(lows[i-20:i-2])
-    swept_high = highs[i-1] > lookback_high and closes[i-1] < lookback_high
-    swept_low = lows[i-1] < lookback_low and closes[i-1] > lookback_low
-    # simple 3-candle FVG: gap between candle i-2 high and candle i low (bullish) etc.
-    bull_fvg = lows[i] > highs[i-2]
-    bear_fvg = highs[i] < lows[i-2]
-    if swept_low and bull_fvg and closes[i] > e21[i]:
+    sweep_depth_hi = (highs[i-1] - lookback_high) / lookback_high if lookback_high else 0
+    sweep_depth_lo = (lookback_low - lows[i-1]) / lookback_low if lookback_low else 0
+    swept_high = highs[i-1] > lookback_high and closes[i-1] < lookback_high and sweep_depth_hi > 0.001
+    swept_low = lows[i-1] < lookback_low and closes[i-1] > lookback_low and sweep_depth_lo > 0.001
+    bull_fvg = lows[i] > highs[i-2] and (lows[i] - highs[i-2]) / highs[i-2] > 0.0015
+    bear_fvg = highs[i] < lows[i-2] and (lows[i-2] - highs[i]) / lows[i-2] > 0.0015
+    if swept_low and bull_fvg and closes[i] > e21[i] > e50[i]:
         return 'buy'
-    if swept_high and bear_fvg and closes[i] < e21[i]:
+    if swept_high and bear_fvg and closes[i] < e21[i] < e50[i]:
         return 'sell'
     return None
 
 def sig_sr_pinbar(ctx, i):
+    # Tightened: stricter pin-bar geometry (3x wick vs body, not 2x), zone must be
+    # touched more precisely, and ADX filter avoids choppy no-structure conditions.
     highs, lows, closes, opens = ctx['highs'], ctx['lows'], ctx['closes'], ctx['opens']
-    e50 = ctx['e50']
-    if i < 30 or e50[i] is None:
+    e50, adx = ctx['e50'], ctx['adx']
+    if i < 30 or e50[i] is None or adx[i] is None:
         return None
     zone_high = max(highs[i-20:i])
     zone_low = min(lows[i-20:i])
     body = abs(closes[i] - opens[i])
     rng = highs[i] - lows[i]
-    if rng == 0:
+    if rng == 0 or body == 0:
         return None
     lower_wick = min(opens[i], closes[i]) - lows[i]
     upper_wick = highs[i] - max(opens[i], closes[i])
-    is_pin_bull = lower_wick > body * 2 and lower_wick > rng * 0.55
-    is_pin_bear = upper_wick > body * 2 and upper_wick > rng * 0.55
-    near_support = lows[i] <= zone_low * 1.01
-    near_resistance = highs[i] >= zone_high * 0.99
-    if is_pin_bull and near_support and closes[i] > e50[i]:
+    is_pin_bull = lower_wick > body * 3 and lower_wick > rng * 0.62
+    is_pin_bear = upper_wick > body * 3 and upper_wick > rng * 0.62
+    near_support = lows[i] <= zone_low * 1.005
+    near_resistance = highs[i] >= zone_high * 0.995
+    if is_pin_bull and near_support and closes[i] > e50[i] and adx[i] > 18:
         return 'buy'
-    if is_pin_bear and near_resistance and closes[i] < e50[i]:
+    if is_pin_bear and near_resistance and closes[i] < e50[i] and adx[i] > 18:
         return 'sell'
     return None
 
 def sig_bb_meanrev(ctx, i):
+    # Tightened: deeper RSI extremes, stricter regime filter (ADX<18 not <20),
+    # and require price to actually close back inside the band on THIS bar vs prior
+    # (rejection confirmed, not just still falling).
     closes = ctx['closes']
     bb_low, bb_up, rsi, adx = ctx['bb_low'], ctx['bb_up'], ctx['rsi'], ctx['adx']
-    if None in (bb_low[i], bb_up[i], rsi[i], adx[i]):
+    if i < 1 or None in (bb_low[i], bb_up[i], rsi[i], adx[i], bb_low[i-1], bb_up[i-1]):
         return None
-    if adx[i] >= 20:   # only trade ranges
+    if adx[i] >= 18:
         return None
-    if closes[i] <= bb_low[i] and rsi[i] < 30:
+    touched_low_prev = closes[i-1] <= bb_low[i-1]
+    touched_high_prev = closes[i-1] >= bb_up[i-1]
+    if touched_low_prev and closes[i] > bb_low[i] and rsi[i] < 25:
         return 'buy'
-    if closes[i] >= bb_up[i] and rsi[i] > 70:
+    if touched_high_prev and closes[i] < bb_up[i] and rsi[i] > 75:
         return 'sell'
     return None
 
 def sig_donchian_vol(ctx, i):
-    closes, vols = ctx['closes'], ctx['vols']
+    # Tightened: bigger volume spike threshold, and require ADX confirming trend
+    # strength so we're not breaking out into immediate chop.
+    closes, vols, adx = ctx['closes'], ctx['vols'], ctx['adx']
     dc_up, dc_low = ctx['dc_up'], ctx['dc_low']
-    if i < 25 or dc_up[i-1] is None or dc_low[i-1] is None:
+    if i < 25 or dc_up[i-1] is None or dc_low[i-1] is None or adx[i] is None:
         return None
     avg_vol = sum(vols[i-20:i]) / 20
-    vol_spike = vols[i] > avg_vol * 1.5
-    if closes[i] > dc_up[i-1] and vol_spike:
+    vol_spike = vols[i] > avg_vol * 2.0
+    if closes[i] > dc_up[i-1] and vol_spike and adx[i] > 20:
         return 'buy'
-    if closes[i] < dc_low[i-1] and vol_spike:
+    if closes[i] < dc_low[i-1] and vol_spike and adx[i] > 20:
         return 'sell'
     return None
 
 def sig_vwap_rev(ctx, i):
+    # Tightened: this was the noisiest strategy (142k trades) because deviation
+    # persists for many consecutive bars, re-firing every candle. Now requires a
+    # fresh extreme (deeper than the recent 10-bar max deviation) AND a reversal
+    # candle close back toward VWAP, so it only fires once per stretch, not every bar.
     closes = ctx['closes']
     vwap = ctx['vwap']
-    if vwap[i] is None:
+    if i < 10 or vwap[i] is None or vwap[i-1] is None:
+        return None
+    devs = []
+    for j in range(i-10, i):
+        if vwap[j] is not None:
+            devs.append((closes[j] - vwap[j]) / vwap[j] * 100)
+    if not devs:
         return None
     dev = (closes[i] - vwap[i]) / vwap[i] * 100
-    if dev < -2.0:
+    dev_prev = (closes[i-1] - vwap[i-1]) / vwap[i-1] * 100
+    min_recent = min(devs)
+    max_recent = max(devs)
+    # fresh extreme stretch + this bar shows reversal (less extreme than prior bar)
+    if dev_prev <= min_recent and dev_prev < -3.0 and dev > dev_prev:
         return 'buy'
-    if dev > 2.0:
+    if dev_prev >= max_recent and dev_prev > 3.0 and dev < dev_prev:
         return 'sell'
     return None
 
 def sig_vol_squeeze(ctx, i):
-    closes = ctx['closes']
+    # Tightened: stricter percentile (top 5% compression, not 10%), and require
+    # volume confirmation on the expansion breakout bar.
+    closes, vols = ctx['closes'], ctx['vols']
     bb_up, bb_low, bb_width = ctx['bb_up'], ctx['bb_low'], ctx['bb_width']
     if i < 210 or bb_width[i-1] is None:
         return None
     pct = percentile_rank(bb_width, i - 1, lookback=200)
-    if pct is None or pct > 10:
+    if pct is None or pct > 5:
         return None
-    if closes[i] > bb_up[i]:
+    avg_vol = sum(vols[i-20:i]) / 20
+    vol_conf = vols[i] > avg_vol * 1.3
+    if closes[i] > bb_up[i] and vol_conf:
         return 'buy'
-    if closes[i] < bb_low[i]:
+    if closes[i] < bb_low[i] and vol_conf:
         return 'sell'
     return None
 
 def sig_mtf_confluence(ctx, i, htf_ctx, htf_idx):
-    e9, e21 = ctx['e9'], ctx['e21']
+    # Tightened: require the 1h EMA separation to be meaningful (not just barely
+    # crossed) and 15m ADX confirming momentum, cutting weak-confluence trades.
+    e9, e21, adx = ctx['e9'], ctx['e21'], ctx['adx']
     if htf_idx is None or htf_idx < 1:
         return None
     htf_e9, htf_e21 = htf_ctx['e9'], htf_ctx['e21']
-    if None in (e9[i], e21[i], e9[i-1], e21[i-1], htf_e9[htf_idx], htf_e21[htf_idx]):
+    if None in (e9[i], e21[i], e9[i-1], e21[i-1], adx[i], htf_e9[htf_idx], htf_e21[htf_idx]):
         return None
-    htf_bull = htf_e9[htf_idx] > htf_e21[htf_idx]
-    htf_bear = htf_e9[htf_idx] < htf_e21[htf_idx]
+    htf_sep = (htf_e9[htf_idx] - htf_e21[htf_idx]) / htf_e21[htf_idx] * 100 if htf_e21[htf_idx] else 0
+    htf_bull = htf_sep > 0.2
+    htf_bear = htf_sep < -0.2
     crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
     crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
-    if crossed_up and htf_bull:
+    if crossed_up and htf_bull and adx[i] > 20:
         return 'buy'
-    if crossed_dn and htf_bear:
+    if crossed_dn and htf_bear and adx[i] > 20:
         return 'sell'
+    return None
+
+def sig_ict_ob_bos(ctx, i):
+    """
+    ICT Order Block + Break of Structure.
+    1. Find the most recent swing high/low over a lookback window (structure points).
+    2. A Break of Structure (BOS) = price closes beyond that swing point.
+    3. The Order Block = the last opposite-colored candle immediately before the
+       impulse move that caused the BOS.
+    4. Entry trigger: price retraces back INTO that order block's body range and
+       shows a reaction (close back in the direction of the break).
+    Very selective by construction — structure breaks are infrequent.
+    """
+    highs, lows, closes, opens = ctx['highs'], ctx['lows'], ctx['closes'], ctx['opens']
+    if i < 40:
+        return None
+    swing_window = 15
+    recent_swing_high = max(highs[i-swing_window-5:i-5])
+    recent_swing_low = min(lows[i-swing_window-5:i-5])
+
+    # bullish BOS: some bar in the last 5 bars closed above recent_swing_high
+    bos_up_idx = None
+    for j in range(i-5, i):
+        if closes[j] > recent_swing_high:
+            bos_up_idx = j
+            break
+    bos_dn_idx = None
+    for j in range(i-5, i):
+        if closes[j] < recent_swing_low:
+            bos_dn_idx = j
+            break
+
+    if bos_up_idx is not None:
+        # order block = last bearish (red) candle before the impulse leg up
+        ob_idx = None
+        for j in range(bos_up_idx - 1, max(bos_up_idx - 8, 0), -1):
+            if closes[j] < opens[j]:
+                ob_idx = j
+                break
+        if ob_idx is not None:
+            ob_low, ob_high = min(opens[ob_idx], closes[ob_idx]), max(opens[ob_idx], closes[ob_idx])
+            # price must retrace back into the OB zone on bar i, then close bullish
+            if lows[i] <= ob_high and lows[i] >= ob_low * 0.995 and closes[i] > opens[i] and closes[i] > ob_high * 0.998:
+                return 'buy'
+
+    if bos_dn_idx is not None:
+        ob_idx = None
+        for j in range(bos_dn_idx - 1, max(bos_dn_idx - 8, 0), -1):
+            if closes[j] > opens[j]:
+                ob_idx = j
+                break
+        if ob_idx is not None:
+            ob_low, ob_high = min(opens[ob_idx], closes[ob_idx]), max(opens[ob_idx], closes[ob_idx])
+            if highs[i] >= ob_low and highs[i] <= ob_high * 1.005 and closes[i] < opens[i] and closes[i] < ob_low * 1.002:
+                return 'sell'
+
+    return None
+
+def sig_ict_ote(ctx, i):
+    """
+    ICT Optimal Trade Entry: Fibonacci 62%-79% retracement of the most recent
+    impulse leg (post-BOS), combined with a liquidity sweep of the leg's origin
+    before reversing back into the OTE zone. Extremely selective — needs a clean
+    impulse leg, a real retracement into a narrow zone, AND a sweep+reversal.
+    """
+    highs, lows, closes = ctx['highs'], ctx['lows'], ctx['closes']
+    if i < 40:
+        return None
+    swing_window = 20
+    # find the most recent significant leg: lowest low to highest high (or reverse)
+    # in the lookback window, using the last 20 bars before the retracement zone
+    seg = list(range(i - swing_window - 3, i - 2))
+    if not seg:
+        return None
+    leg_low_idx = min(seg, key=lambda j: lows[j])
+    leg_high_idx = max(seg, key=lambda j: highs[j])
+
+    if leg_low_idx < leg_high_idx:
+        # bullish leg: low -> high, expect retracement down into 62-79% zone then reversal up
+        leg_low, leg_high = lows[leg_low_idx], highs[leg_high_idx]
+        rng = leg_high - leg_low
+        if rng <= 0:
+            return None
+        fib_62 = leg_high - rng * 0.62
+        fib_79 = leg_high - rng * 0.79
+        # sweep: price dipped below fib_79 (liquidity grab) then closed back above fib_79
+        swept = lows[i-1] < fib_79 and closes[i-1] >= fib_79
+        in_zone = fib_79 <= closes[i] <= fib_62
+        reversal = closes[i] > closes[i-1]
+        if swept and in_zone and reversal:
+            return 'buy'
+
+    if leg_high_idx < leg_low_idx:
+        # bearish leg: high -> low, expect retracement up into 62-79% zone then reversal down
+        leg_high, leg_low = highs[leg_high_idx], lows[leg_low_idx]
+        rng = leg_high - leg_low
+        if rng <= 0:
+            return None
+        fib_62 = leg_low + rng * 0.62
+        fib_79 = leg_low + rng * 0.79
+        swept = highs[i-1] > fib_79 and closes[i-1] <= fib_79
+        in_zone = fib_62 <= closes[i] <= fib_79
+        reversal = closes[i] < closes[i-1]
+        if swept and in_zone and reversal:
+            return 'sell'
+
     return None
 
 # ── Build indicator context for a candle series ────────────────────
@@ -447,6 +592,10 @@ def backtest_strategy(strat_id, symbol, ctx, htf_ctx=None):
         elif strat_id == 'S8_MTF_CONFLUENCE':
             htf_idx = find_htf_index(htf_ctx['ts'], ts[i]) if htf_ctx else None
             sig = sig_mtf_confluence(ctx, i, htf_ctx, htf_idx)
+        elif strat_id == 'S9_ICT_OB_BOS':
+            sig = sig_ict_ob_bos(ctx, i)
+        elif strat_id == 'S10_ICT_OTE':
+            sig = sig_ict_ote(ctx, i)
         else:
             sig = None
 
@@ -725,3 +874,4 @@ if __name__ == "__main__":
         merge_shards()
     else:
         run_shard(int(arg))
+
