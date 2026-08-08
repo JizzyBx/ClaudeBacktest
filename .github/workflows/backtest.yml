@@ -1,4 +1,4 @@
-name: Strategy G VAR_D — Indicator TP Exit Backtest
+name: GMaxV1 Multi-Strategy Backtest
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +32,7 @@ jobs:
   merge:
     needs: backtest
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
