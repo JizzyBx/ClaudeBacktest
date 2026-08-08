@@ -64,31 +64,53 @@ ALL_SYMBOLS = [
 ]
 
 # ── Data Fetch ─────────────────────────────────────────────
-def fetch_month(symbol, year, month):
-    ym = f"{year}-{month:02d}"
-    url = (f"https://data.binance.vision/data/futures/um/monthly/klines"
-           f"/{symbol}/{TIMEFRAME}/{symbol}-{TIMEFRAME}-{ym}.zip")
-    try:
-        with urlopen(url, timeout=30) as r:
-            raw = r.read()
-        with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            name = z.namelist()[0]
-            with z.open(name) as f:
-                rows = list(csv.reader(io.TextIOWrapper(f)))
-        out = []
-        for row in rows:
-            if len(row) < 5:
-                continue
+BASE_URLS = [
+    "https://data.binance.vision/data/futures/um/monthly/klines",
+    "https://data.binance.com/data/futures/um/monthly/klines",
+]
+
+def _parse_zip(raw):
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        name = z.namelist()[0]
+        with z.open(name) as f:
+            rows = list(csv.reader(io.TextIOWrapper(f)))
+    out = []
+    for row in rows:
+        if len(row) < 5:
+            continue
+        try:
             ts = int(row[0])
             if ts > 10**14:
                 ts //= 1000
             o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
             out.append((ts, o, h, l, c))
-        return out
-    except (HTTPError, URLError):
-        return []
-    except Exception:
-        return []
+        except (ValueError, IndexError):
+            continue
+    return out
+
+def fetch_month(symbol, year, month):
+    ym = f"{year}-{month:02d}"
+    fname = f"{symbol}-{TIMEFRAME}-{ym}.zip"
+    for base in BASE_URLS:
+        url = f"{base}/{symbol}/{TIMEFRAME}/{fname}"
+        for attempt in range(3):
+            try:
+                with urlopen(url, timeout=40) as r:
+                    raw = r.read()
+                return _parse_zip(raw)
+            except HTTPError as e:
+                if e.code == 404:
+                    break   # month doesn't exist, try next base
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+                continue
+            except URLError:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                continue
+            except Exception:
+                break
+    return []
 
 def fetch_symbol(symbol):
     sy, sm = START_YM
