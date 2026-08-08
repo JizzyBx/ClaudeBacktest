@@ -1,4 +1,4 @@
-name: Strategy G — 4-Variant Backtest
+name: G VAR_D Multi-TP Backtest
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +32,7 @@ jobs:
   merge:
     needs: backtest
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
