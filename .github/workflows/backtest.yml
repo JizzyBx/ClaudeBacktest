@@ -1,4 +1,4 @@
-name: G VAR_D Multi-TP Backtest
+name: Strategy G VAR_D — ADX TP Variant Backtest
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
