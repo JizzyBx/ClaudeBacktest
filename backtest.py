@@ -1,8 +1,8 @@
 """
-Strategy G VAR_D — Multi-TP Backtest
-6 TP strategies compared side by side
-20 shards | 5x leverage | unlimited positions | 1 year
-stdlib only — no pip installs
+Strategy G VAR_D — ADX TP Variant Comparison
+VAR_A: Tight tiers 2% / 3.5% / 5%
+VAR_B: Linear scale ADX 22→0.5%, ADX 70→3.5%
+20 shards | 5x leverage | 3 years | stdlib only
 """
 
 import sys, json, csv, io, zipfile, math, time
@@ -10,7 +10,7 @@ from urllib.request import urlopen
 from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime
 
 # ══════════════════════════════════════════════════════════════
 # COIN LIST — 117-coin universe
@@ -40,9 +40,8 @@ ALL_SYMBOLS = [
 NUM_SHARDS = 20
 WORKERS    = 16
 
-# ── Date range: 1 year back from Aug 2025 ──
-# Aug 2024 → Jul 2025
-START_YM = (2024, 8)
+# ── 3-year date range ──
+START_YM = (2022, 8)
 END_YM   = (2025, 7)
 
 TIMEFRAME = '15m'
@@ -54,26 +53,16 @@ FEE       = 0.0005   # 0.05% taker
 SLIP      = 0.0003   # 0.03% slippage
 
 # ── Strategy G constants ──
-SL_PCT   = 0.150     # 15% SL — fixed, unchanged
-MAX_BARS = 960       # 10 days max hold
+SL_PCT   = 0.150     # 15% SL — fixed
+MAX_BARS = 960       # 10 days max hold (960 × 15m = 240h)
 MIN_BARS = 100       # indicator warmup
 
 # ── TP Strategy definitions ──
-# tp_id  : short label used in results
-# tp_type: 'fixed' | 'atr' | 'adx_scaled' | 'partial_adx'
 TP_STRATEGIES = [
-    # 0: Original baseline — fixed 3%
-    {'id': 'TP0_FIXED_3PCT',     'tp_type': 'fixed',        'tp_fixed': 0.030},
-    # 1: ATR-based (2.0x ATR)
-    {'id': 'TP1_ATR_2x',         'tp_type': 'atr',          'atr_mult': 2.0},
-    # 2: ATR-based (3.0x ATR)
-    {'id': 'TP2_ATR_3x',         'tp_type': 'atr',          'atr_mult': 3.0},
-    # 3: ADX-scaled tiered TP
-    {'id': 'TP3_ADX_SCALED',     'tp_type': 'adx_scaled'},
-    # 4: Hybrid ATR floor + ADX ceiling
-    {'id': 'TP4_HYBRID',         'tp_type': 'hybrid'},
-    # 5: Partial TP (50% at 2%, rest at ADX-scaled) merged with ADX scaling
-    {'id': 'TP5_PARTIAL_ADX',    'tp_type': 'partial_adx'},
+    # VAR_A: Tighter fixed ADX tiers — 2% / 3.5% / 5%
+    {'id': 'VAR_A_TIGHT_TIERS', 'tp_type': 'adx_scaled_tight'},
+    # VAR_B: Linear ADX scale — ADX 22 → 0.5%, ADX 70+ → 3.5%
+    {'id': 'VAR_B_LINEAR',      'tp_type': 'adx_linear'},
 ]
 
 # ══════════════════════════════════════════════════════════════
@@ -119,7 +108,7 @@ def fetch_symbol(symbol):
     return [seen[k] for k in sorted(seen)]
 
 # ══════════════════════════════════════════════════════════════
-# INDICATORS (pure Python)
+# INDICATORS
 # ══════════════════════════════════════════════════════════════
 def ema_series(values, period):
     k = 2.0 / (period + 1)
@@ -129,7 +118,6 @@ def ema_series(values, period):
     return r
 
 def atr_value(highs, lows, closes, period=14, idx=None):
-    """ATR at a specific index (or last bar if idx=None)."""
     if idx is None:
         idx = len(closes) - 1
     start = max(1, idx - period * 3)
@@ -150,7 +138,6 @@ def atr_value(highs, lows, closes, period=14, idx=None):
     return a
 
 def adx_at(highs, lows, closes, period=14, idx=None):
-    """ADX, +DI, -DI at a specific bar index."""
     if idx is None:
         idx = len(closes) - 1
     start = max(1, idx - period * 4)
@@ -181,13 +168,9 @@ def adx_at(highs, lows, closes, period=14, idx=None):
     return max(0.0, min(100.0, adx)), pdi[-1], mdi[-1]
 
 # ══════════════════════════════════════════════════════════════
-# SIGNAL — Strategy G VAR_D
+# SIGNAL — Strategy G VAR_D (unchanged)
 # ══════════════════════════════════════════════════════════════
 def signal_G(i, closes, highs, lows, e9, e21, e50):
-    """
-    Returns (signal, adx_val, slope_pct, atr14) or (None, ...) if no signal.
-    Evaluated on bar i (last CLOSED bar). Entry on bar i+1.
-    """
     if i < 70:
         return None, 0.0, 0.0, 0.0
 
@@ -216,58 +199,38 @@ def signal_G(i, closes, highs, lows, e9, e21, e50):
     return sig, adx_val, slope_pct, atr14
 
 # ══════════════════════════════════════════════════════════════
-# TP CALCULATOR
+# TP CALCULATORS
 # ══════════════════════════════════════════════════════════════
+def _adx_tier_tight(adx_val):
+    """VAR_A: tighter fixed tiers — 2% / 3.5% / 5%"""
+    if adx_val >= 50: return 0.050
+    if adx_val >= 35: return 0.035
+    return 0.020   # ADX 22–35
+
+def _adx_linear(adx_val):
+    """VAR_B: linear scale — ADX 22 → 0.5%, ADX 70+ → 3.5%"""
+    low_adx,  high_adx  = 22.0, 70.0
+    low_pct,  high_pct  = 0.005, 0.035
+    t = (adx_val - low_adx) / (high_adx - low_adx)
+    t = max(0.0, min(1.0, t))
+    return low_pct + t * (high_pct - low_pct)
+
 def calc_tp(tp_cfg, side, entry_price, adx_val, atr14):
-    """
-    Returns tp_price for full close strategies.
-    For partial_adx returns (tp1_price, tp2_price, tp1_frac).
-    """
     tp_type = tp_cfg['tp_type']
 
-    if tp_type == 'fixed':
-        pct = tp_cfg['tp_fixed']
+    if tp_type == 'adx_scaled_tight':
+        pct = _adx_tier_tight(adx_val)
         if side == 'buy': return entry_price * (1 + pct)
         else:             return entry_price * (1 - pct)
 
-    elif tp_type == 'atr':
-        mult = tp_cfg['atr_mult']
-        dist = atr14 * mult
-        if side == 'buy': return entry_price + dist
-        else:             return entry_price - dist
-
-    elif tp_type == 'adx_scaled':
-        pct = _adx_tier(adx_val)
+    elif tp_type == 'adx_linear':
+        pct = _adx_linear(adx_val)
         if side == 'buy': return entry_price * (1 + pct)
         else:             return entry_price * (1 - pct)
 
-    elif tp_type == 'hybrid':
-        # ATR floor (1.5x), scaled by ADX tier, no hard cap
-        atr_floor = atr14 * 1.5
-        adx_pct   = _adx_tier(adx_val)
-        adx_dist  = entry_price * adx_pct
-        dist = max(atr_floor, adx_dist)
-        if side == 'buy': return entry_price + dist
-        else:             return entry_price - dist
-
-    elif tp_type == 'partial_adx':
-        # TP1: 2% (50% of position)
-        # TP2: ADX-scaled (remaining 50%)
-        pct2 = _adx_tier(adx_val)
-        if side == 'buy':
-            tp1 = entry_price * 1.02
-            tp2 = entry_price * (1 + pct2)
-        else:
-            tp1 = entry_price * 0.98
-            tp2 = entry_price * (1 - pct2)
-        return tp1, tp2, 0.5   # (tp1, tp2, fraction_at_tp1)
-
-    return entry_price * (1.03 if side == 'buy' else 0.97)
-
-def _adx_tier(adx_val):
-    if adx_val >= 50: return 0.060
-    if adx_val >= 35: return 0.040
-    return 0.025   # ADX 22–35
+    # fallback
+    if side == 'buy': return entry_price * 1.030
+    else:             return entry_price * 0.970
 
 # ══════════════════════════════════════════════════════════════
 # BACKTEST — single symbol, single TP strategy
@@ -284,17 +247,13 @@ def backtest_symbol(symbol, candles, tp_cfg):
 
     n = len(closes)
 
-    # Pre-compute EMA series
     e9  = ema_series(closes, 9)
     e21 = ema_series(closes, 21)
     e50 = ema_series(closes, 50)
 
     trades = []
-    tp_type = tp_cfg['tp_type']
-    is_partial = (tp_type == 'partial_adx')
 
-    # Position sizing — unlimited concurrent positions
-    # Each trade risks CAPITAL * 0.75% / SL_PCT, capped by CAPITAL * LEVERAGE
+    # Position sizing
     risk_usd = CAPITAL * 0.0075
     notional = min(risk_usd / SL_PCT, CAPITAL * LEVERAGE)
 
@@ -306,40 +265,31 @@ def backtest_symbol(symbol, candles, tp_cfg):
             i += 1
             continue
 
-        # Entry on bar i+1 open
         if i + 1 >= n:
             break
 
         raw_entry = opens[i+1]
         if sig == 'buy':
-            entry_p = raw_entry * (1 + FEE + SLIP)
+            entry_p  = raw_entry * (1 + FEE + SLIP)
             sl_price = entry_p * (1 - SL_PCT)
         else:
-            entry_p = raw_entry * (1 - FEE - SLIP)
+            entry_p  = raw_entry * (1 - FEE - SLIP)
             sl_price = entry_p * (1 + SL_PCT)
 
-        # Compute TP(s)
-        if is_partial:
-            tp1, tp2, frac1 = calc_tp(tp_cfg, sig, entry_p, adx_val, atr14)
-            tp1_hit = False
-            tp1_pnl = 0.0
-        else:
-            tp_price = calc_tp(tp_cfg, sig, entry_p, adx_val, atr14)
+        tp_price = calc_tp(tp_cfg, sig, entry_p, adx_val, atr14)
 
-        # Sanity check TP direction
-        if not is_partial:
-            if sig == 'buy' and tp_price <= entry_p:
-                i += 1; continue
-            if sig == 'sell' and tp_price >= entry_p:
-                i += 1; continue
+        # Sanity check
+        if sig == 'buy' and tp_price <= entry_p:
+            i += 1; continue
+        if sig == 'sell' and tp_price >= entry_p:
+            i += 1; continue
 
-        entry_ts = ts_arr[i+1]
-        exit_ts = entry_ts
+        entry_ts  = ts_arr[i+1]
+        exit_ts   = entry_ts
         exit_price = entry_p
-        reason = 'end_of_data'
+        reason    = 'end_of_data'
         bars_held = 0
 
-        # Simulate bar by bar
         j = i + 1
         while j < n:
             bars_held = j - (i + 1)
@@ -347,227 +297,101 @@ def backtest_symbol(symbol, candles, tp_cfg):
             l = lows[j]
             c = closes[j]
 
-            if is_partial:
-                if not tp1_hit:
-                    # Phase 1: both TP1 and SL active
-                    if sig == 'buy':
-                        sl_hit = l <= sl_price
-                        t1_hit = h >= tp1
-                    else:
-                        sl_hit = h >= sl_price
-                        t1_hit = l <= tp1
-
-                    if sl_hit and t1_hit:
-                        # SL wins (conservative)
-                        sl_hit = True; t1_hit = False
-
-                    if sl_hit:
-                        exit_price = sl_price
-                        exit_ts    = ts_arr[j]
-                        reason     = 'sl'
-                        # Full position hit SL
-                        gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                        net   = gross - (FEE + SLIP) * 2
-                        trade_pnl = notional * net
-                        trades.append({
-                            'symbol': symbol, 'side': sig,
-                            'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                            'entry_price': entry_p, 'exit_price': exit_price,
-                            'pnl': round(trade_pnl, 6),
-                            'reason': reason, 'bars': bars_held,
-                            'tp_id': tp_cfg['id'],
-                            'adx': round(adx_val, 1),
-                        })
-                        break
-
-                    if t1_hit:
-                        # 50% closed at TP1
-                        tp1_hit = True
-                        tp1_exit = tp1
-                        gross1 = (tp1_exit - entry_p) / entry_p if sig == 'buy' else (entry_p - tp1_exit) / entry_p
-                        net1   = gross1 - (FEE + SLIP) * 2
-                        tp1_pnl = notional * frac1 * net1
-                        # Move SL to breakeven for remainder
-                        sl_price = entry_p
-
-                else:
-                    # Phase 2: TP2 with breakeven SL
-                    if sig == 'buy':
-                        sl_hit = l <= sl_price
-                        t2_hit = h >= tp2
-                    else:
-                        sl_hit = h >= sl_price
-                        t2_hit = l <= tp2
-
-                    if sl_hit and t2_hit:
-                        sl_hit = True; t2_hit = False
-
-                    if sl_hit:
-                        # Breakeven stop — remainder exits at entry_p
-                        exit_price = sl_price
-                        exit_ts    = ts_arr[j]
-                        reason     = 'sl_breakeven'
-                        gross2 = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                        net2   = gross2 - (FEE + SLIP) * 2
-                        tp2_pnl = notional * (1 - frac1) * net2
-                        trade_pnl = tp1_pnl + tp2_pnl
-                        trades.append({
-                            'symbol': symbol, 'side': sig,
-                            'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                            'entry_price': entry_p, 'exit_price': exit_price,
-                            'pnl': round(trade_pnl, 6),
-                            'reason': reason, 'bars': bars_held,
-                            'tp_id': tp_cfg['id'],
-                            'adx': round(adx_val, 1),
-                        })
-                        break
-
-                    if t2_hit:
-                        exit_price = tp2
-                        exit_ts    = ts_arr[j]
-                        reason     = 'tp'
-                        gross2 = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                        net2   = gross2 - (FEE + SLIP) * 2
-                        tp2_pnl = notional * (1 - frac1) * net2
-                        trade_pnl = tp1_pnl + tp2_pnl
-                        trades.append({
-                            'symbol': symbol, 'side': sig,
-                            'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                            'entry_price': entry_p, 'exit_price': exit_price,
-                            'pnl': round(trade_pnl, 6),
-                            'reason': reason, 'bars': bars_held,
-                            'tp_id': tp_cfg['id'],
-                            'adx': round(adx_val, 1),
-                        })
-                        break
-
-                # Max hold
-                if bars_held >= MAX_BARS:
-                    exit_price = c
-                    exit_ts    = ts_arr[j]
-                    reason     = 'max_hold'
-                    gross_r = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                    net_r   = gross_r - (FEE + SLIP) * 2
-                    remainder_pnl = notional * (1 - (frac1 if tp1_hit else 0)) * net_r
-                    trade_pnl = (tp1_pnl if tp1_hit else 0) + remainder_pnl
-                    trades.append({
-                        'symbol': symbol, 'side': sig,
-                        'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                        'entry_price': entry_p, 'exit_price': exit_price,
-                        'pnl': round(trade_pnl, 6),
-                        'reason': reason, 'bars': bars_held,
-                        'tp_id': tp_cfg['id'],
-                        'adx': round(adx_val, 1),
-                    })
-                    break
-
-                j += 1
-                if j >= n:
-                    # End of data — close remainder
-                    exit_price = closes[-1]
-                    exit_ts    = ts_arr[-1]
-                    reason     = 'end_of_data'
-                    gross_r = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                    net_r   = gross_r - (FEE + SLIP) * 2
-                    remainder_pnl = notional * (1 - (frac1 if tp1_hit else 0)) * net_r
-                    trade_pnl = (tp1_pnl if tp1_hit else 0) + remainder_pnl
-                    trades.append({
-                        'symbol': symbol, 'side': sig,
-                        'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                        'entry_price': entry_p, 'exit_price': exit_price,
-                        'pnl': round(trade_pnl, 6),
-                        'reason': reason, 'bars': bars_held,
-                        'tp_id': tp_cfg['id'],
-                        'adx': round(adx_val, 1),
-                    })
-
+            if sig == 'buy':
+                sl_hit = l <= sl_price
+                tp_hit = h >= tp_price
             else:
-                # Non-partial strategies
-                if sig == 'buy':
-                    sl_hit = l <= sl_price
-                    tp_hit = h >= tp_price
-                else:
-                    sl_hit = h >= sl_price
-                    tp_hit = l <= tp_price
+                sl_hit = h >= sl_price
+                tp_hit = l <= tp_price
 
-                # SL wins if both on same bar
-                if sl_hit and tp_hit:
-                    sl_hit = True; tp_hit = False
+            # SL wins if both hit same bar
+            if sl_hit and tp_hit:
+                sl_hit = True; tp_hit = False
 
-                if sl_hit:
-                    exit_price = sl_price
-                    exit_ts    = ts_arr[j]
-                    reason     = 'sl'
-                    gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                    net   = gross - (FEE + SLIP) * 2
-                    trade_pnl = notional * net
-                    trades.append({
-                        'symbol': symbol, 'side': sig,
-                        'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                        'entry_price': entry_p, 'exit_price': exit_price,
-                        'pnl': round(trade_pnl, 6),
-                        'reason': reason, 'bars': bars_held,
-                        'tp_id': tp_cfg['id'],
-                        'adx': round(adx_val, 1),
-                    })
-                    break
+            if sl_hit:
+                exit_price = sl_price
+                exit_ts    = ts_arr[j]
+                reason     = 'sl'
+                gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
+                net   = gross - (FEE + SLIP) * 2
+                trades.append({
+                    'symbol':      symbol,
+                    'side':        sig,
+                    'entry_ts':    entry_ts,
+                    'exit_ts':     exit_ts,
+                    'entry_price': entry_p,
+                    'exit_price':  exit_price,
+                    'pnl':         round(notional * net, 6),
+                    'reason':      reason,
+                    'bars':        bars_held,
+                    'tp_id':       tp_cfg['id'],
+                    'adx':         round(adx_val, 1),
+                })
+                break
 
-                if tp_hit:
-                    exit_price = tp_price
-                    exit_ts    = ts_arr[j]
-                    reason     = 'tp'
-                    gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                    net   = gross - (FEE + SLIP) * 2
-                    trade_pnl = notional * net
-                    trades.append({
-                        'symbol': symbol, 'side': sig,
-                        'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                        'entry_price': entry_p, 'exit_price': exit_price,
-                        'pnl': round(trade_pnl, 6),
-                        'reason': reason, 'bars': bars_held,
-                        'tp_id': tp_cfg['id'],
-                        'adx': round(adx_val, 1),
-                    })
-                    break
+            if tp_hit:
+                exit_price = tp_price
+                exit_ts    = ts_arr[j]
+                reason     = 'tp'
+                gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
+                net   = gross - (FEE + SLIP) * 2
+                trades.append({
+                    'symbol':      symbol,
+                    'side':        sig,
+                    'entry_ts':    entry_ts,
+                    'exit_ts':     exit_ts,
+                    'entry_price': entry_p,
+                    'exit_price':  exit_price,
+                    'pnl':         round(notional * net, 6),
+                    'reason':      reason,
+                    'bars':        bars_held,
+                    'tp_id':       tp_cfg['id'],
+                    'adx':         round(adx_val, 1),
+                })
+                break
 
-                if bars_held >= MAX_BARS:
-                    exit_price = c
-                    exit_ts    = ts_arr[j]
-                    reason     = 'max_hold'
-                    gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                    net   = gross - (FEE + SLIP) * 2
-                    trade_pnl = notional * net
-                    trades.append({
-                        'symbol': symbol, 'side': sig,
-                        'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                        'entry_price': entry_p, 'exit_price': exit_price,
-                        'pnl': round(trade_pnl, 6),
-                        'reason': reason, 'bars': bars_held,
-                        'tp_id': tp_cfg['id'],
-                        'adx': round(adx_val, 1),
-                    })
-                    break
+            if bars_held >= MAX_BARS:
+                exit_price = c
+                exit_ts    = ts_arr[j]
+                reason     = 'max_hold'
+                gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
+                net   = gross - (FEE + SLIP) * 2
+                trades.append({
+                    'symbol':      symbol,
+                    'side':        sig,
+                    'entry_ts':    entry_ts,
+                    'exit_ts':     exit_ts,
+                    'entry_price': entry_p,
+                    'exit_price':  exit_price,
+                    'pnl':         round(notional * net, 6),
+                    'reason':      reason,
+                    'bars':        bars_held,
+                    'tp_id':       tp_cfg['id'],
+                    'adx':         round(adx_val, 1),
+                })
+                break
 
-                j += 1
-                if j >= n:
-                    exit_price = closes[-1]
-                    exit_ts    = ts_arr[-1]
-                    reason     = 'end_of_data'
-                    gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
-                    net   = gross - (FEE + SLIP) * 2
-                    trade_pnl = notional * net
-                    trades.append({
-                        'symbol': symbol, 'side': sig,
-                        'entry_ts': entry_ts, 'exit_ts': exit_ts,
-                        'entry_price': entry_p, 'exit_price': exit_price,
-                        'pnl': round(trade_pnl, 6),
-                        'reason': reason, 'bars': bars_held,
-                        'tp_id': tp_cfg['id'],
-                        'adx': round(adx_val, 1),
-                    })
+            j += 1
+            if j >= n:
+                exit_price = closes[-1]
+                exit_ts    = ts_arr[-1]
+                reason     = 'end_of_data'
+                gross = (exit_price - entry_p) / entry_p if sig == 'buy' else (entry_p - exit_price) / entry_p
+                net   = gross - (FEE + SLIP) * 2
+                trades.append({
+                    'symbol':      symbol,
+                    'side':        sig,
+                    'entry_ts':    entry_ts,
+                    'exit_ts':     exit_ts,
+                    'entry_price': entry_p,
+                    'exit_price':  exit_price,
+                    'pnl':         round(notional * net, 6),
+                    'reason':      reason,
+                    'bars':        bars_held,
+                    'tp_id':       tp_cfg['id'],
+                    'adx':         round(adx_val, 1),
+                })
 
-        # Next scan from bar i+2 (bar after entry) — unlimited concurrent positions
-        # so we don't skip i+1; we just advance past the signal bar
         i += 1
 
     return trades
@@ -583,8 +407,7 @@ def compute_stats(trades):
             'avg_win': 0.0, 'avg_loss': 0.0, 'expectancy': 0.0,
             'sharpe': 0.0, 'longs': 0, 'shorts': 0,
             'tp_hits': 0, 'sl_hits': 0, 'max_hold_hits': 0,
-            'avg_bars': 0.0,
-            'monthly': {}, 'per_coin': {},
+            'avg_bars': 0.0, 'monthly': {}, 'per_coin': {},
         }
 
     wins   = [t['pnl'] for t in trades if t['pnl'] > 0]
@@ -594,27 +417,26 @@ def compute_stats(trades):
     gp = sum(wins)
     gl = abs(sum(losses))
     pf = gp / gl if gl > 0 else (float('inf') if gp > 0 else 0.0)
-    net_pnl   = sum(t['pnl'] for t in trades)
-    avg_win   = sum(wins)  / len(wins)   if wins   else 0.0
-    avg_loss  = sum(losses)/ len(losses) if losses else 0.0
+    net_pnl    = sum(t['pnl'] for t in trades)
+    avg_win    = sum(wins)   / len(wins)   if wins   else 0.0
+    avg_loss   = sum(losses) / len(losses) if losses else 0.0
     expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
     avg_bars   = sum(t['bars'] for t in trades) / total
 
     # Max drawdown
     equity = 0.0; peak = 0.0; max_dd = 0.0; max_dd_pct = 0.0
     daily_pnl = defaultdict(float)
-    for t in trades:
+    for t in sorted(trades, key=lambda x: x['exit_ts']):
         equity += t['pnl']
         peak = max(peak, equity)
         dd = peak - equity
         if dd > max_dd:
             max_dd = dd
             max_dd_pct = (dd / peak * 100) if peak > 0 else 0.0
-        # Daily for Sharpe
         d_str = datetime.utcfromtimestamp(t['exit_ts']/1000).strftime('%Y-%m-%d')
         daily_pnl[d_str] += t['pnl']
 
-    # Sharpe (daily returns, annualised)
+    # Sharpe
     if len(daily_pnl) > 1:
         vals = list(daily_pnl.values())
         mean = sum(vals) / len(vals)
@@ -644,24 +466,24 @@ def compute_stats(trades):
         per_coin[sym]['wr'] = per_coin[sym]['w'] / n * 100 if n else 0.0
 
     return {
-        'total':           total,
-        'win_rate':        round(win_rate, 2),
-        'profit_factor':   round(pf, 4) if pf != float('inf') else 9999.0,
-        'net_pnl':         round(net_pnl, 4),
-        'max_drawdown':    round(max_dd, 4),
-        'max_drawdown_pct':round(max_dd_pct, 2),
-        'avg_win':         round(avg_win, 4),
-        'avg_loss':        round(avg_loss, 4),
-        'expectancy':      round(expectancy, 4),
-        'sharpe':          round(sharpe, 3),
-        'longs':           sum(1 for t in trades if t['side'] == 'buy'),
-        'shorts':          sum(1 for t in trades if t['side'] == 'sell'),
-        'tp_hits':         sum(1 for t in trades if t['reason'] == 'tp'),
-        'sl_hits':         sum(1 for t in trades if t['reason'] in ('sl','sl_breakeven')),
-        'max_hold_hits':   sum(1 for t in trades if t['reason'] == 'max_hold'),
-        'avg_bars':        round(avg_bars, 1),
-        'monthly':         {k: dict(v) for k, v in sorted(monthly.items())},
-        'per_coin':        {k: dict(v) for k, v in per_coin.items()},
+        'total':            total,
+        'win_rate':         round(win_rate, 2),
+        'profit_factor':    round(pf, 4) if pf != float('inf') else 9999.0,
+        'net_pnl':          round(net_pnl, 4),
+        'max_drawdown':     round(max_dd, 4),
+        'max_drawdown_pct': round(max_dd_pct, 2),
+        'avg_win':          round(avg_win, 4),
+        'avg_loss':         round(avg_loss, 4),
+        'expectancy':       round(expectancy, 4),
+        'sharpe':           round(sharpe, 3),
+        'longs':            sum(1 for t in trades if t['side'] == 'buy'),
+        'shorts':           sum(1 for t in trades if t['side'] == 'sell'),
+        'tp_hits':          sum(1 for t in trades if t['reason'] == 'tp'),
+        'sl_hits':          sum(1 for t in trades if t['reason'] == 'sl'),
+        'max_hold_hits':    sum(1 for t in trades if t['reason'] == 'max_hold'),
+        'avg_bars':         round(avg_bars, 1),
+        'monthly':          {k: dict(v) for k, v in sorted(monthly.items())},
+        'per_coin':         {k: dict(v) for k, v in per_coin.items()},
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -672,7 +494,6 @@ def run_shard(shard_idx):
     symbols = ALL_SYMBOLS[shard_idx::NUM_SHARDS]
     print(f"[Shard {shard_idx}] {len(symbols)} symbols: {symbols}")
 
-    # Fetch all candles in parallel
     candle_map = {}
     def _fetch(sym):
         data = fetch_symbol(sym)
@@ -685,7 +506,6 @@ def run_shard(shard_idx):
             candle_map[sym] = data
             print(f"[Shard {shard_idx}] {sym}: {len(data)} candles")
 
-    # Check geo-block
     total_candles = sum(len(v) for v in candle_map.values())
     if total_candles == 0:
         print(f"[Shard {shard_idx}] GEO-BLOCK or no data — 0 candles fetched. Aborting.")
@@ -699,14 +519,13 @@ def run_shard(shard_idx):
             json.dump(result, f)
         return
 
-    # Backtest each symbol × each TP strategy
     all_trades_by_tp = {tp['id']: [] for tp in TP_STRATEGIES}
     with_data = []
 
     for sym in symbols:
         candles = candle_map[sym]
         if len(candles) < MIN_BARS:
-            print(f"[Shard {shard_idx}] {sym}: skipped (only {len(candles)} candles)")
+            print(f"[Shard {shard_idx}] {sym}: skipped ({len(candles)} candles)")
             continue
         with_data.append(sym)
         for tp_cfg in TP_STRATEGIES:
@@ -714,25 +533,22 @@ def run_shard(shard_idx):
             all_trades_by_tp[tp_cfg['id']].extend(trades)
             print(f"[Shard {shard_idx}] {sym} {tp_cfg['id']}: {len(trades)} trades")
 
-    # Stats per TP strategy
     stats_by_tp = {}
     for tp_cfg in TP_STRATEGIES:
         tp_id = tp_cfg['id']
-        trades = all_trades_by_tp[tp_id]
-        stats_by_tp[tp_id] = compute_stats(trades)
+        stats_by_tp[tp_id] = compute_stats(all_trades_by_tp[tp_id])
 
-    # Flatten all trades (include tp_id tag)
     all_trades_flat = []
     for tp_id, trades in all_trades_by_tp.items():
         all_trades_flat.extend(trades)
 
     result = {
-        'shard':        shard_idx,
-        'symbols':      symbols,
-        'with_data':    with_data,
-        'trades':       all_trades_flat,
-        'stats_by_tp':  stats_by_tp,
-        'elapsed':      round(time.time() - t0, 1),
+        'shard':       shard_idx,
+        'symbols':     symbols,
+        'with_data':   with_data,
+        'trades':      all_trades_flat,
+        'stats_by_tp': stats_by_tp,
+        'elapsed':     round(time.time() - t0, 1),
     }
 
     with open(f'shard_{shard_idx}.json', 'w') as f:
@@ -757,31 +573,29 @@ def merge_shards():
             shard = json.load(f)
         all_symbols.extend(shard.get('symbols', []))
         with_data.extend(shard.get('with_data', []))
-        # Trades are tagged with tp_id
         for trade in shard.get('trades', []):
             tp_id = trade.get('tp_id')
             if tp_id in all_trades_by_tp:
                 all_trades_by_tp[tp_id].append(trade)
 
-    # Compute stats per TP strategy
     results_by_tp = {}
     for tp_cfg in TP_STRATEGIES:
         tp_id = tp_cfg['id']
         trades = all_trades_by_tp[tp_id]
         results_by_tp[tp_id] = {
-            'config': tp_cfg,
-            'stats':  compute_stats(trades),
+            'config':      tp_cfg,
+            'stats':       compute_stats(trades),
             'trade_count': len(trades),
         }
 
     report = {
-        'period':         f"{START_YM[0]}-{START_YM[1]:02d} to {END_YM[0]}-{END_YM[1]:02d}",
-        'timeframe':      TIMEFRAME,
-        'leverage':       LEVERAGE,
-        'sl_pct':         SL_PCT,
-        'symbols_attempted': len(set(all_symbols)),
-        'symbols_with_data': len(set(with_data)),
-        'tp_strategies':  results_by_tp,
+        'period':              f"{START_YM[0]}-{START_YM[1]:02d} to {END_YM[0]}-{END_YM[1]:02d}",
+        'timeframe':           TIMEFRAME,
+        'leverage':            LEVERAGE,
+        'sl_pct':              SL_PCT,
+        'symbols_attempted':   len(set(all_symbols)),
+        'symbols_with_data':   len(set(with_data)),
+        'tp_strategies':       results_by_tp,
     }
 
     with open('backtest_report.json', 'w') as f:
@@ -790,26 +604,28 @@ def merge_shards():
     # ── Summary text ──
     lines = []
     lines.append("=" * 72)
-    lines.append("  STRATEGY G VAR_D — MULTI-TP BACKTEST RESULTS")
+    lines.append("  STRATEGY G VAR_D — ADX TP VARIANT COMPARISON")
+    lines.append("  VAR_A: Tight tiers 2%/3.5%/5%  |  VAR_B: Linear 0.5%–3.5%")
     lines.append("=" * 72)
-    lines.append(f"  Period   : {report['period']}")
+    lines.append(f"  Period   : {report['period']}  (3 years)")
     lines.append(f"  Timeframe: {TIMEFRAME}   Leverage: {LEVERAGE}x")
-    lines.append(f"  SL       : {SL_PCT*100:.0f}% (fixed)")
+    lines.append(f"  SL       : {SL_PCT*100:.0f}% (fixed)   Max Hold: {MAX_BARS} bars (10 days)")
     lines.append(f"  Capital  : ${CAPITAL}   Fee: {FEE*100:.2f}%   Slip: {SLIP*100:.2f}%")
     lines.append(f"  Coins    : {report['symbols_attempted']} attempted, {report['symbols_with_data']} with data")
     lines.append("=" * 72)
     lines.append("")
 
     # Comparison table
-    headers = ["TP Strategy", "Trades", "WR%", "PF", "Net PnL", "MaxDD%", "Sharpe", "AvgBars", "TPs", "SLs"]
-    col_w   = [20, 7, 7, 7, 10, 8, 8, 9, 7, 7]
+    headers = ["TP Strategy", "Trades", "WR%", "PF", "Net PnL", "MaxDD%", "Sharpe", "AvgBars", "TPs", "SLs", "MaxHold"]
+    col_w   = [22, 7, 7, 7, 10, 8, 8, 9, 7, 7, 9]
 
     def _pad(s, w): return str(s)[:w].ljust(w)
     def _row(vals): return "  " + "  ".join(_pad(v, w) for v, w in zip(vals, col_w))
 
     lines.append(_row(headers))
-    lines.append("  " + "-" * 70)
+    lines.append("  " + "-" * 76)
 
+    best_tp = None; best_pf = 0.0
     for tp_cfg in TP_STRATEGIES:
         tp_id = tp_cfg['id']
         s = results_by_tp[tp_id]['stats']
@@ -819,57 +635,61 @@ def merge_shards():
             pf_str, f"${s['net_pnl']:+.2f}",
             f"{s['max_drawdown_pct']:.1f}%",
             f"{s['sharpe']:.3f}", f"{s['avg_bars']:.0f}",
-            s['tp_hits'], s['sl_hits'],
+            s['tp_hits'], s['sl_hits'], s['max_hold_hits'],
         ]
         lines.append(_row(row))
-
-    lines.append("")
-    lines.append("=" * 72)
-    lines.append("  DETAILED BREAKDOWN PER TP STRATEGY")
-    lines.append("=" * 72)
-
-    best_tp = None; best_pf = 0.0
-    for tp_cfg in TP_STRATEGIES:
-        tp_id = tp_cfg['id']
-        s = results_by_tp[tp_id]['stats']
         pf_val = s['profit_factor'] if s['profit_factor'] < 9999 else 0.0
         if pf_val > best_pf:
             best_pf = pf_val; best_tp = tp_id
 
+    lines.append("")
+    lines.append("=" * 72)
+    lines.append("  DETAILED BREAKDOWN")
+    lines.append("=" * 72)
+
+    for tp_cfg in TP_STRATEGIES:
+        tp_id = tp_cfg['id']
+        s = results_by_tp[tp_id]['stats']
+        pf_str = f"{s['profit_factor']:.4f}" if s['profit_factor'] < 9999 else "∞"
+        rec = "✅ USABLE" if s['profit_factor'] >= 1.5 and s['win_rate'] >= 42 else "❌ NOT USABLE"
+
         lines.append("")
         lines.append(f"  ── {tp_id} ──")
-        lines.append(f"     Trades     : {s['total']}")
-        lines.append(f"     Win Rate   : {s['win_rate']:.2f}%")
-        pf_str = f"{s['profit_factor']:.4f}" if s['profit_factor'] < 9999 else "∞"
-        lines.append(f"     Prof Factor: {pf_str}")
-        lines.append(f"     Net PnL    : ${s['net_pnl']:+.4f}")
-        lines.append(f"     Max DD     : ${s['max_drawdown']:+.4f}  ({s['max_drawdown_pct']:.2f}%)")
-        lines.append(f"     Sharpe     : {s['sharpe']:.3f}")
-        lines.append(f"     Avg Win    : ${s['avg_win']:+.4f}")
-        lines.append(f"     Avg Loss   : ${s['avg_loss']:+.4f}")
-        lines.append(f"     Expectancy : ${s['expectancy']:+.4f}")
-        lines.append(f"     Longs      : {s['longs']}  Shorts: {s['shorts']}")
-        lines.append(f"     TP hits    : {s['tp_hits']}  SL hits: {s['sl_hits']}  MaxHold: {s['max_hold_hits']}")
-        lines.append(f"     Avg Bars   : {s['avg_bars']:.1f}")
-        rec = "✅ USABLE" if s['profit_factor'] >= 1.5 and s['win_rate'] >= 42 else "❌ NOT USABLE"
-        lines.append(f"     VERDICT    : {rec}")
+        lines.append(f"     Trades      : {s['total']}")
+        lines.append(f"     Win Rate    : {s['win_rate']:.2f}%")
+        lines.append(f"     Prof Factor : {pf_str}")
+        lines.append(f"     Net PnL     : ${s['net_pnl']:+.4f}")
+        lines.append(f"     Max DD      : ${s['max_drawdown']:+.4f}  ({s['max_drawdown_pct']:.2f}%)")
+        lines.append(f"     Sharpe      : {s['sharpe']:.3f}")
+        lines.append(f"     Avg Win     : ${s['avg_win']:+.4f}")
+        lines.append(f"     Avg Loss    : ${s['avg_loss']:+.4f}")
+        lines.append(f"     Expectancy  : ${s['expectancy']:+.4f}")
+        lines.append(f"     Longs       : {s['longs']}  Shorts: {s['shorts']}")
+        lines.append(f"     TP hits     : {s['tp_hits']}  SL hits: {s['sl_hits']}  MaxHold: {s['max_hold_hits']}")
+        lines.append(f"     Avg Bars    : {s['avg_bars']:.1f}")
+        lines.append(f"     VERDICT     : {rec}")
 
-        # Monthly PnL
         lines.append(f"     Monthly PnL:")
         for ym, mv in sorted(s['monthly'].items()):
-            bar = "+" * min(30, int(abs(mv['pnl']))) if mv['pnl'] > 0 else "-" * min(30, int(abs(mv['pnl'])))
-            lines.append(f"       {ym}  ${mv['pnl']:+8.2f}  {bar}  ({mv['w']}/{mv['n']})")
+            sign = "+" if mv['pnl'] >= 0 else ""
+            bar_len = min(30, int(abs(mv['pnl']) / 10))
+            bar = ("+" if mv['pnl'] >= 0 else "-") * bar_len
+            lines.append(f"       {ym}  ${mv['pnl']:+8.2f}  {bar:<30}  ({mv['w']}/{mv['n']})")
 
-        # Top 20 coins
         ranked = sorted(s['per_coin'].items(), key=lambda x: x[1]['pnl'], reverse=True)
-        lines.append(f"     Top 20 Coins (by PnL):")
-        for sym, cd in ranked[:20]:
-            pf_c = "∞" if cd['pnl'] > 0 and cd.get('n', 1) > 0 else "--"
+        lines.append(f"     Top 50 Coins (by PnL):")
+        for sym, cd in ranked[:50]:
+            lines.append(f"       {sym:<28}  {cd['n']:>4} trades  {cd['wr']:5.1f}% WR  ${cd['pnl']:+.4f}")
+
+        bottom = ranked[-10:][::-1]
+        lines.append(f"     Bottom 10 Coins (by PnL):")
+        for sym, cd in bottom:
             lines.append(f"       {sym:<28}  {cd['n']:>4} trades  {cd['wr']:5.1f}% WR  ${cd['pnl']:+.4f}")
 
     lines.append("")
     lines.append("=" * 72)
-    lines.append(f"  WINNER: {best_tp}  (PF={best_pf:.4f})")
+    if best_tp:
+        lines.append(f"  WINNER: {best_tp}  (PF={best_pf:.4f})")
     lines.append("=" * 72)
 
     summary = "\n".join(lines)
