@@ -91,7 +91,12 @@ def fetch_month(symbol, tf, year, month):
                     continue
                 try:
                     ts = int(r[0])
-                    if ts > 10**14:
+                    # Binance timestamps come in seconds, ms, or us depending on archive.
+                    # Normalize everything down to seconds using digit-count thresholds:
+                    #   >= 10^16 -> microseconds   >= 10^12 -> milliseconds   else -> seconds
+                    if ts >= 10**16:
+                        ts //= 1_000_000
+                    elif ts >= 10**12:
                         ts //= 1000
                     o, h, l, c = float(r[1]), float(r[2]), float(r[3]), float(r[4])
                     vol = float(r[5])
@@ -533,8 +538,20 @@ def compute_stats(trades):
         max_dd = max(max_dd, dd)
 
     monthly = {}
+    bad_ts_count = 0
     for t in trades:
-        dt = datetime.fromtimestamp(t['exit_ts'], tz=timezone.utc)
+        raw_ts = t['exit_ts']
+        # Defensive clamp: normalize any stray bad-unit timestamp instead of crashing the merge.
+        ts_val = raw_ts
+        if ts_val >= 10**16:
+            ts_val //= 1_000_000
+        elif ts_val >= 10**12:
+            ts_val //= 1000
+        try:
+            dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            bad_ts_count += 1
+            continue
         key = f"{dt.year:04d}-{dt.month:02d}"
         m = monthly.setdefault(key, {'pnl': 0.0, 'n': 0, 'w': 0})
         m['pnl'] += t['pnl']; m['n'] += 1
