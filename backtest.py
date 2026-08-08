@@ -1,1008 +1,710 @@
 """
-GMaxV1 Multi-Strategy Backtest
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-6 Strategies tested against 117 Universe coins
-Period: Aug 2024 – Jul 2026 (or full coin history if shorter)
-Timeframe: 15m | Leverage: 5x | SL: 15% | TP max: 3%
-Fees: 0.05% + 0.02% slippage per side
-Capital: $10,000 | Risk: 0.75% per trade
-Shards: 20 | Workers: 16 per shard
-
-STRATEGIES:
-  S0 — Baseline:            Fixed TP 3% / SL 15% (original, no changes)
-  S1 — EMA Reversal Exit:   Hold until EMA9/21 reverses, TP cap 3%
-  S2 — RSI Overbought Exit: Exit when RSI>=75 (long) / <=25 (short), TP cap 3%
-  S3 — Signal Score TP:     ADX+slope score → TP tier (max 3%)
-  S4 — Tiered Time Exit:    Close stalled trades early, TP cap 3%
-  S5 — Breakeven + EMA:     Lock SL to entry at 1.5% profit, exit on EMA reversal, TP cap 3%
+8-Strategy Exploration Backtest — GitHub Actions Pipeline
+117-coin universe (from GMax bot), 5x leverage, 20 parallel shards.
+All 8 strategies are tested against the same fetched candle data per coin.
+stdlib only. No pip installs.
 """
 
-import sys, os, json, csv, io, zipfile, time
-from urllib.request import urlopen
-from urllib.error import HTTPError, URLError
+import sys, os, json, csv, io, zipfile, urllib.request, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 
-# ── Constants ──────────────────────────────────────────────
-NUM_SHARDS   = 20
-WORKERS      = 16
-START_YM     = (2024, 8)
-END_YM       = (2026, 7)
-TIMEFRAME    = '15m'
-CAPITAL      = 10_000.0
-RISK_PCT     = 0.0075      # 0.75%
-FEE          = 0.0005      # 0.05%
-SLIP         = 0.0002      # 0.02%
-LEVERAGE     = 5
-SL_PCT       = 0.150       # 15%
-TP_PCT       = 0.030       # 3% hard cap for all strategies
-MAX_BARS     = 960         # 10 days at 15m
-MIN_BARS     = 100         # warmup
-
-STRATEGIES   = ['S0','S1','S2','S3','S4','S5']
-
+# ── Coin Universe (117 coins, from GMax COINS_UNIVERSE) ──────────────
 ALL_SYMBOLS = [
-    '1000000BOBUSDT','1000BONKUSDT','1000CATUSDT','1000RATSUSDT',
-    '1000SATSUSDT','A2ZUSDT','ACHUSDT','AI16ZUSDT','AINUSDT','AIOTUSDT',
-    'ALGOUSDT','ALICEUSDT','ALPINEUSDT','ANKRUSDT','ARKMUSDT','ASRUSDT',
-    'ASTERUSDT','AUSDT','AWEUSDT','BANKUSDT','BASEDUSDT','BELUSDT','BIDUSDT',
-    'BMTUSDT','BTRUSDT','CFXUSDT','CHIPUSDT','COAIUSDT','COMBOUSDT',
-    'COMMONUSDT','CRCLUSDT','CUSDT','DAMUSDT','DEFIUSDT','DEXEUSDT','DIAUSDT',
-    'DMCUSDT','EIGENUSDT','ELSAUSDT','ENAUSDT','EPICUSDT','EPTUSDT','ETHUSDT',
-    'EVAAUSDT','FLNCUSDT','FLUXUSDT','FUNUSDT','FXSUSDT','GLMUSDT',
-    'GRIFFAINUSDT','GUAUSDT','HANAUSDT','HEMIUSDT','ICXUSDT','INITUSDT',
-    'IOUSDT','IPUSDT','KITEUSDT','LABUSDT','LIGHTUSDT','LRCUSDT','LYNUSDT',
-    'MAGICUSDT','MEGAUSDT','MILKUSDT','MOODENGUSDT','MTLUSDT','NFPUSDT',
+    '1000000BOBUSDT','1000BONKUSDT','1000CATUSDT','1000RATSUSDT','1000SATSUSDT',
+    'A2ZUSDT','ACHUSDT','AI16ZUSDT','AINUSDT','AIOTUSDT','ALGOUSDT','ALICEUSDT',
+    'ALPINEUSDT','ANKRUSDT','ARKMUSDT','ASRUSDT','ASTERUSDT','AUSDT','AWEUSDT',
+    'BANKUSDT','BASEDUSDT','BELUSDT','BIDUSDT','BMTUSDT','BTRUSDT','CFXUSDT',
+    'CHIPUSDT','COAIUSDT','COMBOUSDT','COMMONUSDT','CRCLUSDT','CUSDT','DAMUSDT',
+    'DEFIUSDT','DEXEUSDT','DIAUSDT','DMCUSDT','EIGENUSDT','ELSAUSDT','ENAUSDT',
+    'EPICUSDT','EPTUSDT','ETHUSDT','EVAAUSDT','FLNCUSDT','FLUXUSDT','FUNUSDT',
+    'FXSUSDT','GLMUSDT','GRIFFAINUSDT','GUAUSDT','HANAUSDT','HEMIUSDT','ICXUSDT',
+    'INITUSDT','IOUSDT','IPUSDT','KITEUSDT','LABUSDT','LIGHTUSDT','LRCUSDT',
+    'LYNUSDT','MAGICUSDT','MEGAUSDT','MILKUSDT','MOODENGUSDT','MTLUSDT','NFPUSDT',
     'NMRUSDT','NOMUSDT','NOTUSDT','OBOLUSDT','OPENUSDT','OPNUSDT','ORBSUSDT',
     'PEOPLEUSDT','PIPPINUSDT','PIXELUSDT','PLUMEUSDT','POLUSDT','POWERUSDT',
     'POWRUSDT','PTBUSDT','PUMPBTCUSDT','PUNDIXUSDT','QUICKUSDT','RAVEUSDT',
-    'REEFUSDT','RESOLVUSDT','RLSUSDT','RVVUSDT','SAGAUSDT','SANTOSUSDT',
-    'SEIUSDT','SIGNUSDT','SKRUSDT','SNDKUSDT','SOMIUSDT','SPELLUSDT',
-    'SPKUSDT','STABLEUSDT','STBLUSDT','TRUTHUSDT','TURBOUSDT','UBUSDT',
-    'USUALUSDT','VANRYUSDT','VINEUSDT','VIRTUALUSDT','VVVUSDT','WLDUSDT',
-    'XEMUSDT','XLMUSDT','XRPUSDT','YBUSDT','ZECUSDT','ZEREBROUSDT',
+    'REEFUSDT','RESOLVUSDT','RLSUSDT','RVVUSDT','SAGAUSDT','SANTOSUSDT','SEIUSDT',
+    'SIGNUSDT','SKRUSDT','SNDKUSDT','SOMIUSDT','SPELLUSDT','SPKUSDT','STABLEUSDT',
+    'STBLUSDT','TRUTHUSDT','TURBOUSDT','UBUSDT','USUALUSDT','VANRYUSDT','VINEUSDT',
+    'VIRTUALUSDT','VVVUSDT','WLDUSDT','XEMUSDT','XLMUSDT','XRPUSDT','YBUSDT',
+    'ZECUSDT','ZEREBROUSDT',
 ]
 
-# ── Data Fetch ─────────────────────────────────────────────
-BASE_URLS = [
-    "https://data.binance.vision/data/futures/um/monthly/klines",
-    "https://data.binance.com/data/futures/um/monthly/klines",
-]
+NUM_SHARDS = 20
+WORKERS = 16
 
-def _parse_zip(raw):
-    with zipfile.ZipFile(io.BytesIO(raw)) as z:
-        name = z.namelist()[0]
-        with z.open(name) as f:
-            rows = list(csv.reader(io.TextIOWrapper(f)))
+# ── Config ─────────────────────────────────────────────────────────
+START_YM = (2024, 8)
+END_YM   = (2026, 7)
+CAPITAL   = 10000.0
+RISK_PCT  = 0.0075       # 0.75% risk per trade
+FEE       = 0.0005       # 0.05%
+SLIP      = 0.0002       # 0.02%
+LEVERAGE  = 5             # per user instruction: minimum 5x
+MIN_BARS  = 100           # warmup bars before any signal can fire
+
+TIMEFRAMES_NEEDED = ['15m', '1h']  # union of all TFs used by the 8 strategies
+
+# ── Strategy Definitions ──────────────────────────────────────────
+# Each strategy declares: id, name, primary tf, secondary tf (or None), tp/sl pct
+STRATEGIES = {
+    'S1_EMA_RIBBON':   {'name': 'EMA Ribbon Trend + ADX',        'tf': '15m', 'tf2': None,  'tp': 0.035, 'sl': 0.14},
+    'S2_FVG_SWEEP':    {'name': 'FVG + Liquidity Sweep',         'tf': '15m', 'tf2': None,  'tp': 0.03,  'sl': 0.12},
+    'S3_SR_PINBAR':    {'name': 'S/R Zone + Pin Bar Rejection',  'tf': '1h',  'tf2': None,  'tp': 0.04,  'sl': 0.15},
+    'S4_BB_MEANREV':   {'name': 'BB Mean-Reversion (regime)',    'tf': '15m', 'tf2': None,  'tp': 0.025, 'sl': 0.10},
+    'S5_DONCHIAN_VOL': {'name': 'Donchian Breakout + Volume',    'tf': '1h',  'tf2': None,  'tp': 0.05,  'sl': 0.16},
+    'S6_VWAP_REV':     {'name': 'VWAP Session Reversion',        'tf': '15m', 'tf2': None,  'tp': 0.02,  'sl': 0.09},
+    'S7_VOL_SQUEEZE':  {'name': 'Volatility Squeeze Breakout',   'tf': '1h',  'tf2': None,  'tp': 0.045, 'sl': 0.15},
+    'S8_MTF_CONFLUENCE':{'name': 'MTF Confluence (1h bias+15m)', 'tf': '15m', 'tf2': '1h',  'tp': 0.03,  'sl': 0.13},
+}
+
+MAX_BARS_BY_TF = {'15m': 60, '1h': 40}   # max hold bars before force-close
+
+# ── Data fetch (Binance Vision monthly archives) ──────────────────
+def month_range(start_ym, end_ym):
+    y, m = start_ym
     out = []
-    for row in rows:
-        if len(row) < 5:
-            continue
-        try:
-            ts = int(row[0])
-            if ts > 10**14:
-                ts //= 1000
-            o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-            out.append((ts, o, h, l, c))
-        except (ValueError, IndexError):
-            continue
-    return out
-
-def fetch_month(symbol, year, month):
-    ym = f"{year}-{month:02d}"
-    fname = f"{symbol}-{TIMEFRAME}-{ym}.zip"
-    for base in BASE_URLS:
-        url = f"{base}/{symbol}/{TIMEFRAME}/{fname}"
-        for attempt in range(3):
-            try:
-                with urlopen(url, timeout=40) as r:
-                    raw = r.read()
-                return _parse_zip(raw)
-            except HTTPError as e:
-                if e.code == 404:
-                    break   # month doesn't exist, try next base
-                if attempt < 2:
-                    time.sleep(2 ** attempt)  # 1s, 2s backoff
-                continue
-            except URLError:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-                continue
-            except Exception:
-                break
-    return []
-
-def fetch_symbol(symbol):
-    sy, sm = START_YM
-    ey, em = END_YM
-    months = []
-    y, m = sy, sm
-    while (y, m) <= (ey, em):
-        months.append((y, m))
+    while (y, m) <= end_ym:
+        out.append((y, m))
         m += 1
         if m > 12:
-            m = 1; y += 1
+            m = 1
+            y += 1
+    return out
 
-    all_candles = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {ex.submit(fetch_month, symbol, y, m): (y, m) for y, m in months}
-        for f in as_completed(futs):
-            all_candles.extend(f.result())
-
-    seen = {}
-    for c in all_candles:
-        seen[c[0]] = c
-    candles = sorted(seen.values(), key=lambda x: x[0])
-    return candles
-
-# ── Indicators ─────────────────────────────────────────────
-def ema(values, period):
-    if not values:
+def fetch_month(symbol, tf, year, month):
+    url = (f"https://data.binance.vision/data/futures/um/monthly/klines/"
+           f"{symbol}/{tf}/{symbol}-{tf}-{year:04d}-{month:02d}.zip")
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        name = zf.namelist()[0]
+        rows = []
+        with zf.open(name) as f:
+            text = io.TextIOWrapper(f, encoding='utf-8')
+            reader = csv.reader(text)
+            for r in reader:
+                if not r or r[0] in ('open_time', ''):
+                    continue
+                try:
+                    ts = int(r[0])
+                    if ts > 10**14:
+                        ts //= 1000
+                    o, h, l, c = float(r[1]), float(r[2]), float(r[3]), float(r[4])
+                    vol = float(r[5])
+                    rows.append((ts, o, h, l, c, vol))
+                except (ValueError, IndexError):
+                    continue
+        return rows
+    except Exception:
         return []
+
+def fetch_symbol_tf(symbol, tf):
+    months = month_range(START_YM, END_YM)
+    all_rows = []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(fetch_month, symbol, tf, y, m): (y, m) for (y, m) in months}
+        for fut in as_completed(futs):
+            rows = fut.result()
+            if rows:
+                all_rows.extend(rows)
+    if not all_rows:
+        return None
+    dedup = {}
+    for row in all_rows:
+        dedup[row[0]] = row
+    sorted_rows = sorted(dedup.values(), key=lambda r: r[0])
+    return sorted_rows
+
+def fetch_symbol_all_tfs(symbol):
+    out = {}
+    for tf in TIMEFRAMES_NEEDED:
+        rows = fetch_symbol_tf(symbol, tf)
+        if rows:
+            out[tf] = rows
+    return out
+
+# ── Indicators (pure python) ───────────────────────────────────────
+def ema_series(closes, period):
+    if len(closes) < period:
+        return [None] * len(closes)
+    out = [None] * (period - 1)
     k = 2.0 / (period + 1)
-    r = [values[0]]
-    for v in values[1:]:
-        r.append(v * k + r[-1] * (1 - k))
-    return r
+    sma = sum(closes[:period]) / period
+    out.append(sma)
+    prev = sma
+    for c in closes[period:]:
+        val = c * k + prev * (1 - k)
+        out.append(val)
+        prev = val
+    return out
 
-def atr_series(highs, lows, closes, period=14):
-    trs = []
-    for i in range(1, len(closes)):
-        trs.append(max(highs[i]-lows[i],
-                       abs(highs[i]-closes[i-1]),
-                       abs(lows[i]-closes[i-1])))
-    if not trs:
-        return []
-    if len(trs) < period:
-        return [sum(trs)/len(trs)] * len(trs)
-    out = []
-    a = sum(trs[:period]) / period
-    out.append(a)
-    for t in trs[period:]:
-        a = (a*(period-1) + t) / period
-        out.append(a)
-    # pad front to align with closes index (atr[i] corresponds to closes[i+1])
+def sma_series(values, period):
+    out = [None] * len(values)
+    for i in range(period - 1, len(values)):
+        out[i] = sum(values[i - period + 1:i + 1]) / period
+    return out
+
+def stdev_series(values, period):
+    out = [None] * len(values)
+    for i in range(period - 1, len(values)):
+        window = values[i - period + 1:i + 1]
+        m = sum(window) / period
+        var = sum((x - m) ** 2 for x in window) / period
+        out[i] = var ** 0.5
     return out
 
 def rsi_series(closes, period=14):
-    """Returns RSI series aligned to closes index."""
-    if len(closes) < period + 1:
-        return [50.0] * len(closes)
+    n = len(closes)
+    out = [None] * n
+    if n <= period:
+        return out
     gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i-1]
-        gains.append(max(d, 0.0))
-        losses.append(max(-d, 0.0))
-    ag = sum(gains[:period]) / period
-    al = sum(losses[:period]) / period
-    rsi_vals = [50.0] * (period + 1)
-    for i in range(period, len(gains)):
-        ag = (ag*(period-1) + gains[i]) / period
-        al = (al*(period-1) + losses[i]) / period
-        rs = ag / al if al else 100.0
-        rsi_vals.append(100 - (100 / (1 + rs)))
-    # pad to same length as closes
-    while len(rsi_vals) < len(closes):
-        rsi_vals.append(rsi_vals[-1])
-    return rsi_vals
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    out[period] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
+    for i in range(period + 1, n):
+        d = closes[i] - closes[i - 1]
+        gain = max(d, 0); loss = max(-d, 0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        out[i] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
+    return out
 
-def adx_calc(highs, lows, closes, period=14):
-    if len(closes) < period * 3:
-        return 0.0, 0.0, 0.0
-    pdm, mdm, trs = [], [], []
-    for i in range(1, len(closes)):
-        up = highs[i] - highs[i-1]
-        down = lows[i-1] - lows[i]
-        pdm.append(up if up > down and up > 0 else 0.0)
-        mdm.append(down if down > up and down > 0 else 0.0)
-        trs.append(max(highs[i]-lows[i],
-                       abs(highs[i]-closes[i-1]),
-                       abs(lows[i]-closes[i-1])))
-    def ws(v, p):
-        if len(v) < p:
-            return []
-        r = [sum(v[:p])]
-        for x in v[p:]:
-            r.append(r[-1] - r[-1]/p + x)
-        return r
-    st = ws(trs, period); sp = ws(pdm, period); sm = ws(mdm, period)
-    if not st:
-        return 0.0, 0.0, 0.0
-    pdi = [100*p/t if t else 0 for p, t in zip(sp, st)]
-    mdi = [100*m/t if t else 0 for m, t in zip(sm, st)]
-    dx  = [100*abs(p-m)/(p+m) if (p+m) else 0 for p, m in zip(pdi, mdi)]
-    if len(dx) < period:
-        return 0.0, pdi[-1] if pdi else 0.0, mdi[-1] if mdi else 0.0
-    adx_val = sum(dx[:period]) / period
-    for d in dx[period:]:
-        adx_val = (adx_val*(period-1) + d) / period
-    return max(0.0, min(100.0, adx_val)), pdi[-1], mdi[-1]
+def adx_series(highs, lows, closes, period=14):
+    n = len(closes)
+    out = [None] * n
+    if n <= period * 2:
+        return out
+    tr, pdm, mdm = [0.0], [0.0], [0.0]
+    for i in range(1, n):
+        up = highs[i] - highs[i - 1]
+        dn = lows[i - 1] - lows[i]
+        pdm.append(up if (up > dn and up > 0) else 0.0)
+        mdm.append(dn if (dn > up and dn > 0) else 0.0)
+        tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+    atr = sum(tr[1:period + 1]) / period
+    pdi_s = sum(pdm[1:period + 1])
+    mdi_s = sum(mdm[1:period + 1])
+    dx_list = []
+    for i in range(period + 1, n):
+        atr = (atr * (period - 1) + tr[i]) / period
+        pdi_s = (pdi_s * (period - 1) + pdm[i])
+        mdi_s = (mdi_s * (period - 1) + mdm[i])
+        pdi = 100 * (pdi_s / period) / atr if atr > 0 else 0
+        mdi = 100 * (mdi_s / period) / atr if atr > 0 else 0
+        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0
+        dx_list.append(dx)
+        if len(dx_list) == period:
+            out[i] = sum(dx_list) / period
+        elif len(dx_list) > period:
+            out[i] = (out[i - 1] * (period - 1) + dx) / period
+    return out
 
-# ── Base Signal (shared by all strategies) ─────────────────
-def base_signal(i, closes, highs, lows, e9, e21, e50):
-    """Returns ('buy'|'sell'|None, adx_val, slope_pct)"""
-    if i < 10:
-        return None, 0.0, 0.0
-    slope_pct = (e50[i] - e50[i-10]) / e50[i-10] * 100
-    trend_up   = slope_pct >  0.05
-    trend_down = slope_pct < -0.05
-    if not trend_up and not trend_down:
-        return None, 0.0, slope_pct
+def bollinger(closes, period=20, mult=2.0):
+    mid = sma_series(closes, period)
+    sd = stdev_series(closes, period)
+    upper = [None if mid[i] is None else mid[i] + mult * sd[i] for i in range(len(closes))]
+    lower = [None if mid[i] is None else mid[i] - mult * sd[i] for i in range(len(closes))]
+    width = [None if mid[i] is None else (upper[i] - lower[i]) / mid[i] for i in range(len(closes))]
+    return mid, upper, lower, width
 
-    crossed_up   = e9[i] > e21[i] and e9[i-1] <= e21[i-1]
-    crossed_down = e9[i] < e21[i] and e9[i-1] >= e21[i-1]
+def donchian(highs, lows, period=20):
+    n = len(highs)
+    upper = [None] * n
+    lower = [None] * n
+    for i in range(period, n):
+        upper[i] = max(highs[i - period:i])
+        lower[i] = min(lows[i - period:i])
+    return upper, lower
 
-    if not crossed_up and not crossed_down:
-        return None, 0.0, slope_pct
-    if trend_up and not crossed_up:
-        return None, 0.0, slope_pct
-    if trend_down and not crossed_down:
-        return None, 0.0, slope_pct
+def rolling_vwap(closes, highs, lows, vols, period=96):
+    # session-anchored approximation: rolling VWAP over `period` bars (96 x 15m = 24h)
+    n = len(closes)
+    out = [None] * n
+    for i in range(period, n):
+        tp_vol = 0.0
+        vol_sum = 0.0
+        for j in range(i - period, i):
+            tp = (highs[j] + lows[j] + closes[j]) / 3.0
+            tp_vol += tp * vols[j]
+            vol_sum += vols[j]
+        out[i] = tp_vol / vol_sum if vol_sum > 0 else None
+    return out
 
-    adx_val, _, _ = adx_calc(highs[:i+1], lows[:i+1], closes[:i+1], 14)
-    if adx_val < 22:
-        return None, adx_val, slope_pct
+def percentile_rank(values, idx, lookback=200):
+    if idx < lookback:
+        return None
+    window = [v for v in values[idx - lookback:idx] if v is not None]
+    if not window or values[idx] is None:
+        return None
+    below = sum(1 for v in window if v <= values[idx])
+    return below / len(window) * 100
 
-    sig = 'buy' if crossed_up else 'sell'
-    return sig, adx_val, slope_pct
+# ── Signal functions — each returns 'buy' / 'sell' / None on bar i (closed bar) ──
 
-# ── Position Sizing ────────────────────────────────────────
-def calc_notional():
-    return min(CAPITAL * RISK_PCT / SL_PCT, CAPITAL * LEVERAGE)
+def sig_ema_ribbon(ctx, i):
+    e9, e21, e50, adx = ctx['e9'], ctx['e21'], ctx['e50'], ctx['adx']
+    if None in (e9[i], e21[i], e50[i], adx[i], e9[i-1], e21[i-1]):
+        return None
+    if adx[i] < 22:
+        return None
+    slope = (e50[i] - e50[i-5]) / e50[i-5] * 100 if i >= 5 and e50[i-5] else 0
+    crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
+    crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
+    if crossed_up and slope > 0:
+        return 'buy'
+    if crossed_dn and slope < 0:
+        return 'sell'
+    return None
 
-# ── Trade Builder ──────────────────────────────────────────
-def make_trade(symbol, side, entry_ts, exit_ts, entry_p, exit_p, reason, bars):
-    if side == 'buy':
-        gross = (exit_p - entry_p) / entry_p
-    else:
-        gross = (entry_p - exit_p) / entry_p
-    net = gross - (FEE + SLIP) * 2
-    notional = calc_notional()
-    pnl = notional * net * LEVERAGE
+def sig_fvg_sweep(ctx, i):
+    highs, lows, closes = ctx['highs'], ctx['lows'], ctx['closes']
+    e21 = ctx['e21']
+    if i < 25 or e21[i] is None:
+        return None
+    lookback_high = max(highs[i-20:i-2])
+    lookback_low = min(lows[i-20:i-2])
+    swept_high = highs[i-1] > lookback_high and closes[i-1] < lookback_high
+    swept_low = lows[i-1] < lookback_low and closes[i-1] > lookback_low
+    # simple 3-candle FVG: gap between candle i-2 high and candle i low (bullish) etc.
+    bull_fvg = lows[i] > highs[i-2]
+    bear_fvg = highs[i] < lows[i-2]
+    if swept_low and bull_fvg and closes[i] > e21[i]:
+        return 'buy'
+    if swept_high and bear_fvg and closes[i] < e21[i]:
+        return 'sell'
+    return None
+
+def sig_sr_pinbar(ctx, i):
+    highs, lows, closes, opens = ctx['highs'], ctx['lows'], ctx['closes'], ctx['opens']
+    e50 = ctx['e50']
+    if i < 30 or e50[i] is None:
+        return None
+    zone_high = max(highs[i-20:i])
+    zone_low = min(lows[i-20:i])
+    body = abs(closes[i] - opens[i])
+    rng = highs[i] - lows[i]
+    if rng == 0:
+        return None
+    lower_wick = min(opens[i], closes[i]) - lows[i]
+    upper_wick = highs[i] - max(opens[i], closes[i])
+    is_pin_bull = lower_wick > body * 2 and lower_wick > rng * 0.55
+    is_pin_bear = upper_wick > body * 2 and upper_wick > rng * 0.55
+    near_support = lows[i] <= zone_low * 1.01
+    near_resistance = highs[i] >= zone_high * 0.99
+    if is_pin_bull and near_support and closes[i] > e50[i]:
+        return 'buy'
+    if is_pin_bear and near_resistance and closes[i] < e50[i]:
+        return 'sell'
+    return None
+
+def sig_bb_meanrev(ctx, i):
+    closes = ctx['closes']
+    bb_low, bb_up, rsi, adx = ctx['bb_low'], ctx['bb_up'], ctx['rsi'], ctx['adx']
+    if None in (bb_low[i], bb_up[i], rsi[i], adx[i]):
+        return None
+    if adx[i] >= 20:   # only trade ranges
+        return None
+    if closes[i] <= bb_low[i] and rsi[i] < 30:
+        return 'buy'
+    if closes[i] >= bb_up[i] and rsi[i] > 70:
+        return 'sell'
+    return None
+
+def sig_donchian_vol(ctx, i):
+    closes, vols = ctx['closes'], ctx['vols']
+    dc_up, dc_low = ctx['dc_up'], ctx['dc_low']
+    if i < 25 or dc_up[i-1] is None or dc_low[i-1] is None:
+        return None
+    avg_vol = sum(vols[i-20:i]) / 20
+    vol_spike = vols[i] > avg_vol * 1.5
+    if closes[i] > dc_up[i-1] and vol_spike:
+        return 'buy'
+    if closes[i] < dc_low[i-1] and vol_spike:
+        return 'sell'
+    return None
+
+def sig_vwap_rev(ctx, i):
+    closes = ctx['closes']
+    vwap = ctx['vwap']
+    if vwap[i] is None:
+        return None
+    dev = (closes[i] - vwap[i]) / vwap[i] * 100
+    if dev < -2.0:
+        return 'buy'
+    if dev > 2.0:
+        return 'sell'
+    return None
+
+def sig_vol_squeeze(ctx, i):
+    closes = ctx['closes']
+    bb_up, bb_low, bb_width = ctx['bb_up'], ctx['bb_low'], ctx['bb_width']
+    if i < 210 or bb_width[i-1] is None:
+        return None
+    pct = percentile_rank(bb_width, i - 1, lookback=200)
+    if pct is None or pct > 10:
+        return None
+    if closes[i] > bb_up[i]:
+        return 'buy'
+    if closes[i] < bb_low[i]:
+        return 'sell'
+    return None
+
+def sig_mtf_confluence(ctx, i, htf_ctx, htf_idx):
+    e9, e21 = ctx['e9'], ctx['e21']
+    if htf_idx is None or htf_idx < 1:
+        return None
+    htf_e9, htf_e21 = htf_ctx['e9'], htf_ctx['e21']
+    if None in (e9[i], e21[i], e9[i-1], e21[i-1], htf_e9[htf_idx], htf_e21[htf_idx]):
+        return None
+    htf_bull = htf_e9[htf_idx] > htf_e21[htf_idx]
+    htf_bear = htf_e9[htf_idx] < htf_e21[htf_idx]
+    crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
+    crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
+    if crossed_up and htf_bull:
+        return 'buy'
+    if crossed_dn and htf_bear:
+        return 'sell'
+    return None
+
+# ── Build indicator context for a candle series ────────────────────
+def build_ctx(rows):
+    closes = [r[4] for r in rows]
+    highs  = [r[2] for r in rows]
+    lows   = [r[3] for r in rows]
+    opens  = [r[1] for r in rows]
+    vols   = [r[5] for r in rows]
+    ts     = [r[0] for r in rows]
+    e9  = ema_series(closes, 9)
+    e21 = ema_series(closes, 21)
+    e50 = ema_series(closes, 50)
+    adx = adx_series(highs, lows, closes, 14)
+    rsi = rsi_series(closes, 14)
+    bb_mid, bb_up, bb_low, bb_width = bollinger(closes, 20, 2.0)
+    dc_up, dc_low = donchian(highs, lows, 20)
+    vwap = rolling_vwap(closes, highs, lows, vols, period=96)
     return {
-        'symbol':      symbol,
-        'side':        side,
-        'entry_ts':    entry_ts,
-        'exit_ts':     exit_ts,
-        'entry_price': entry_p,
-        'exit_price':  exit_p,
-        'pnl':         round(pnl, 4),
-        'reason':      reason,
-        'bars':        bars,
+        'ts': ts, 'closes': closes, 'highs': highs, 'lows': lows, 'opens': opens, 'vols': vols,
+        'e9': e9, 'e21': e21, 'e50': e50, 'adx': adx, 'rsi': rsi,
+        'bb_up': bb_up, 'bb_low': bb_low, 'bb_width': bb_width,
+        'dc_up': dc_up, 'dc_low': dc_low, 'vwap': vwap,
     }
 
-# ══════════════════════════════════════════════════════════
-# STRATEGY IMPLEMENTATIONS
-# ══════════════════════════════════════════════════════════
-
-def backtest_S0(symbol, candles):
-    """S0 — Baseline: Fixed TP 3% / SL 15%"""
-    if len(candles) < MIN_BARS:
-        return []
-    ts_arr = [c[0] for c in candles]
-    opens  = [c[1] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    closes = [c[4] for c in candles]
-    e9  = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
-    trades = []
-    pos = None
-    for i in range(MIN_BARS, len(closes) - 1):
-        if pos is None:
-            sig, adx_val, slope = base_signal(i, closes, highs, lows, e9, e21, e50)
-            if sig:
-                raw_entry = opens[i+1]
-                if sig == 'buy':
-                    entry_p = raw_entry * (1 + FEE + SLIP)
-                    tp_p = entry_p * (1 + TP_PCT)
-                    sl_p = entry_p * (1 - SL_PCT)
-                else:
-                    entry_p = raw_entry * (1 - FEE - SLIP)
-                    tp_p = entry_p * (1 - TP_PCT)
-                    sl_p = entry_p * (1 + SL_PCT)
-                pos = {'side': sig, 'entry_p': entry_p, 'tp_p': tp_p,
-                       'sl_p': sl_p, 'entry_ts': ts_arr[i+1], 'entry_bar': i+1}
+def find_htf_index(htf_ts, target_ts):
+    # binary search for the last htf bar with ts <= target_ts
+    lo, hi = 0, len(htf_ts) - 1
+    res = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if htf_ts[mid] <= target_ts:
+            res = mid
+            lo = mid + 1
         else:
-            j = i
-            side = pos['side']
-            hi, lo = highs[j], lows[j]
-            bars_held = j - pos['entry_bar']
-            hit_sl = lo <= pos['sl_p'] if side == 'buy' else hi >= pos['sl_p']
-            hit_tp = hi >= pos['tp_p'] if side == 'buy' else lo <= pos['tp_p']
-            reason = exit_p = None
-            if hit_sl:
-                reason = 'sl'; exit_p = pos['sl_p']
-            elif hit_tp:
-                reason = 'tp'; exit_p = pos['tp_p']
-            elif bars_held >= MAX_BARS:
-                reason = 'max_hold'; exit_p = closes[j]
-            if reason:
-                trades.append(make_trade(symbol, side, pos['entry_ts'],
-                    ts_arr[j], pos['entry_p'], exit_p, reason, bars_held))
-                pos = None
-    if pos:
-        j = len(closes) - 1
-        trades.append(make_trade(symbol, pos['side'], pos['entry_ts'],
-            ts_arr[j], pos['entry_p'], closes[j], 'end_of_data',
-            j - pos['entry_bar']))
-    return trades
+            hi = mid - 1
+    return res
 
-
-def backtest_S1(symbol, candles):
-    """S1 — EMA9/21 Reversal Exit: hold until cross reverses, TP cap 3%"""
-    if len(candles) < MIN_BARS:
-        return []
-    ts_arr = [c[0] for c in candles]
-    opens  = [c[1] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    closes = [c[4] for c in candles]
-    e9  = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
+# ── Backtest a single strategy against a single symbol's candles ──
+def backtest_strategy(strat_id, symbol, ctx, htf_ctx=None):
+    cfg = STRATEGIES[strat_id]
+    tp_pct, sl_pct = cfg['tp'], cfg['sl']
+    tf = cfg['tf']
+    max_bars = MAX_BARS_BY_TF[tf]
+    closes, highs, lows, opens = ctx['closes'], ctx['highs'], ctx['lows'], ctx['opens']
+    ts = ctx['ts']
+    n = len(closes)
     trades = []
-    pos = None
-    for i in range(MIN_BARS, len(closes) - 1):
-        if pos is None:
-            sig, adx_val, slope = base_signal(i, closes, highs, lows, e9, e21, e50)
-            if sig:
-                raw_entry = opens[i+1]
-                if sig == 'buy':
-                    entry_p = raw_entry * (1 + FEE + SLIP)
-                    tp_p = entry_p * (1 + TP_PCT)
-                    sl_p = entry_p * (1 - SL_PCT)
-                else:
-                    entry_p = raw_entry * (1 - FEE - SLIP)
-                    tp_p = entry_p * (1 - TP_PCT)
-                    sl_p = entry_p * (1 + SL_PCT)
-                pos = {'side': sig, 'entry_p': entry_p, 'tp_p': tp_p,
-                       'sl_p': sl_p, 'entry_ts': ts_arr[i+1], 'entry_bar': i+1}
+    if n < MIN_BARS + 5:
+        return trades
+
+    i = MIN_BARS
+    while i < n - 1:
+        if strat_id == 'S1_EMA_RIBBON':
+            sig = sig_ema_ribbon(ctx, i)
+        elif strat_id == 'S2_FVG_SWEEP':
+            sig = sig_fvg_sweep(ctx, i)
+        elif strat_id == 'S3_SR_PINBAR':
+            sig = sig_sr_pinbar(ctx, i)
+        elif strat_id == 'S4_BB_MEANREV':
+            sig = sig_bb_meanrev(ctx, i)
+        elif strat_id == 'S5_DONCHIAN_VOL':
+            sig = sig_donchian_vol(ctx, i)
+        elif strat_id == 'S6_VWAP_REV':
+            sig = sig_vwap_rev(ctx, i)
+        elif strat_id == 'S7_VOL_SQUEEZE':
+            sig = sig_vol_squeeze(ctx, i)
+        elif strat_id == 'S8_MTF_CONFLUENCE':
+            htf_idx = find_htf_index(htf_ctx['ts'], ts[i]) if htf_ctx else None
+            sig = sig_mtf_confluence(ctx, i, htf_ctx, htf_idx)
         else:
-            j = i
-            side = pos['side']
-            hi, lo = highs[j], lows[j]
-            bars_held = j - pos['entry_bar']
-            hit_sl = lo <= pos['sl_p'] if side == 'buy' else hi >= pos['sl_p']
-            hit_tp = hi >= pos['tp_p'] if side == 'buy' else lo <= pos['tp_p']
-            # EMA reversal check on closed bar
-            ema_reversed = False
-            if side == 'buy':
-                ema_reversed = e9[j] < e21[j] and e9[j-1] >= e21[j-1]
+            sig = None
+
+        if sig is None:
+            i += 1
+            continue
+
+        entry_i = i + 1
+        if entry_i >= n:
+            break
+        if sig == 'buy':
+            entry_p = opens[entry_i] * (1 + FEE + SLIP)
+            tp_p = entry_p * (1 + tp_pct)
+            sl_p = entry_p * (1 - sl_pct)
+        else:
+            entry_p = opens[entry_i] * (1 - FEE - SLIP)
+            tp_p = entry_p * (1 - tp_pct)
+            sl_p = entry_p * (1 + sl_pct)
+
+        exit_p, reason, bars_held, exit_ts = None, None, 0, ts[entry_i]
+        j = entry_i
+        while j < n:
+            bars_held = j - entry_i
+            if bars_held >= max_bars:
+                exit_p, reason, exit_ts = closes[j], 'max_hold', ts[j]
+                break
+            if sig == 'buy':
+                if lows[j] <= sl_p:
+                    exit_p, reason, exit_ts = sl_p, 'sl', ts[j]
+                    break
+                if highs[j] >= tp_p:
+                    exit_p, reason, exit_ts = tp_p, 'tp', ts[j]
+                    break
             else:
-                ema_reversed = e9[j] > e21[j] and e9[j-1] <= e21[j-1]
-            reason = exit_p = None
-            if hit_sl:
-                reason = 'sl'; exit_p = pos['sl_p']
-            elif hit_tp:
-                reason = 'tp'; exit_p = pos['tp_p']
-            elif ema_reversed:
-                reason = 'ema_reversal'; exit_p = closes[j]
-            elif bars_held >= MAX_BARS:
-                reason = 'max_hold'; exit_p = closes[j]
-            if reason:
-                trades.append(make_trade(symbol, side, pos['entry_ts'],
-                    ts_arr[j], pos['entry_p'], exit_p, reason, bars_held))
-                pos = None
-    if pos:
-        j = len(closes) - 1
-        trades.append(make_trade(symbol, pos['side'], pos['entry_ts'],
-            ts_arr[j], pos['entry_p'], closes[j], 'end_of_data',
-            j - pos['entry_bar']))
-    return trades
-
-
-def backtest_S2(symbol, candles):
-    """S2 — RSI Overbought/Oversold Exit: exit RSI>=75 long / <=25 short, TP cap 3%"""
-    if len(candles) < MIN_BARS:
-        return []
-    ts_arr = [c[0] for c in candles]
-    opens  = [c[1] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    closes = [c[4] for c in candles]
-    e9  = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
-    rsi = rsi_series(closes, 14)
-    trades = []
-    pos = None
-    for i in range(MIN_BARS, len(closes) - 1):
-        if pos is None:
-            sig, adx_val, slope = base_signal(i, closes, highs, lows, e9, e21, e50)
-            if sig:
-                raw_entry = opens[i+1]
-                if sig == 'buy':
-                    entry_p = raw_entry * (1 + FEE + SLIP)
-                    tp_p = entry_p * (1 + TP_PCT)
-                    sl_p = entry_p * (1 - SL_PCT)
-                else:
-                    entry_p = raw_entry * (1 - FEE - SLIP)
-                    tp_p = entry_p * (1 - TP_PCT)
-                    sl_p = entry_p * (1 + SL_PCT)
-                pos = {'side': sig, 'entry_p': entry_p, 'tp_p': tp_p,
-                       'sl_p': sl_p, 'entry_ts': ts_arr[i+1], 'entry_bar': i+1}
+                if highs[j] >= sl_p:
+                    exit_p, reason, exit_ts = sl_p, 'sl', ts[j]
+                    break
+                if lows[j] <= tp_p:
+                    exit_p, reason, exit_ts = tp_p, 'tp', ts[j]
+                    break
+            j += 1
         else:
-            j = i
-            side = pos['side']
-            hi, lo = highs[j], lows[j]
-            bars_held = j - pos['entry_bar']
-            hit_sl = lo <= pos['sl_p'] if side == 'buy' else hi >= pos['sl_p']
-            hit_tp = hi >= pos['tp_p'] if side == 'buy' else lo <= pos['tp_p']
-            rsi_exit = False
-            if side == 'buy' and rsi[j] >= 75:
-                rsi_exit = True
-            elif side == 'sell' and rsi[j] <= 25:
-                rsi_exit = True
-            reason = exit_p = None
-            if hit_sl:
-                reason = 'sl'; exit_p = pos['sl_p']
-            elif hit_tp:
-                reason = 'tp'; exit_p = pos['tp_p']
-            elif rsi_exit:
-                reason = 'rsi_exit'; exit_p = closes[j]
-            elif bars_held >= MAX_BARS:
-                reason = 'max_hold'; exit_p = closes[j]
-            if reason:
-                trades.append(make_trade(symbol, side, pos['entry_ts'],
-                    ts_arr[j], pos['entry_p'], exit_p, reason, bars_held))
-                pos = None
-    if pos:
-        j = len(closes) - 1
-        trades.append(make_trade(symbol, pos['side'], pos['entry_ts'],
-            ts_arr[j], pos['entry_p'], closes[j], 'end_of_data',
-            j - pos['entry_bar']))
-    return trades
+            exit_p, reason, exit_ts = closes[n-1], 'end_of_data', ts[n-1]
+            bars_held = n - 1 - entry_i
 
-
-def backtest_S3(symbol, candles):
-    """S3 — Signal Score TP Tier: ADX+slope → TP tier (max 3%)"""
-    if len(candles) < MIN_BARS:
-        return []
-    ts_arr = [c[0] for c in candles]
-    opens  = [c[1] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    closes = [c[4] for c in candles]
-    e9  = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
-    trades = []
-    pos = None
-    for i in range(MIN_BARS, len(closes) - 1):
-        if pos is None:
-            sig, adx_val, slope = base_signal(i, closes, highs, lows, e9, e21, e50)
-            if sig:
-                # Score: ADX tier
-                if adx_val >= 40:
-                    adx_score = 3
-                elif adx_val >= 30:
-                    adx_score = 2
-                else:
-                    adx_score = 1
-                # Score: slope tier
-                abs_slope = abs(slope)
-                if abs_slope >= 0.40:
-                    slope_score = 2
-                elif abs_slope >= 0.15:
-                    slope_score = 1
-                else:
-                    slope_score = 0
-                total_score = adx_score + slope_score  # range 1–5
-                # TP tiers — capped at 3%
-                if total_score >= 4:
-                    tp_use = 0.030   # 3.0%
-                elif total_score == 3:
-                    tp_use = 0.025   # 2.5%
-                elif total_score == 2:
-                    tp_use = 0.020   # 2.0%
-                else:
-                    tp_use = 0.015   # 1.5% (weakest signal)
-                raw_entry = opens[i+1]
-                if sig == 'buy':
-                    entry_p = raw_entry * (1 + FEE + SLIP)
-                    tp_p = entry_p * (1 + tp_use)
-                    sl_p = entry_p * (1 - SL_PCT)
-                else:
-                    entry_p = raw_entry * (1 - FEE - SLIP)
-                    tp_p = entry_p * (1 - tp_use)
-                    sl_p = entry_p * (1 + SL_PCT)
-                pos = {'side': sig, 'entry_p': entry_p, 'tp_p': tp_p,
-                       'sl_p': sl_p, 'entry_ts': ts_arr[i+1], 'entry_bar': i+1,
-                       'tp_use': tp_use}
+        notional = min(CAPITAL * RISK_PCT / sl_pct, CAPITAL * LEVERAGE)
+        if sig == 'buy':
+            gross = (exit_p - entry_p) / entry_p
         else:
-            j = i
-            side = pos['side']
-            hi, lo = highs[j], lows[j]
-            bars_held = j - pos['entry_bar']
-            hit_sl = lo <= pos['sl_p'] if side == 'buy' else hi >= pos['sl_p']
-            hit_tp = hi >= pos['tp_p'] if side == 'buy' else lo <= pos['tp_p']
-            reason = exit_p = None
-            if hit_sl:
-                reason = 'sl'; exit_p = pos['sl_p']
-            elif hit_tp:
-                reason = 'tp'; exit_p = pos['tp_p']
-            elif bars_held >= MAX_BARS:
-                reason = 'max_hold'; exit_p = closes[j]
-            if reason:
-                trades.append(make_trade(symbol, side, pos['entry_ts'],
-                    ts_arr[j], pos['entry_p'], exit_p, reason, bars_held))
-                pos = None
-    if pos:
-        j = len(closes) - 1
-        trades.append(make_trade(symbol, pos['side'], pos['entry_ts'],
-            ts_arr[j], pos['entry_p'], closes[j], 'end_of_data',
-            j - pos['entry_bar']))
+            gross = (entry_p - exit_p) / entry_p
+        net = gross - (FEE + SLIP) * 2
+        pnl = notional * net
+
+        trades.append({
+            'symbol': symbol, 'side': sig, 'entry_ts': ts[entry_i], 'exit_ts': exit_ts,
+            'entry_price': entry_p, 'exit_price': exit_p, 'pnl': pnl,
+            'reason': reason, 'bars': bars_held,
+        })
+        i = entry_i + bars_held + 1
+
     return trades
 
-
-def backtest_S4(symbol, candles):
-    """S4 — Tiered Time Exit: close stalled trades early, TP cap 3%
-    Rules:
-      - If bars_held >= 96  (24h)  and current_pnl_pct < 0.5%  -> close
-      - If bars_held >= 192 (48h)  and current_pnl_pct < 1.0%  -> close
-      - If bars_held >= 384 (96h)  and current_pnl_pct < 1.5%  -> close
-    """
-    if len(candles) < MIN_BARS:
-        return []
-    ts_arr = [c[0] for c in candles]
-    opens  = [c[1] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    closes = [c[4] for c in candles]
-    e9  = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
-    trades = []
-    pos = None
-    for i in range(MIN_BARS, len(closes) - 1):
-        if pos is None:
-            sig, adx_val, slope = base_signal(i, closes, highs, lows, e9, e21, e50)
-            if sig:
-                raw_entry = opens[i+1]
-                if sig == 'buy':
-                    entry_p = raw_entry * (1 + FEE + SLIP)
-                    tp_p = entry_p * (1 + TP_PCT)
-                    sl_p = entry_p * (1 - SL_PCT)
-                else:
-                    entry_p = raw_entry * (1 - FEE - SLIP)
-                    tp_p = entry_p * (1 - TP_PCT)
-                    sl_p = entry_p * (1 + SL_PCT)
-                pos = {'side': sig, 'entry_p': entry_p, 'tp_p': tp_p,
-                       'sl_p': sl_p, 'entry_ts': ts_arr[i+1], 'entry_bar': i+1}
-        else:
-            j = i
-            side = pos['side']
-            hi, lo = highs[j], lows[j]
-            bars_held = j - pos['entry_bar']
-            hit_sl = lo <= pos['sl_p'] if side == 'buy' else hi >= pos['sl_p']
-            hit_tp = hi >= pos['tp_p'] if side == 'buy' else lo <= pos['tp_p']
-            # Tiered stall check using current close
-            cur = closes[j]
-            ep  = pos['entry_p']
-            if side == 'buy':
-                cur_pct = (cur - ep) / ep
-            else:
-                cur_pct = (ep - cur) / ep
-            stall_exit = False
-            if   bars_held >= 384 and cur_pct < 0.015:
-                stall_exit = True
-            elif bars_held >= 192 and cur_pct < 0.010:
-                stall_exit = True
-            elif bars_held >= 96  and cur_pct < 0.005:
-                stall_exit = True
-            reason = exit_p = None
-            if hit_sl:
-                reason = 'sl'; exit_p = pos['sl_p']
-            elif hit_tp:
-                reason = 'tp'; exit_p = pos['tp_p']
-            elif stall_exit:
-                reason = 'stall_exit'; exit_p = closes[j]
-            elif bars_held >= MAX_BARS:
-                reason = 'max_hold'; exit_p = closes[j]
-            if reason:
-                trades.append(make_trade(symbol, side, pos['entry_ts'],
-                    ts_arr[j], pos['entry_p'], exit_p, reason, bars_held))
-                pos = None
-    if pos:
-        j = len(closes) - 1
-        trades.append(make_trade(symbol, pos['side'], pos['entry_ts'],
-            ts_arr[j], pos['entry_p'], closes[j], 'end_of_data',
-            j - pos['entry_bar']))
-    return trades
-
-
-def backtest_S5(symbol, candles):
-    """S5 — Breakeven Lock + EMA Reversal:
-    Once trade reaches 1.5% profit -> move SL to entry (one-time, static).
-    Exit when EMA9/21 reverses OR TP 3% OR original SL.
-    """
-    if len(candles) < MIN_BARS:
-        return []
-    ts_arr = [c[0] for c in candles]
-    opens  = [c[1] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    closes = [c[4] for c in candles]
-    e9  = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
-    trades = []
-    pos = None
-    for i in range(MIN_BARS, len(closes) - 1):
-        if pos is None:
-            sig, adx_val, slope = base_signal(i, closes, highs, lows, e9, e21, e50)
-            if sig:
-                raw_entry = opens[i+1]
-                if sig == 'buy':
-                    entry_p = raw_entry * (1 + FEE + SLIP)
-                    tp_p = entry_p * (1 + TP_PCT)
-                    sl_p = entry_p * (1 - SL_PCT)
-                else:
-                    entry_p = raw_entry * (1 - FEE - SLIP)
-                    tp_p = entry_p * (1 - TP_PCT)
-                    sl_p = entry_p * (1 + SL_PCT)
-                pos = {'side': sig, 'entry_p': entry_p, 'tp_p': tp_p,
-                       'sl_p': sl_p, 'entry_ts': ts_arr[i+1], 'entry_bar': i+1,
-                       'be_locked': False}
-        else:
-            j = i
-            side = pos['side']
-            hi, lo = highs[j], lows[j]
-            bars_held = j - pos['entry_bar']
-            ep = pos['entry_p']
-
-            # Breakeven lock: if 1.5% profit reached and not yet locked
-            if not pos['be_locked']:
-                if side == 'buy' and hi >= ep * 1.015:
-                    pos['sl_p'] = ep   # move SL to breakeven
-                    pos['be_locked'] = True
-                elif side == 'sell' and lo <= ep * 0.985:
-                    pos['sl_p'] = ep
-                    pos['be_locked'] = True
-
-            hit_sl = lo <= pos['sl_p'] if side == 'buy' else hi >= pos['sl_p']
-            hit_tp = hi >= pos['tp_p'] if side == 'buy' else lo <= pos['tp_p']
-            # EMA reversal exit
-            ema_reversed = False
-            if side == 'buy':
-                ema_reversed = e9[j] < e21[j] and e9[j-1] >= e21[j-1]
-            else:
-                ema_reversed = e9[j] > e21[j] and e9[j-1] <= e21[j-1]
-            reason = exit_p = None
-            if hit_sl:
-                reason = 'sl' if not pos['be_locked'] else 'breakeven'
-                exit_p = pos['sl_p']
-            elif hit_tp:
-                reason = 'tp'; exit_p = pos['tp_p']
-            elif ema_reversed:
-                reason = 'ema_reversal'; exit_p = closes[j]
-            elif bars_held >= MAX_BARS:
-                reason = 'max_hold'; exit_p = closes[j]
-            if reason:
-                trades.append(make_trade(symbol, side, pos['entry_ts'],
-                    ts_arr[j], pos['entry_p'], exit_p, reason, bars_held))
-                pos = None
-    if pos:
-        j = len(closes) - 1
-        trades.append(make_trade(symbol, pos['side'], pos['entry_ts'],
-            ts_arr[j], pos['entry_p'], closes[j], 'end_of_data',
-            j - pos['entry_bar']))
-    return trades
-
-
-STRATEGY_FNS = {
-    'S0': backtest_S0,
-    'S1': backtest_S1,
-    'S2': backtest_S2,
-    'S3': backtest_S3,
-    'S4': backtest_S4,
-    'S5': backtest_S5,
-}
-
-STRATEGY_NAMES = {
-    'S0': 'Baseline — Fixed TP 3% / SL 15%',
-    'S1': 'EMA9/21 Reversal Exit (TP cap 3%)',
-    'S2': 'RSI Overbought/Oversold Exit (TP cap 3%)',
-    'S3': 'Signal Score TP Tier (max 3%)',
-    'S4': 'Tiered Time Stall Exit (TP cap 3%)',
-    'S5': 'Breakeven Lock + EMA Reversal Exit (TP cap 3%)',
-}
-
-# ── Stats ──────────────────────────────────────────────────
-def stats(trades):
+# ── Stats ────────────────────────────────────────────────────────
+def compute_stats(trades):
     if not trades:
         return {
-            'total': 0, 'win_rate': 0.0, 'profit_factor': 0.0,
-            'net_pnl': 0.0, 'max_drawdown': 0.0,
-            'avg_win': 0.0, 'avg_loss': 0.0, 'expectancy': 0.0,
+            'total': 0, 'win_rate': 0.0, 'profit_factor': 0.0, 'net_pnl': 0.0,
+            'max_drawdown': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0, 'expectancy': 0.0,
             'longs': 0, 'shorts': 0, 'monthly': {}, 'per_coin': {},
         }
-    wins = losses = longs = shorts = 0
-    gp = gl = net_pnl = 0.0
-    win_pnls = []; loss_pnls = []
-    monthly = {}; per_coin = {}
+    total = len(trades)
+    wins = [t for t in trades if t['pnl'] > 0]
+    losses = [t for t in trades if t['pnl'] <= 0]
+    win_rate = len(wins) / total * 100
+    gross_win = sum(t['pnl'] for t in wins)
+    gross_loss = abs(sum(t['pnl'] for t in losses))
+    pf = gross_win / gross_loss if gross_loss > 0 else (float('inf') if gross_win > 0 else 0.0)
+    net_pnl = sum(t['pnl'] for t in trades)
+    avg_win = gross_win / len(wins) if wins else 0.0
+    avg_loss = gross_loss / len(losses) if losses else 0.0
+    expectancy = net_pnl / total
 
-    sorted_trades = sorted(trades, key=lambda t: t['entry_ts'])
-    equity = 0.0; peak = 0.0; max_dd = 0.0
-
+    sorted_trades = sorted(trades, key=lambda t: t['exit_ts'])
+    equity, peak, max_dd = 0.0, 0.0, 0.0
     for t in sorted_trades:
-        pnl = t['pnl']
-        net_pnl += pnl
-        equity += pnl
-        if equity > peak:
-            peak = equity
-        dd = (peak - equity) / max(abs(peak), 1) * 100 if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
+        equity += t['pnl']
+        peak = max(peak, equity)
+        dd = peak - equity
+        max_dd = max(max_dd, dd)
 
-        if pnl > 0:
-            wins += 1; gp += pnl; win_pnls.append(pnl)
-        elif pnl < 0:
-            losses += 1; gl += abs(pnl); loss_pnls.append(pnl)
+    monthly = {}
+    for t in trades:
+        dt = datetime.fromtimestamp(t['exit_ts'], tz=timezone.utc)
+        key = f"{dt.year:04d}-{dt.month:02d}"
+        m = monthly.setdefault(key, {'pnl': 0.0, 'n': 0, 'w': 0})
+        m['pnl'] += t['pnl']; m['n'] += 1
+        if t['pnl'] > 0: m['w'] += 1
 
-        if t['side'] == 'buy':
-            longs += 1
-        else:
-            shorts += 1
-
-        # Monthly
-        dt = datetime.utcfromtimestamp(t['entry_ts'] / 1000)
-        mk = dt.strftime('%Y-%m')
-        if mk not in monthly:
-            monthly[mk] = {'pnl': 0.0, 'n': 0, 'w': 0}
-        monthly[mk]['pnl'] += pnl
-        monthly[mk]['n'] += 1
-        if pnl > 0:
-            monthly[mk]['w'] += 1
-
-        # Per coin
-        sym = t['symbol']
-        if sym not in per_coin:
-            per_coin[sym] = {'pnl': 0.0, 'n': 0, 'w': 0, 'wr': 0.0}
-        per_coin[sym]['pnl'] += pnl
-        per_coin[sym]['n'] += 1
-        if pnl > 0:
-            per_coin[sym]['w'] += 1
-
-    total = wins + losses
-    for sym in per_coin:
-        d = per_coin[sym]
-        d['wr'] = round(d['w'] / d['n'] * 100, 1) if d['n'] else 0.0
-        d['pnl'] = round(d['pnl'], 4)
-
-    pf = (gp / gl) if gl > 0 else (float('inf') if gp > 0 else 0.0)
-    avg_win  = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0.0
-    avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
-    expectancy = (wins/total * avg_win + losses/total * avg_loss) if total else 0.0
+    per_coin = {}
+    for t in trades:
+        c = per_coin.setdefault(t['symbol'], {'pnl': 0.0, 'n': 0, 'w': 0, 'wr': 0.0})
+        c['pnl'] += t['pnl']; c['n'] += 1
+        if t['pnl'] > 0: c['w'] += 1
+    for c in per_coin.values():
+        c['wr'] = c['w'] / c['n'] * 100 if c['n'] else 0.0
 
     return {
-        'total':         total,
-        'win_rate':      round(wins / total * 100, 2) if total else 0.0,
-        'profit_factor': round(pf, 4),
-        'net_pnl':       round(net_pnl, 4),
-        'max_drawdown':  round(max_dd, 2),
-        'avg_win':       round(avg_win, 4),
-        'avg_loss':      round(avg_loss, 4),
-        'expectancy':    round(expectancy, 4),
-        'longs':         longs,
-        'shorts':        shorts,
-        'monthly':       {k: {kk: round(vv,4) if isinstance(vv,float) else vv
-                              for kk,vv in v.items()}
-                          for k,v in sorted(monthly.items())},
-        'per_coin':      per_coin,
+        'total': total, 'win_rate': round(win_rate, 2), 'profit_factor': round(pf, 3) if pf != float('inf') else 999.0,
+        'net_pnl': round(net_pnl, 2), 'max_drawdown': round(max_dd, 2),
+        'avg_win': round(avg_win, 2), 'avg_loss': round(avg_loss, 2), 'expectancy': round(expectancy, 3),
+        'longs': sum(1 for t in trades if t['side'] == 'buy'),
+        'shorts': sum(1 for t in trades if t['side'] == 'sell'),
+        'monthly': monthly, 'per_coin': per_coin,
     }
 
-# ── Shard Runner ───────────────────────────────────────────
+# ── Shard runner ────────────────────────────────────────────────
 def run_shard(shard_idx):
     symbols = ALL_SYMBOLS[shard_idx::NUM_SHARDS]
-    print(f"[Shard {shard_idx}] {len(symbols)} coins: {symbols}", flush=True)
-
-    # Fetch all candles in parallel
-    coin_candles = {}
-    def fetch_one(sym):
-        c = fetch_symbol(sym)
-        return sym, c
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(fetch_one, sym): sym for sym in symbols}
-        for f in as_completed(futs):
-            sym, candles = f.result()
-            coin_candles[sym] = candles
-            print(f"[Shard {shard_idx}] {sym}: {len(candles)} candles", flush=True)
-
-    # Check for geo-block
-    total_candles = sum(len(v) for v in coin_candles.values())
-    if total_candles == 0:
-        print(f"[Shard {shard_idx}] ERROR: 0 candles fetched — possible geo-block!", flush=True)
-        # Write empty shard
-        result = {'shard': shard_idx, 'symbols': symbols, 'with_data': [],
-                  'strategies': {}, 'elapsed': 0.0, 'error': 'geo_block'}
-        with open(f'shard_{shard_idx}.json', 'w') as f:
-            json.dump(result, f)
-        return
-
     t0 = time.time()
-    with_data = [sym for sym, c in coin_candles.items() if len(c) >= MIN_BARS]
+    all_trades = {sid: [] for sid in STRATEGIES}
+    with_data = []
 
-    strategy_results = {}
-    for strat in STRATEGIES:
-        fn = STRATEGY_FNS[strat]
-        all_trades = []
-        for sym in with_data:
-            trades = fn(sym, coin_candles[sym])
-            all_trades.extend(trades)
-        strategy_results[strat] = {
-            'trades': all_trades,
-            'stats':  stats(all_trades),
-        }
-        print(f"[Shard {shard_idx}] {strat}: {len(all_trades)} trades", flush=True)
+    for symbol in symbols:
+        tfs = fetch_symbol_all_tfs(symbol)
+        if '15m' not in tfs and '1h' not in tfs:
+            continue
+        with_data.append(symbol)
 
-    elapsed = round(time.time() - t0, 2)
-    result = {
-        'shard':      shard_idx,
-        'symbols':    symbols,
-        'with_data':  with_data,
-        'strategies': strategy_results,
-        'elapsed':    elapsed,
+        ctx_15m = build_ctx(tfs['15m']) if '15m' in tfs else None
+        ctx_1h  = build_ctx(tfs['1h']) if '1h' in tfs else None
+
+        for strat_id, cfg in STRATEGIES.items():
+            tf = cfg['tf']
+            ctx = ctx_15m if tf == '15m' else ctx_1h
+            if ctx is None:
+                continue
+            htf_ctx = None
+            if strat_id == 'S8_MTF_CONFLUENCE':
+                htf_ctx = ctx_1h
+                if htf_ctx is None:
+                    continue
+            trades = backtest_strategy(strat_id, symbol, ctx, htf_ctx)
+            all_trades[strat_id].extend(trades)
+
+    out = {
+        'shard': shard_idx,
+        'symbols': symbols,
+        'with_data': with_data,
+        'trades_by_strategy': all_trades,
+        'elapsed': round(time.time() - t0, 1),
     }
     with open(f'shard_{shard_idx}.json', 'w') as f:
-        json.dump(result, f)
-    print(f"[Shard {shard_idx}] done in {elapsed}s", flush=True)
+        json.dump(out, f)
+    print(f"Shard {shard_idx} done: {len(with_data)}/{len(symbols)} coins with data, "
+          f"{sum(len(v) for v in all_trades.values())} total trades, {out['elapsed']}s")
 
-# ── Merge ──────────────────────────────────────────────────
+# ── Merge ───────────────────────────────────────────────────────
 def merge_shards():
-    all_strategy_trades = {s: [] for s in STRATEGIES}
-    all_with_data = set()
-    all_symbols = set()
-    shard_errors = []
+    combined_trades = {sid: [] for sid in STRATEGIES}
+    all_symbols_attempted = []
+    all_with_data = []
 
     for idx in range(NUM_SHARDS):
         fname = f'shard_{idx}.json'
         if not os.path.exists(fname):
-            print(f"WARNING: {fname} missing", flush=True)
+            print(f"WARNING: {fname} missing, skipping")
             continue
         with open(fname) as f:
-            shard = json.load(f)
-        if shard.get('error'):
-            shard_errors.append(idx)
-            continue
-        all_symbols.update(shard.get('symbols', []))
-        all_with_data.update(shard.get('with_data', []))
-        for strat in STRATEGIES:
-            if strat in shard.get('strategies', {}):
-                all_strategy_trades[strat].extend(
-                    shard['strategies'][strat].get('trades', []))
+            data = json.load(f)
+        all_symbols_attempted.extend(data['symbols'])
+        all_with_data.extend(data['with_data'])
+        for sid, trades in data['trades_by_strategy'].items():
+            combined_trades[sid].extend(trades)
 
-    # Build combined stats per strategy
-    combined = {}
-    for strat in STRATEGIES:
-        combined[strat] = {
-            'name':   STRATEGY_NAMES[strat],
-            'trades': all_strategy_trades[strat],
-            'stats':  stats(all_strategy_trades[strat]),
-        }
+    if not all_with_data:
+        with open('backtest_summary.txt', 'w') as f:
+            f.write("ERROR: 0 symbols returned data across all shards.\n"
+                    "Likely geo-block on Binance Vision or network issue in Actions runner.\n")
+        with open('backtest_report.json', 'w') as f:
+            json.dump({'error': 'no_data'}, f)
+        return
 
     report = {
-        'period':       f"{START_YM[0]}-{START_YM[1]:02d} to {END_YM[0]}-{END_YM[1]:02d}",
-        'timeframe':    TIMEFRAME,
-        'symbols_attempted': len(all_symbols),
-        'symbols_with_data': len(all_with_data),
-        'capital':      CAPITAL,
-        'risk_pct':     RISK_PCT,
-        'leverage':     LEVERAGE,
-        'fee':          FEE,
-        'slip':         SLIP,
-        'tp_cap':       TP_PCT,
-        'sl_pct':       SL_PCT,
-        'shard_errors': shard_errors,
-        'strategies':   combined,
+        'period': f"{START_YM[0]}-{START_YM[1]:02d} to {END_YM[0]}-{END_YM[1]:02d}",
+        'symbols_attempted': len(set(all_symbols_attempted)),
+        'symbols_with_data': len(set(all_with_data)),
+        'leverage': LEVERAGE,
+        'capital': CAPITAL,
+        'strategies': {}
     }
 
-    with open('backtest_report.json', 'w') as f:
-        json.dump(report, f, indent=2)
+    summary_lines = []
+    summary_lines.append("=" * 70)
+    summary_lines.append("8-STRATEGY EXPLORATION BACKTEST — SUMMARY REPORT")
+    summary_lines.append("=" * 70)
+    summary_lines.append(f"Period: {report['period']}")
+    summary_lines.append(f"Symbols attempted: {report['symbols_attempted']}  |  With data: {report['symbols_with_data']}")
+    summary_lines.append(f"Capital: ${CAPITAL:,.0f}  |  Leverage: {LEVERAGE}x  |  Risk/trade: {RISK_PCT*100:.2f}%")
+    summary_lines.append(f"Fee: {FEE*100:.3f}%  |  Slippage: {SLIP*100:.3f}%")
+    summary_lines.append("")
 
-    # ── Summary Text ───────────────────────────────────────
-    lines = []
-    lines.append("=" * 70)
-    lines.append("  GMaxV1 MULTI-STRATEGY BACKTEST REPORT")
-    lines.append("=" * 70)
-    lines.append(f"  Period    : {report['period']}")
-    lines.append(f"  Timeframe : {TIMEFRAME} | Leverage: {LEVERAGE}x")
-    lines.append(f"  Capital   : ${CAPITAL:,.0f} | Risk: {RISK_PCT*100:.2f}% per trade")
-    lines.append(f"  Fees      : {FEE*100:.2f}% + {SLIP*100:.2f}% slip per side")
-    lines.append(f"  TP Cap    : {TP_PCT*100:.1f}% | SL: {SL_PCT*100:.1f}%")
-    lines.append(f"  Coins     : {len(all_with_data)}/{len(all_symbols)} had sufficient data")
-    if shard_errors:
-        lines.append(f"  ⚠ Shard errors: {shard_errors}")
-    lines.append("")
+    ranked = []
+    for sid, cfg in STRATEGIES.items():
+        trades = combined_trades[sid]
+        stats = compute_stats(trades)
+        report['strategies'][sid] = {'name': cfg['name'], 'tf': cfg['tf'], 'tp': cfg['tp'], 'sl': cfg['sl'], 'stats': stats}
+        ranked.append((sid, cfg, stats))
 
-    for strat in STRATEGIES:
-        d  = combined[strat]
-        st = d['stats']
-        lines.append("-" * 70)
-        lines.append(f"  [{strat}] {d['name']}")
-        lines.append("-" * 70)
-        lines.append(f"  Trades       : {st['total']}  |  Longs: {st['longs']}  Shorts: {st['shorts']}")
-        lines.append(f"  Win Rate     : {st['win_rate']:.2f}%")
-        lines.append(f"  Profit Factor: {st['profit_factor']:.4f}")
-        lines.append(f"  Net PnL      : ${st['net_pnl']:,.2f}")
-        lines.append(f"  Max Drawdown : {st['max_drawdown']:.2f}%")
-        lines.append(f"  Avg Win      : ${st['avg_win']:.2f}  |  Avg Loss: ${st['avg_loss']:.2f}")
-        lines.append(f"  Expectancy   : ${st['expectancy']:.4f}")
+    # sort by profit factor then win rate for the leaderboard
+    ranked_sorted = sorted(ranked, key=lambda x: (x[2]['profit_factor'], x[2]['win_rate']), reverse=True)
 
-        # Exit reason breakdown
-        reason_counts = {}
-        for t in d['trades']:
-            r = t['reason']
-            reason_counts[r] = reason_counts.get(r, 0) + 1
-        if reason_counts:
-            lines.append(f"  Exit Reasons : " +
-                "  ".join(f"{k}={v}" for k,v in sorted(reason_counts.items())))
-
-        # Recommendation
-        usable = st['profit_factor'] >= 1.5 and st['win_rate'] >= 42
-        lines.append(f"  RECOMMENDATION: {'✅ USABLE' if usable else '❌ NOT USABLE'}"
-                     f"  (PF≥1.5 and WR≥42% required)")
-
-        # Top 20 coins by net PnL
-        per_coin = st['per_coin']
-        top_coins = sorted(per_coin.items(), key=lambda x: x[1]['pnl'], reverse=True)[:20]
-        if top_coins:
-            lines.append("")
-            lines.append(f"  Top 20 Coins by Net PnL:")
-            lines.append(f"  {'Symbol':<22} {'Trades':>6} {'WR%':>7} {'PnL':>10}")
-            lines.append(f"  {'-'*22} {'-'*6} {'-'*7} {'-'*10}")
-            for sym, cd in top_coins:
-                lines.append(f"  {sym:<22} {cd['n']:>6} {cd['wr']:>6.1f}% ${cd['pnl']:>9.2f}")
-
-        # Monthly PnL
-        monthly = st['monthly']
-        if monthly:
-            lines.append("")
-            lines.append(f"  Monthly PnL:")
-            lines.append(f"  {'Month':<10} {'Trades':>6} {'Wins':>5} {'PnL':>10}")
-            lines.append(f"  {'-'*10} {'-'*6} {'-'*5} {'-'*10}")
-            for mk in sorted(monthly.keys()):
-                md = monthly[mk]
-                lines.append(f"  {mk:<10} {md['n']:>6} {md['w']:>5} ${md['pnl']:>9.2f}")
-        lines.append("")
-
-    # Strategy comparison table
-    lines.append("=" * 70)
-    lines.append("  STRATEGY COMPARISON")
-    lines.append("=" * 70)
-    lines.append(f"  {'ID':<4} {'Trades':>7} {'WR%':>7} {'PF':>7} {'Net PnL':>12} {'MaxDD%':>8}")
-    lines.append(f"  {'-'*4} {'-'*7} {'-'*7} {'-'*7} {'-'*12} {'-'*8}")
-    for strat in STRATEGIES:
-        st = combined[strat]['stats']
-        lines.append(
-            f"  {strat:<4} {st['total']:>7} {st['win_rate']:>6.1f}% "
-            f"{st['profit_factor']:>7.4f} ${st['net_pnl']:>11.2f} {st['max_drawdown']:>7.2f}%"
+    summary_lines.append("-" * 70)
+    summary_lines.append("LEADERBOARD (ranked by profit factor)")
+    summary_lines.append("-" * 70)
+    summary_lines.append(f"{'Strategy':<28}{'TF':<6}{'Trades':<8}{'WR%':<8}{'PF':<8}{'NetPnL':<12}{'MaxDD':<10}{'Verdict'}")
+    for sid, cfg, stats in ranked_sorted:
+        verdict = "USABLE" if (stats['profit_factor'] >= 1.5 and stats['win_rate'] >= 42 and stats['total'] >= 30) else "NOT USABLE"
+        summary_lines.append(
+            f"{cfg['name']:<28}{cfg['tf']:<6}{stats['total']:<8}{stats['win_rate']:<8}{stats['profit_factor']:<8}"
+            f"{stats['net_pnl']:<12}{stats['max_drawdown']:<10}{verdict}"
         )
-    lines.append("=" * 70)
+    summary_lines.append("")
 
-    summary_text = "\n".join(lines)
+    for sid, cfg, stats in ranked_sorted:
+        summary_lines.append("=" * 70)
+        summary_lines.append(f"{sid} — {cfg['name']}  (TF: {cfg['tf']}, TP: {cfg['tp']*100:.1f}%, SL: {cfg['sl']*100:.1f}%)")
+        summary_lines.append("=" * 70)
+        if stats['total'] == 0:
+            summary_lines.append("No trades generated.")
+            summary_lines.append("")
+            continue
+        summary_lines.append(f"Total trades: {stats['total']}  |  Win rate: {stats['win_rate']}%  |  Profit Factor: {stats['profit_factor']}")
+        summary_lines.append(f"Net PnL: ${stats['net_pnl']:,.2f}  |  Max Drawdown: ${stats['max_drawdown']:,.2f}")
+        summary_lines.append(f"Avg Win: ${stats['avg_win']:,.2f}  |  Avg Loss: ${stats['avg_loss']:,.2f}  |  Expectancy: ${stats['expectancy']:,.3f}")
+        summary_lines.append(f"Longs: {stats['longs']}  |  Shorts: {stats['shorts']}")
+        verdict = "✅ USABLE" if (stats['profit_factor'] >= 1.5 and stats['win_rate'] >= 42 and stats['total'] >= 30) else "❌ NOT USABLE"
+        summary_lines.append(f"RECOMMENDATION: {verdict} (threshold: PF>=1.5, WR>=42%, trades>=30)")
+        summary_lines.append("")
+        top_coins = sorted(stats['per_coin'].items(), key=lambda x: x[1]['pnl'], reverse=True)[:15]
+        summary_lines.append("Top 15 coins by net PnL:")
+        for sym, c in top_coins:
+            summary_lines.append(f"  {sym:<18}trades={c['n']:<5}wr={c['wr']:.1f}%   pnl=${c['pnl']:,.2f}")
+        summary_lines.append("")
+        summary_lines.append("Monthly PnL:")
+        for month in sorted(stats['monthly'].keys()):
+            md = stats['monthly'][month]
+            summary_lines.append(f"  {month}:  pnl=${md['pnl']:,.2f}   trades={md['n']}   wins={md['w']}")
+        summary_lines.append("")
+
     with open('backtest_summary.txt', 'w') as f:
-        f.write(summary_text)
+        f.write("\n".join(summary_lines))
+    with open('backtest_report.json', 'w') as f:
+        json.dump(report, f)
 
-    print(summary_text, flush=True)
+    print("Merge complete. backtest_summary.txt and backtest_report.json written.")
 
-    # Zip both outputs
-    with zipfile.ZipFile('backtest_results.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.write('backtest_report.json')
-        zf.write('backtest_summary.txt')
-    print("\n✅ backtest_results.zip created (backtest_report.json + backtest_summary.txt)", flush=True)
-
-# ── Entry Point ────────────────────────────────────────────
-if __name__ == '__main__':
+# ── Entry point ────────────────────────────────────────────────
+if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python backtest.py <shard_index|merge>")
+        print("Usage: python backtest.py <shard_idx|merge>")
         sys.exit(1)
     arg = sys.argv[1]
-    if arg == 'merge':
+    if arg == "merge":
         merge_shards()
     else:
         run_shard(int(arg))
-
