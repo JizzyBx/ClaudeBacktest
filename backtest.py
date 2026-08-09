@@ -133,31 +133,30 @@ SLIP      = 0.0002       # 0.02%
 LEVERAGE  = 5             # per user instruction: minimum 5x
 MIN_BARS  = 60            # warmup bars before any signal can fire (lower TF bar count is coarser now)
 
-TIMEFRAMES_NEEDED = ['15m', '1h']  # only what S8 + S8_REFINED actually need
+TIMEFRAMES_NEEDED = ['15m', '1h']
 
 # ── Strategy Definitions ──────────────────────────────────────────
 # Each strategy declares entry tf + the bias tf(s) it needs for confirmation.
-# Trimmed to S8 (original) + S8_REFINED only for this run — testing both against
-# the full 527-coin universe. Other exploratory strategies (M1-M7) all showed
-# flat/negative edge in prior batches; dropping them keeps this run's fetch load
-# manageable on the free-tier 20-shard limit with 4.5x more coins than before.
+# S8 original dropped — fully tested on 527 coins, PF 0.947 with correct ADX,
+# not usable. Refined carries forward as the sole EMA-confluence lineage.
+# S9 is a structurally new signal family (RSI divergence + S/R reclaim) — not
+# trend-alignment-based like everything tested so far.
 STRATEGIES = {
-    'S8_MTF_CONFLUENCE': {
-        # ORIGINAL, UNCHANGED — the only strategy across all prior batches with PF > 1.0
-        # (PF 1.345, WR 51.2%, Sharpe 1.695 on the 117-coin universe). Permanent control.
-        'name': 'MTF Confluence ORIGINAL (1h bias + 15m entry)',
-        'tf': '15m', 'bias_tfs': ['1h'], 'tp': 0.05, 'sl': 0.035,
-    },
     'S8R_MTF_CONFLUENCE_REFINED': {
-        # REFINED VARIANT — same core mechanism, two changes being tested:
-        # 1. TP widened 5.0% -> 5.5% (tests if edge survives a better R:R before assuming
-        #    win rate holds up)
-        # 2. Long-side confirmation tightened (stronger bullish separation required) to
-        #    address the 56-long/188-short imbalance seen in the original's results —
-        #    testing whether that skew was a real regime effect or an artifact of a
-        #    slightly looser long-side trigger.
-        'name': 'MTF Confluence REFINED (wider TP, balanced long/short filter)',
-        'tf': '15m', 'bias_tfs': ['1h'], 'tp': 0.055, 'sl': 0.035,
+        # TP/SL changed per explicit request: 2% TP / 8% SL. This needs an 80%
+        # breakeven win rate — far above the 43.8% WR this signal logic actually
+        # achieved with 5.5%/3.5% TP/SL. Kept in specifically to let the backtest
+        # settle the question rather than deciding by argument.
+        'name': 'MTF Confluence REFINED (TP 2% / SL 8%)',
+        'tf': '15m', 'bias_tfs': ['1h'], 'tp': 0.02, 'sl': 0.08,
+    },
+    'S9_RSI_DIV_SR_RECLAIM': {
+        # NEW strategy family — reversal/divergence based, not trend-alignment.
+        # Confirmation 1: regular RSI divergence (price extreme not confirmed by RSI)
+        # Confirmation 2: price reclaims a recent swing level in the reversal direction
+        # Confirmation 3: 1h trend NOT strongly opposed (avoids fighting a strong HTF trend)
+        'name': 'RSI Divergence + S/R Reclaim',
+        'tf': '15m', 'bias_tfs': ['1h'], 'tp': 0.045, 'sl': 0.03,
     },
 }
 
@@ -417,44 +416,16 @@ def htf_trend_bear(ctx, idx):
 
 # ── Signal functions — each returns 'buy' / 'sell' / None on bar i ──
 
-def sig_s8_mtf_confluence(ctx, i, bias_ctxs):
-    """
-    RESTORED, UNCHANGED from the batch where it scored PF 1.309 / WR ~57% / 223 trades.
-    Confirmation 1: 15m EMA9/21 fresh cross (entry trigger)
-    Confirmation 2: 1h EMA9/21 separation meaningful (>0.2%), not a marginal cross
-    Confirmation 3: 15m ADX > 20 (momentum confirmed, not chop)
-    """
-    e9, e21, adx = ctx['e9'], ctx['e21'], ctx['adx']
-    if i < 1 or None in (e9[i], e21[i], e9[i-1], e21[i-1], adx[i]):
-        return None
-    htf_ctx, htf_idx = bias_ctxs['1h']
-    if htf_ctx is None or htf_idx is None:
-        return None
-    htf_e9, htf_e21 = htf_ctx['e9'], htf_ctx['e21']
-    if htf_idx >= len(htf_e9) or htf_e9[htf_idx] is None or htf_e21[htf_idx] is None or not htf_e21[htf_idx]:
-        return None
-    htf_sep = (htf_e9[htf_idx] - htf_e21[htf_idx]) / htf_e21[htf_idx] * 100
-    htf_bull = htf_sep > 0.2
-    htf_bear = htf_sep < -0.2
-    crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
-    crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
-    if crossed_up and htf_bull and adx[i] > 20:
-        return 'buy'
-    if crossed_dn and htf_bear and adx[i] > 20:
-        return 'sell'
-    return None
-
 def sig_s8_refined_mtf_confluence(ctx, i, bias_ctxs):
     """
     REFINED variant of S8. Same core mechanism (15m EMA9/21 cross + 1h bias +
-    ADX filter), with two deliberate changes to test against the original:
+    ADX filter), with two deliberate changes tested against the original:
     1. Long-side bullish separation threshold raised from 0.2% to 0.35% — the
        original showed a 56-long/188-short imbalance; this tests whether that
        skew was a genuine regime effect (refinement won't fix it) or partly an
-       artifact of a looser long trigger (refinement should partially rebalance it).
-       Short-side threshold left unchanged at -0.2% for direct comparison.
+       artifact of a looser long trigger. Short-side threshold left at -0.2%.
     2. ADX floor raised from 20 to 23 on both sides for modestly higher selectivity.
-    TP widened to 5.5% (from 5.0%) via STRATEGIES config; SL unchanged at 3.5%.
+    TP/SL now 2%/8% per explicit request — breakeven WR required is 80%.
     """
     e9, e21, adx = ctx['e9'], ctx['e21'], ctx['adx']
     if i < 1 or None in (e9[i], e21[i], e9[i-1], e21[i-1], adx[i]):
@@ -476,9 +447,73 @@ def sig_s8_refined_mtf_confluence(ctx, i, bias_ctxs):
         return 'sell'
     return None
 
+def sig_s9_rsi_div_sr_reclaim(ctx, i, bias_ctxs):
+    """
+    NEW strategy family: RSI Divergence + Support/Resistance Reclaim.
+    Structurally different from S8/S8R — this is reversal-based, not trend-
+    alignment-based, so it should behave differently in regimes where EMA-cross
+    confluence fails (e.g. choppy/ranging conditions, or exhaustion at extremes).
+
+    Confirmation 1 (divergence): over the lookback window, find the most recent
+    swing low/high in price and the corresponding RSI value at that swing. If
+    price makes a LOWER low but RSI makes a HIGHER low (bullish divergence), or
+    price makes a HIGHER high but RSI makes a LOWER high (bearish divergence),
+    that's genuine regular divergence — a classic reversal signal.
+
+    Confirmation 2 (reclaim): price must close back above/below a recent swing
+    level (structure reclaim), confirming the reversal is actually happening,
+    not just diverging on paper.
+
+    Confirmation 3 (HTF not opposed): 1h EMA9/21 must not be strongly against
+    the reversal direction — avoids fighting a strong higher-timeframe trend.
+    """
+    closes, highs, lows, rsi = ctx['closes'], ctx['highs'], ctx['lows'], ctx['rsi']
+    if i < 40 or rsi[i] is None:
+        return None
+
+    lookback = 30
+    # find the two most recent distinct local lows / highs in the lookback window
+    # (simple local-extreme detection: a bar lower/higher than both neighbors)
+    local_lows, local_highs = [], []
+    for j in range(i - lookback, i - 1):
+        if j < 1:
+            continue
+        if lows[j] < lows[j-1] and lows[j] < lows[j+1]:
+            local_lows.append(j)
+        if highs[j] > highs[j-1] and highs[j] > highs[j+1]:
+            local_highs.append(j)
+
+    htf_ctx, htf_idx = bias_ctxs['1h']
+    if htf_ctx is None or htf_idx is None:
+        return None
+    htf_e9, htf_e21 = htf_ctx['e9'], htf_ctx['e21']
+    if htf_idx >= len(htf_e9) or htf_e9[htf_idx] is None or htf_e21[htf_idx] is None or not htf_e21[htf_idx]:
+        return None
+    htf_sep = (htf_e9[htf_idx] - htf_e21[htf_idx]) / htf_e21[htf_idx] * 100
+
+    # Bullish divergence: two most recent local lows, second one lower in price
+    # but higher (or equal-ish) in RSI, then price reclaims above that swing's high.
+    if len(local_lows) >= 2:
+        j1, j2 = local_lows[-2], local_lows[-1]  # j1 earlier, j2 more recent
+        if lows[j2] < lows[j1] and rsi[j2] is not None and rsi[j1] is not None and rsi[j2] > rsi[j1] + 2:
+            reclaim_level = max(highs[j2:i])
+            if closes[i] > reclaim_level and closes[i] > closes[i-1] and htf_sep > -0.5:
+                return 'buy'
+
+    # Bearish divergence: two most recent local highs, second one higher in price
+    # but lower in RSI, then price reclaims (breaks down) below that swing's low.
+    if len(local_highs) >= 2:
+        j1, j2 = local_highs[-2], local_highs[-1]
+        if highs[j2] > highs[j1] and rsi[j2] is not None and rsi[j1] is not None and rsi[j2] < rsi[j1] - 2:
+            reclaim_level = min(lows[j2:i])
+            if closes[i] < reclaim_level and closes[i] < closes[i-1] and htf_sep < 0.5:
+                return 'sell'
+
+    return None
+
 SIGNAL_FUNCS = {
-    'S8_MTF_CONFLUENCE': sig_s8_mtf_confluence,
     'S8R_MTF_CONFLUENCE_REFINED': sig_s8_refined_mtf_confluence,
+    'S9_RSI_DIV_SR_RECLAIM': sig_s9_rsi_div_sr_reclaim,
 }
 
 # ── Backtest a single strategy against a single symbol's candles ──
@@ -809,3 +844,4 @@ if __name__ == "__main__":
         merge_shards()
     else:
         run_shard(int(arg))
+
