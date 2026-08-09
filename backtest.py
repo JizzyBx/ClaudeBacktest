@@ -45,11 +45,17 @@ SLIP      = 0.0002       # 0.02%
 LEVERAGE  = 5             # per user instruction: minimum 5x
 MIN_BARS  = 60            # warmup bars before any signal can fire (lower TF bar count is coarser now)
 
-TIMEFRAMES_NEEDED = ['30m', '1h', '2h', '4h']
+TIMEFRAMES_NEEDED = ['15m', '30m', '1h', '2h', '4h']
 
 # ── Strategy Definitions ──────────────────────────────────────────
 # Each strategy declares entry tf + the bias tf(s) it needs for confirmation.
 STRATEGIES = {
+    'S8_MTF_CONFLUENCE': {
+        # RESTORED BASELINE — the only strategy across all prior batches with PF > 1.0.
+        # Kept unchanged as a permanent control so it never gets lost in future rebuilds.
+        'name': 'MTF Confluence (1h bias + 15m entry, tight)',
+        'tf': '15m', 'bias_tfs': ['1h'], 'tp': 0.05, 'sl': 0.035,
+    },
     'M1_HTF_TREND_MOM_VOL': {
         'name': 'HTF Trend + Momentum + Volume Triple-Confirm',
         'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.06, 'sl': 0.04,
@@ -70,9 +76,17 @@ STRATEGIES = {
         'name': 'Donchian Breakout + HTF Trend Filter + ADX Strength',
         'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.065, 'sl': 0.045,
     },
+    'M6_VWAP_TREND_VOLDELTA': {
+        'name': 'VWAP Anchored Pullback + Volume Delta Momentum (high-vol coins)',
+        'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.05, 'sl': 0.032,
+    },
+    'M7_ORB_RELVOL': {
+        'name': 'Opening Range Breakout + Relative Volume (high-vol coins)',
+        'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.055, 'sl': 0.035,
+    },
 }
 
-MAX_BARS_BY_TF = {'30m': 50, '1h': 45, '2h': 35, '4h': 25}
+MAX_BARS_BY_TF = {'15m': 60, '30m': 50, '1h': 45, '2h': 35, '4h': 25}
 
 # ── Data fetch (Binance Vision monthly archives) ──────────────────
 def month_range(start_ym, end_ym):
@@ -448,12 +462,153 @@ def sig_m5_donchian_htf_adx(ctx, i, bias_ctxs):
         return 'sell'
     return None
 
+def sig_s8_mtf_confluence(ctx, i, bias_ctxs):
+    """
+    RESTORED, UNCHANGED from the batch where it scored PF 1.309 / WR ~57% / 223 trades.
+    Confirmation 1: 15m EMA9/21 fresh cross (entry trigger)
+    Confirmation 2: 1h EMA9/21 separation meaningful (>0.2%), not a marginal cross
+    Confirmation 3: 15m ADX > 20 (momentum confirmed, not chop)
+    """
+    e9, e21, adx = ctx['e9'], ctx['e21'], ctx['adx']
+    if i < 1 or None in (e9[i], e21[i], e9[i-1], e21[i-1], adx[i]):
+        return None
+    htf_ctx, htf_idx = bias_ctxs['1h']
+    if htf_ctx is None or htf_idx is None:
+        return None
+    htf_e9, htf_e21 = htf_ctx['e9'], htf_ctx['e21']
+    if htf_idx >= len(htf_e9) or htf_e9[htf_idx] is None or htf_e21[htf_idx] is None or not htf_e21[htf_idx]:
+        return None
+    htf_sep = (htf_e9[htf_idx] - htf_e21[htf_idx]) / htf_e21[htf_idx] * 100
+    htf_bull = htf_sep > 0.2
+    htf_bear = htf_sep < -0.2
+    crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
+    crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
+    if crossed_up and htf_bull and adx[i] > 20:
+        return 'buy'
+    if crossed_dn and htf_bear and adx[i] > 20:
+        return 'sell'
+    return None
+
+def sig_m6_vwap_trend_voldelta(ctx, i, bias_ctxs):
+    """
+    VWAP Anchored Pullback + Volume Delta Momentum — real technique used by
+    high-volume futures traders (trades WITH trend, unlike the broken batch-2
+    VWAP-reversion attempt which faded it).
+    Confirmation 1: 4h trend established (EMA21 vs EMA50)
+    Confirmation 2: price pulls back to touch/near the rolling session VWAP on 1h,
+                     in the direction of the 4h trend (buy dips in uptrend, sell rips in downtrend)
+    Confirmation 3: volume delta accelerating — current bar volume > prior 3-bar avg
+                     AND rising over the last 2 bars (real participation returning on the bounce,
+                     not just a random spike)
+    """
+    closes, highs, lows, vols = ctx['closes'], ctx['highs'], ctx['lows'], ctx['vols']
+    if i < 30:
+        return None
+    # rolling 24-bar (24h on 1h tf) VWAP approximation, computed inline to avoid
+    # needing a separate context field
+    window = 24
+    tp_vol, vol_sum = 0.0, 0.0
+    for j in range(i - window, i):
+        tp = (highs[j] + lows[j] + closes[j]) / 3.0
+        tp_vol += tp * vols[j]
+        vol_sum += vols[j]
+    if vol_sum <= 0:
+        return None
+    vwap = tp_vol / vol_sum
+
+    htf_ctx, htf_idx = bias_ctxs['4h']
+    if htf_ctx is None or htf_idx is None:
+        return None
+    bull_htf = htf_trend_bull(htf_ctx, htf_idx)
+    bear_htf = htf_trend_bear(htf_ctx, htf_idx)
+    if bull_htf is None:
+        return None
+
+    near_vwap_from_above = lows[i] <= vwap * 1.003 and closes[i] > vwap * 0.997
+    near_vwap_from_below = highs[i] >= vwap * 0.997 and closes[i] < vwap * 1.003
+
+    avg_vol_3 = sum(vols[i-4:i-1]) / 3
+    vol_accelerating = vols[i] > avg_vol_3 * 1.15 and vols[i] > vols[i-1] > vols[i-2]
+
+    if bull_htf and near_vwap_from_above and closes[i] > closes[i-1] and vol_accelerating:
+        return 'buy'
+    if bear_htf and near_vwap_from_below and closes[i] < closes[i-1] and vol_accelerating:
+        return 'sell'
+    return None
+
+def sig_m7_orb_relvol(ctx, i, bias_ctxs):
+    """
+    Opening Range Breakout + Relative Volume — classic high-liquidity-coin day
+    trading strategy. Works best on liquid coins because deep order books make
+    breakouts more reliable (thin coins fake out constantly).
+    Confirmation 1: mark a fixed opening range (first 4 bars of each UTC day on 1h tf
+                     = first 4 hours) using session-anchoring via bar-of-day math
+    Confirmation 2: current bar breaks above/below that range's high/low
+    Confirmation 3: relative volume vs the same window's average over the last 5
+                     sessions confirms real participation (not just a lone spike)
+    Confirmation 4: 4h trend agrees with breakout direction (avoids fading HTF trend)
+    """
+    closes, highs, lows, vols, ts = ctx['closes'], ctx['highs'], ctx['lows'], ctx['vols'], ctx['ts']
+    if i < 120:
+        return None
+    SECONDS_PER_DAY = 86400
+    bar_of_day = (ts[i] % SECONDS_PER_DAY) // 3600  # hour of day, 1h bars
+    if bar_of_day < 4:
+        return None  # still inside or before the opening range itself
+
+    day_start_ts = ts[i] - (ts[i] % SECONDS_PER_DAY)
+    # find the index of this day's first bar
+    day_start_idx = None
+    for j in range(i, max(i - 30, -1), -1):
+        if ts[j] < day_start_ts:
+            day_start_idx = j + 1
+            break
+    if day_start_idx is None or day_start_idx + 4 > i:
+        return None
+    or_high = max(highs[day_start_idx:day_start_idx + 4])
+    or_low = min(lows[day_start_idx:day_start_idx + 4])
+    if or_high <= or_low:
+        return None
+
+    # only trigger on the first breakout bar after the opening range (bar_of_day == 4)
+    if bar_of_day != 4:
+        return None
+
+    # relative volume: this bar's volume vs avg volume at the same hour-of-day over last 5 days
+    same_hour_vols = []
+    for back in range(1, 6):
+        target_ts = ts[i] - back * SECONDS_PER_DAY
+        idx = find_htf_index(ts, target_ts)
+        if idx is not None and 0 <= idx < len(vols):
+            same_hour_vols.append(vols[idx])
+    if len(same_hour_vols) < 3:
+        return None
+    avg_same_hour_vol = sum(same_hour_vols) / len(same_hour_vols)
+    rel_vol_confirm = vols[i] > avg_same_hour_vol * 1.4
+
+    htf_ctx, htf_idx = bias_ctxs['4h']
+    if htf_ctx is None or htf_idx is None:
+        return None
+    bull_htf = htf_trend_bull(htf_ctx, htf_idx)
+    bear_htf = htf_trend_bear(htf_ctx, htf_idx)
+    if bull_htf is None:
+        return None
+
+    if closes[i] > or_high and rel_vol_confirm and bull_htf:
+        return 'buy'
+    if closes[i] < or_low and rel_vol_confirm and bear_htf:
+        return 'sell'
+    return None
+
 SIGNAL_FUNCS = {
+    'S8_MTF_CONFLUENCE': sig_s8_mtf_confluence,
     'M1_HTF_TREND_MOM_VOL': sig_m1_htf_trend_mom_vol,
     'M2_STACK_ADX_STRUCT': sig_m2_stack_adx_struct,
     'M3_MACD_ALIGN_BB': sig_m3_macd_align_bb,
     'M4_3LAYER_MTF': sig_m4_3layer_mtf,
     'M5_DONCHIAN_HTF_ADX': sig_m5_donchian_htf_adx,
+    'M6_VWAP_TREND_VOLDELTA': sig_m6_vwap_trend_voldelta,
+    'M7_ORB_RELVOL': sig_m7_orb_relvol,
 }
 
 # ── Backtest a single strategy against a single symbol's candles ──
@@ -550,7 +705,7 @@ def compute_stats(trades):
         return {
             'total': 0, 'win_rate': 0.0, 'profit_factor': 0.0, 'net_pnl': 0.0,
             'max_drawdown': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0, 'expectancy': 0.0,
-            'longs': 0, 'shorts': 0, 'monthly': {}, 'per_coin': {},
+            'sharpe': 0.0, 'longs': 0, 'shorts': 0, 'monthly': {}, 'per_coin': {},
         }
     total = len(trades)
     wins = [t for t in trades if t['pnl'] > 0]
@@ -572,6 +727,24 @@ def compute_stats(trades):
         dd = peak - equity
         max_dd = max(max_dd, dd)
 
+    # Sharpe ratio: based on per-trade PnL-as-%-of-capital returns, annualized by
+    # trade frequency (trades/year). This is a trade-level Sharpe, not a daily-equity
+    # Sharpe — appropriate here since trades are irregularly spaced, not daily bars.
+    returns = [t['pnl'] / CAPITAL for t in trades]
+    n_ret = len(returns)
+    mean_ret = sum(returns) / n_ret
+    var_ret = sum((r - mean_ret) ** 2 for r in returns) / n_ret if n_ret > 1 else 0.0
+    std_ret = var_ret ** 0.5
+    span_days = 1
+    if len(sorted_trades) >= 2:
+        span_seconds = sorted_trades[-1]['exit_ts'] - sorted_trades[0]['entry_ts']
+        span_days = max(span_seconds / 86400, 1)
+    trades_per_year = total / span_days * 365
+    if std_ret > 0:
+        sharpe = (mean_ret / std_ret) * (trades_per_year ** 0.5)
+    else:
+        sharpe = 0.0
+
     monthly = {}
     for t in trades:
         raw_ts = t['exit_ts']
@@ -591,16 +764,26 @@ def compute_stats(trades):
 
     per_coin = {}
     for t in trades:
-        c = per_coin.setdefault(t['symbol'], {'pnl': 0.0, 'n': 0, 'w': 0, 'wr': 0.0})
+        c = per_coin.setdefault(t['symbol'], {
+            'pnl': 0.0, 'n': 0, 'w': 0, 'wr': 0.0,
+            'gross_win': 0.0, 'gross_loss': 0.0, 'pf': 0.0,
+        })
         c['pnl'] += t['pnl']; c['n'] += 1
-        if t['pnl'] > 0: c['w'] += 1
+        if t['pnl'] > 0:
+            c['w'] += 1
+            c['gross_win'] += t['pnl']
+        else:
+            c['gross_loss'] += abs(t['pnl'])
     for c in per_coin.values():
         c['wr'] = c['w'] / c['n'] * 100 if c['n'] else 0.0
+        c['pf'] = round(c['gross_win'] / c['gross_loss'], 3) if c['gross_loss'] > 0 else (999.0 if c['gross_win'] > 0 else 0.0)
+        del c['gross_win']; del c['gross_loss']
 
     return {
         'total': total, 'win_rate': round(win_rate, 2), 'profit_factor': round(pf, 3),
         'net_pnl': round(net_pnl, 2), 'max_drawdown': round(max_dd, 2),
         'avg_win': round(avg_win, 2), 'avg_loss': round(avg_loss, 2), 'expectancy': round(expectancy, 3),
+        'sharpe': round(sharpe, 3),
         'longs': sum(1 for t in trades if t['side'] == 'buy'),
         'shorts': sum(1 for t in trades if t['side'] == 'sell'),
         'monthly': monthly, 'per_coin': per_coin,
@@ -702,12 +885,12 @@ def merge_shards():
     summary_lines.append("-" * 70)
     summary_lines.append("LEADERBOARD (ranked by profit factor)")
     summary_lines.append("-" * 70)
-    summary_lines.append(f"{'Strategy':<48}{'TF':<6}{'Trades':<8}{'WR%':<8}{'PF':<8}{'NetPnL':<12}{'MaxDD':<10}{'Verdict'}")
+    summary_lines.append(f"{'Strategy':<48}{'TF':<6}{'Trades':<8}{'WR%':<8}{'PF':<8}{'Sharpe':<9}{'NetPnL':<12}{'MaxDD':<10}{'Verdict'}")
     for sid, cfg, stats in ranked_sorted:
         verdict = "USABLE" if (stats['profit_factor'] >= 1.5 and stats['win_rate'] >= 42 and stats['total'] >= 30) else "NOT USABLE"
         summary_lines.append(
             f"{cfg['name']:<48}{cfg['tf']:<6}{stats['total']:<8}{stats['win_rate']:<8}{stats['profit_factor']:<8}"
-            f"{stats['net_pnl']:<12}{stats['max_drawdown']:<10}{verdict}"
+            f"{stats['sharpe']:<9}{stats['net_pnl']:<12}{stats['max_drawdown']:<10}{verdict}"
         )
     summary_lines.append("")
 
@@ -721,7 +904,7 @@ def merge_shards():
             summary_lines.append("No trades generated.")
             summary_lines.append("")
             continue
-        summary_lines.append(f"Total trades: {stats['total']}  |  Win rate: {stats['win_rate']}%  |  Profit Factor: {stats['profit_factor']}")
+        summary_lines.append(f"Total trades: {stats['total']}  |  Win rate: {stats['win_rate']}%  |  Profit Factor: {stats['profit_factor']}  |  Sharpe: {stats['sharpe']}")
         summary_lines.append(f"Net PnL: ${stats['net_pnl']:,.2f}  |  Max Drawdown: ${stats['max_drawdown']:,.2f}")
         summary_lines.append(f"Avg Win: ${stats['avg_win']:,.2f}  |  Avg Loss: ${stats['avg_loss']:,.2f}  |  Expectancy: ${stats['expectancy']:,.3f}")
         summary_lines.append(f"Longs: {stats['longs']}  |  Shorts: {stats['shorts']}")
@@ -729,9 +912,9 @@ def merge_shards():
         summary_lines.append(f"RECOMMENDATION: {verdict} (threshold: PF>=1.5, WR>=42%, trades>=30)")
         summary_lines.append("")
         top_coins = sorted(stats['per_coin'].items(), key=lambda x: x[1]['pnl'], reverse=True)[:15]
-        summary_lines.append("Top 15 coins by net PnL:")
+        summary_lines.append("Top 15 coins by net PnL (with per-coin PF):")
         for sym, c in top_coins:
-            summary_lines.append(f"  {sym:<18}trades={c['n']:<5}wr={c['wr']:.1f}%   pnl=${c['pnl']:,.2f}")
+            summary_lines.append(f"  {sym:<18}trades={c['n']:<5}wr={c['wr']:5.1f}%   pf={c['pf']:<7}pnl=${c['pnl']:,.2f}")
         summary_lines.append("")
         summary_lines.append("Monthly PnL:")
         for month in sorted(stats['monthly'].keys()):
@@ -756,4 +939,3 @@ if __name__ == "__main__":
         merge_shards()
     else:
         run_shard(int(arg))
-
