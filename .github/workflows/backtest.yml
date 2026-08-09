@@ -1,4 +1,4 @@
-name: 8-Strategy Exploration Backtest
+name: G Max 6-Variant Backtest
 
 on:
   workflow_dispatch:
@@ -6,11 +6,11 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +22,7 @@ jobs:
       - name: Run shard ${{ matrix.shard }}
         run: python backtest.py ${{ matrix.shard }}
 
-      - name: Upload shard result
+      - name: Upload shard ${{ matrix.shard }}
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
@@ -53,7 +53,7 @@ jobs:
       - name: Zip results
         run: zip backtest_results.zip backtest_report.json backtest_summary.txt
 
-      - name: Upload final zip
+      - name: Upload final results
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
