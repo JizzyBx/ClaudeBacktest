@@ -1,4 +1,4 @@
-name: G Max 6-Variant Backtest
+name: Sweep & Engulf Backtest
 
 on:
   workflow_dispatch:
@@ -10,16 +10,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Run shard ${{ matrix.shard }}
         run: python backtest.py ${{ matrix.shard }}
-      - name: Upload shard ${{ matrix.shard }}
+
+      - name: Upload shard result
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
@@ -30,21 +33,27 @@ jobs:
     needs: backtest
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Download all shards
         uses: actions/download-artifact@v4
         with:
           pattern: shard-*
           merge-multiple: true
-      - name: Merge
+
+      - name: Merge and generate report
         run: python backtest.py merge
+
       - name: Zip results
         run: zip backtest_results.zip backtest_report.json backtest_summary.txt
-      - name: Upload results
+
+      - name: Upload final zip
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
