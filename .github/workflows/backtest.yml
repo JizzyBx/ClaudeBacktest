@@ -1,4 +1,4 @@
-name: Sweep & Engulf Backtest
+name: Sweep & Engulf Dual Variant Backtest
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
         run: python backtest.py merge
 
       - name: Zip results
-        run: zip backtest_results.zip backtest_report.json backtest_summary.txt
+        run: zip backtest_results.zip backtest_1h_report.json backtest_1h_summary.txt backtest_4h_report.json backtest_4h_summary.txt
 
       - name: Upload final zip
         uses: actions/upload-artifact@v4
