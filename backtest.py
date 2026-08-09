@@ -10,26 +10,114 @@ import sys, os, json, csv, io, zipfile, urllib.request, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-# ── Coin Universe (117 coins, from GMax COINS_UNIVERSE) ──────────────
+# ── Coin Universe (527 coins, full Binance USDT-perpetual list) ──────
 ALL_SYMBOLS = [
-    '1000000BOBUSDT','1000BONKUSDT','1000CATUSDT','1000RATSUSDT','1000SATSUSDT',
-    'A2ZUSDT','ACHUSDT','AI16ZUSDT','AINUSDT','AIOTUSDT','ALGOUSDT','ALICEUSDT',
-    'ALPINEUSDT','ANKRUSDT','ARKMUSDT','ASRUSDT','ASTERUSDT','AUSDT','AWEUSDT',
-    'BANKUSDT','BASEDUSDT','BELUSDT','BIDUSDT','BMTUSDT','BTRUSDT','CFXUSDT',
-    'CHIPUSDT','COAIUSDT','COMBOUSDT','COMMONUSDT','CRCLUSDT','CUSDT','DAMUSDT',
-    'DEFIUSDT','DEXEUSDT','DIAUSDT','DMCUSDT','EIGENUSDT','ELSAUSDT','ENAUSDT',
-    'EPICUSDT','EPTUSDT','ETHUSDT','EVAAUSDT','FLNCUSDT','FLUXUSDT','FUNUSDT',
-    'FXSUSDT','GLMUSDT','GRIFFAINUSDT','GUAUSDT','HANAUSDT','HEMIUSDT','ICXUSDT',
-    'INITUSDT','IOUSDT','IPUSDT','KITEUSDT','LABUSDT','LIGHTUSDT','LRCUSDT',
-    'LYNUSDT','MAGICUSDT','MEGAUSDT','MILKUSDT','MOODENGUSDT','MTLUSDT','NFPUSDT',
-    'NMRUSDT','NOMUSDT','NOTUSDT','OBOLUSDT','OPENUSDT','OPNUSDT','ORBSUSDT',
-    'PEOPLEUSDT','PIPPINUSDT','PIXELUSDT','PLUMEUSDT','POLUSDT','POWERUSDT',
-    'POWRUSDT','PTBUSDT','PUMPBTCUSDT','PUNDIXUSDT','QUICKUSDT','RAVEUSDT',
-    'REEFUSDT','RESOLVUSDT','RLSUSDT','RVVUSDT','SAGAUSDT','SANTOSUSDT','SEIUSDT',
-    'SIGNUSDT','SKRUSDT','SNDKUSDT','SOMIUSDT','SPELLUSDT','SPKUSDT','STABLEUSDT',
-    'STBLUSDT','TRUTHUSDT','TURBOUSDT','UBUSDT','USUALUSDT','VANRYUSDT','VINEUSDT',
-    'VIRTUALUSDT','VVVUSDT','WLDUSDT','XEMUSDT','XLMUSDT','XRPUSDT','YBUSDT',
-    'ZECUSDT','ZEREBROUSDT',
+    '0GUSDT','1000000BOBUSDT','1000000MOGUSDT','1000BONKUSDT','1000CATUSDT',
+    '1000CHEEMSUSDT','1000FLOKIUSDT','1000LUNCUSDT','1000PEPEUSDT','1000RATSUSDT',
+    '1000SATSUSDT','1000SHIBUSDT','1000XECUSDT','1INCHUSDT','1MBABYDOGEUSDT',
+    '2ZUSDT','4USDT','AAVEUSDT','ACEUSDT','ACHUSDT',
+    'ACTUSDT','ACUUSDT','ACXUSDT','ADAUSDT','AEROUSDT',
+    'AEVOUSDT','AGLDUSDT','AGTUSDT','AIAUSDT','AIGENSYNUSDT',
+    'AINUSDT','AIOTUSDT','AIOUSDT','AIXBTUSDT','AKEUSDT',
+    'AKTUSDT','ALCHUSDT','ALGOUSDT','ALICEUSDT','ALLOUSDT',
+    'ALLUSDT','ALPINEUSDT','ALTUSDT','ANIMEUSDT','ANKRUSDT',
+    'APEUSDT','API3USDT','APRUSDT','APTUSDT','ARBUSDT',
+    'ARCUSDT','ARIAUSDT','ARKMUSDT','ARKUSDT','ARPAUSDT',
+    'ARUSDT','ARXUSDT','ASRUSDT','ASTERUSDT','ASTRUSDT',
+    'ATHUSDT','ATOMUSDT','ATUSDT','AUCTIONUSDT','AUSDT',
+    'AVAAIUSDT','AVAUSDT','AVAXUSDT','AVNTUSDT','AWEUSDT',
+    'AXLUSDT','AXSUSDT','AZTECUSDT','B2USDT','BABYUSDT',
+    'BANANAS31USDT','BANANAUSDT','BANDUSDT','BANKUSDT','BANUSDT',
+    'BARDUSDT','BASEDUSDT','BASUSDT','BATUSDT','BBUSDT',
+    'BCHUSDT','BEAMXUSDT','BEATUSDT','BELUSDT','BERAUSDT',
+    'BICOUSDT','BIGTIMEUSDT','BILLUSDT','BIOUSDT','BIRBUSDT',
+    'BLESSUSDT','BLUAIUSDT','BLURUSDT','BMTUSDT','BNBUSDT',
+    'BNTUSDT','BOMEUSDT','BRETTUSDT','BREVUSDT','BROCCOLI714USDT',
+    'BROCCOLIF3BUSDT','BRUSDT','BSBUSDT','BSVUSDT','BTCDOMUSDT',
+    'BTCUSDT','BTRUSDT','BTWUSDT','BULLAUSDT','BUSDT',
+    'C98USDT','CAKEUSDT','CAPUSDT','CARVUSDT','CATIUSDT',
+    'CCUSDT','CELOUSDT','CELRUSDT','CETUSUSDT','CFGUSDT',
+    'CFXUSDT','CGPTUSDT','CHILLGUYUSDT','CHIPUSDT','CHRUSDT',
+    'CHZUSDT','CKBUSDT','CLANKERUSDT','CLOUSDT','COAIUSDT',
+    'COLLECTUSDT','COMPUSDT','COOKIEUSDT','COTIUSDT','COWUSDT',
+    'CROSSUSDT','CRVUSDT','CTKUSDT','CTRUSDT','CTSIUSDT',
+    'CUSDT','CVCUSDT','CVXUSDT','CYBERUSDT','CYSUSDT',
+    'DASHUSDT','DATAIPUSDT','DEEPUSDT','DEXEUSDT','DIAUSDT',
+    'DODOXUSDT','DOGEUSDT','DOGSUSDT','DOLOUSDT','DOODUSDT',
+    'DOTUSDT','DRIFTUSDT','DUSKUSDT','DYDXUSDT','DYMUSDT',
+    'EDENUSDT','EDGEUSDT','EDUUSDT','EGLDUSDT','EIGENUSDT',
+    'ELSAUSDT','ENAUSDT','ENJUSDT','ENSOUSDT','ENSUSDT',
+    'EPICUSDT','ERAUSDT','ESPORTSUSDT','ESPUSDT','ETCUSDT',
+    'ETHFIUSDT','ETHUSDT','ETHWUSDT','EULUSDT','EVAAUSDT',
+    'FARTCOINUSDT','FETUSDT','FFUSDT','FHEUSDT','FIDAUSDT',
+    'FIGHTUSDT','FILUSDT','FLOCKUSDT','FLOWUSDT','FLUIDUSDT',
+    'FLUXUSDT','FOGOUSDT','FOLKSUSDT','FORMUSDT','FRAXUSDT',
+    'FUSDT','GALAUSDT','GASUSDT','GENIUSUSDT','GIGGLEUSDT',
+    'GLMUSDT','GMTUSDT','GMXUSDT','GOATUSDT','GPSUSDT',
+    'GRAMUSDT','GRASSUSDT','GRIFFAINUSDT','GRTUSDT','GRVTUSDT',
+    'GTCUSDT','GUAUSDT','GUNUSDT','GUSDT','GWEIUSDT',
+    'HAEDALUSDT','HANAUSDT','HBARUSDT','HEIUSDT','HEMIUSDT',
+    'HFTUSDT','HIVEUSDT','HMSTRUSDT','HOLOUSDT','HOMEUSDT',
+    'HOTUSDT','HUMAUSDT','HUSDT','HYPERUSDT','HYPEUSDT',
+    'ICNTUSDT','ICPUSDT','ICXUSDT','IDOLUSDT','IDUSDT',
+    'ILVUSDT','IMXUSDT','INITUSDT','INJUSDT','INUSDT',
+    'INXUSDT','IOSTUSDT','IOTAUSDT','IOTXUSDT','IOUSDT',
+    'IRYSUSDT','JASMYUSDT','JCTUSDT','JELLYJELLYUSDT','JOEUSDT',
+    'JSTUSDT','JTOUSDT','JUPUSDT','KAIAUSDT','KAITOUSDT',
+    'KASUSDT','KATUSDT','KAVAUSDT','KERNELUSDT','KGENUSDT',
+    'KITEUSDT','KMNOUSDT','KNCUSDT','KOMAUSDT','KSMUSDT',
+    'LABUSDT','LAUSDT','LAYERUSDT','LDOUSDT','LIGHTUSDT',
+    'LINEAUSDT','LINKUSDT','LISTAUSDT','LITUSDT','LPTUSDT',
+    'LQTYUSDT','LSKUSDT','LTCUSDT','LUMIAUSDT','LUNA2USDT',
+    'LYNUSDT','MAGICUSDT','MAGMAUSDT','MANAUSDT','MANTAUSDT',
+    'MANTRAUSDT','MASKUSDT','MAVIAUSDT','MAVUSDT','MEGAUSDT',
+    'MELANIAUSDT','MEMEUSDT','MERLUSDT','METISUSDT','METUSDT',
+    'MEUSDT','MEWUSDT','MINAUSDT','MIRAUSDT','MITOUSDT',
+    'MMTUSDT','MOCAUSDT','MONUSDT','MOODENGUSDT','MORPHOUSDT',
+    'MOVEUSDT','MOVRUSDT','MTLUSDT','MUBARAKUSDT','MUSDT',
+    'MYXUSDT','NAORISUSDT','NEARUSDT','NEIROUSDT','NEOUSDT',
+    'NEWTUSDT','NIGHTUSDT','NILUSDT','NMRUSDT','NOMUSDT',
+    'NOTUSDT','NXPCUSDT','OGNUSDT','OGUSDT','ONDOUSDT',
+    'ONEUSDT','ONGUSDT','ONTUSDT','ONUSDT','OPENUSDT',
+    'OPGUSDT','OPNUSDT','OPUSDT','ORCAUSDT','ORDERUSDT',
+    'ORDIUSDT','OUSDT','PARTIUSDT','PAXGUSDT','PENDLEUSDT',
+    'PENGUUSDT','PEOPLEUSDT','PHAROSUSDT','PHAUSDT','PIEVERSEUSDT',
+    'PIPPINUSDT','PIXELUSDT','PLAYUSDT','PLUMEUSDT','PNUTUSDT',
+    'POLUSDT','POLYXUSDT','POPCATUSDT','PORTALUSDT','POWERUSDT',
+    'POWRUSDT','PRLUSDT','PROMPTUSDT','PROMUSDT','PROVEUSDT',
+    'PTBUSDT','PUMPBTCUSDT','PUMPUSDT','PUNDIXUSDT','PYTHUSDT',
+    'QNTUSDT','QTUMUSDT','QUSDT','RAREUSDT','RAVEUSDT',
+    'RAYSOLUSDT','RECALLUSDT','REDUSDT','RENDERUSDT','RESOLVUSDT',
+    'REUSDT','REZUSDT','RIFUSDT','RIVERUSDT','RLCUSDT',
+    'ROBOUSDT','RONINUSDT','ROSEUSDT','RPLUSDT','RSRUSDT',
+    'RUNEUSDT','RVNUSDT','SAFEUSDT','SAGAUSDT','SAHARAUSDT',
+    'SANDUSDT','SANTOSUSDT','SAPIENUSDT','SCRTUSDT','SCRUSDT',
+    'SEIUSDT','SENTUSDT','SFPUSDT','SHELLUSDT','SIGNUSDT',
+    'SIRENUSDT','SKLUSDT','SKRUSDT','SKYAIUSDT','SKYUSDT',
+    'SLPUSDT','SLXUSDT','SNXUSDT','SOLUSDT','SOLVUSDT',
+    'SOMIUSDT','SONICUSDT','SOONUSDT','SOPHUSDT','SPACEUSDT',
+    'SPELLUSDT','SPKUSDT','SPORTFUNUSDT','SPXUSDT','SQDUSDT',
+    'SSVUSDT','STABLEUSDT','STARUSDT','STBLUSDT','STEEMUSDT',
+    'STGUSDT','STORJUSDT','STOUSDT','STRKUSDT','STXUSDT',
+    'SUIUSDT','SUNUSDT','SUPERUSDT','SUSDT','SUSHIUSDT',
+    'SWARMSUSDT','SXTUSDT','SYNUSDT','SYRUPUSDT','TACUSDT',
+    'TAGUSDT','TAIKOUSDT','TAKEUSDT','TAOUSDT','TAUSDT',
+    'THETAUSDT','THEUSDT','TIAUSDT','TLMUSDT','TNSRUSDT',
+    'TOSHIUSDT','TOWNSUSDT','TRADOORUSDT','TRBUSDT','TREEUSDT',
+    'TRIAUSDT','TRUMPUSDT','TRUSTUSDT','TRUTHUSDT','TRXUSDT',
+    'TSTUSDT','TURBOUSDT','TURTLEUSDT','TUSDT','TUTUSDT',
+    'TWTUSDT','UAIUSDT','UBUSDT','UMAUSDT','UNIUSDT',
+    'USDCUSDT','USELESSUSDT','USTCUSDT','USUALUSDT','USUSDT',
+    'VANAUSDT','VANRYUSDT','VELODROMEUSDT','VELVETUSDT','VETUSDT',
+    'VICUSDT','VIRTUALUSDT','VTHOUSDT','VVVUSDT','WALUSDT',
+    'WAXPUSDT','WCTUSDT','WETUSDT','WIFUSDT','WLDUSDT',
+    'WLFIUSDT','WOOUSDT','WUSDT','XAIUSDT','XANUSDT',
+    'XAUTUSDT','XLMUSDT','XMRUSDT','XNYUSDT','XPINUSDT',
+    'XPLUSDT','XRPUSDT','XTZUSDT','XVGUSDT','XVSUSDT',
+    'YBUSDT','YFIUSDT','YGGUSDT','ZAMAUSDT','ZBTUSDT',
+    'ZECUSDT','ZENUSDT','ZEREBROUSDT','ZESTUSDT','ZETAUSDT',
+    'ZILUSDT','ZKCUSDT','ZKPUSDT','ZKUSDT','ZORAUSDT',
+    'ZROUSDT','ZRXUSDT',
 ]
 
 NUM_SHARDS = 20
@@ -45,48 +133,35 @@ SLIP      = 0.0002       # 0.02%
 LEVERAGE  = 5             # per user instruction: minimum 5x
 MIN_BARS  = 60            # warmup bars before any signal can fire (lower TF bar count is coarser now)
 
-TIMEFRAMES_NEEDED = ['15m', '30m', '1h', '2h', '4h']
+TIMEFRAMES_NEEDED = ['15m', '1h']  # only what S8 + S8_REFINED actually need
 
 # ── Strategy Definitions ──────────────────────────────────────────
 # Each strategy declares entry tf + the bias tf(s) it needs for confirmation.
+# Trimmed to S8 (original) + S8_REFINED only for this run — testing both against
+# the full 527-coin universe. Other exploratory strategies (M1-M7) all showed
+# flat/negative edge in prior batches; dropping them keeps this run's fetch load
+# manageable on the free-tier 20-shard limit with 4.5x more coins than before.
 STRATEGIES = {
     'S8_MTF_CONFLUENCE': {
-        # RESTORED BASELINE — the only strategy across all prior batches with PF > 1.0.
-        # Kept unchanged as a permanent control so it never gets lost in future rebuilds.
-        'name': 'MTF Confluence (1h bias + 15m entry, tight)',
+        # ORIGINAL, UNCHANGED — the only strategy across all prior batches with PF > 1.0
+        # (PF 1.345, WR 51.2%, Sharpe 1.695 on the 117-coin universe). Permanent control.
+        'name': 'MTF Confluence ORIGINAL (1h bias + 15m entry)',
         'tf': '15m', 'bias_tfs': ['1h'], 'tp': 0.05, 'sl': 0.035,
     },
-    'M1_HTF_TREND_MOM_VOL': {
-        'name': 'HTF Trend + Momentum + Volume Triple-Confirm',
-        'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.06, 'sl': 0.04,
-    },
-    'M2_STACK_ADX_STRUCT': {
-        'name': 'Multi-EMA Stack + ADX + Structure Confirm',
-        'tf': '2h', 'bias_tfs': [], 'tp': 0.08, 'sl': 0.05,
-    },
-    'M3_MACD_ALIGN_BB': {
-        'name': '1h/4h MACD Alignment + BB Position',
-        'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.055, 'sl': 0.038,
-    },
-    'M4_3LAYER_MTF': {
-        'name': '30m Entry with 2h+1h Trend Alignment (3-layer MTF)',
-        'tf': '30m', 'bias_tfs': ['1h', '2h'], 'tp': 0.045, 'sl': 0.03,
-    },
-    'M5_DONCHIAN_HTF_ADX': {
-        'name': 'Donchian Breakout + HTF Trend Filter + ADX Strength',
-        'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.065, 'sl': 0.045,
-    },
-    'M6_VWAP_TREND_VOLDELTA': {
-        'name': 'VWAP Anchored Pullback + Volume Delta Momentum (high-vol coins)',
-        'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.05, 'sl': 0.032,
-    },
-    'M7_ORB_RELVOL': {
-        'name': 'Opening Range Breakout + Relative Volume (high-vol coins)',
-        'tf': '1h', 'bias_tfs': ['4h'], 'tp': 0.055, 'sl': 0.035,
+    'S8R_MTF_CONFLUENCE_REFINED': {
+        # REFINED VARIANT — same core mechanism, two changes being tested:
+        # 1. TP widened 5.0% -> 5.5% (tests if edge survives a better R:R before assuming
+        #    win rate holds up)
+        # 2. Long-side confirmation tightened (stronger bullish separation required) to
+        #    address the 56-long/188-short imbalance seen in the original's results —
+        #    testing whether that skew was a real regime effect or an artifact of a
+        #    slightly looser long-side trigger.
+        'name': 'MTF Confluence REFINED (wider TP, balanced long/short filter)',
+        'tf': '15m', 'bias_tfs': ['1h'], 'tp': 0.055, 'sl': 0.035,
     },
 }
 
-MAX_BARS_BY_TF = {'15m': 60, '30m': 50, '1h': 45, '2h': 35, '4h': 25}
+MAX_BARS_BY_TF = {'15m': 60, '1h': 45}
 
 # ── Data fetch (Binance Vision monthly archives) ──────────────────
 def month_range(start_ym, end_ym):
@@ -207,6 +282,15 @@ def rsi_series(closes, period=14):
     return out
 
 def adx_series(highs, lows, closes, period=14):
+    """
+    Wilder's ADX. NOTE: a prior version of this function had a critical bug —
+    pdi_s/mdi_s were updated as `val*(period-1) + new` without dividing back by
+    period, causing unbounded exponential growth (13^n) that overflowed to inf
+    after ~290 bars on every single symbol/timeframe in every prior backtest run.
+    Any strategy gated on ADX (all of them) was silently getting ADX=inf/nan
+    almost immediately, meaning ADX filters were effectively broken pipeline-wide.
+    Fixed here with correct Wilder smoothing: new = old*(period-1)/period + current.
+    """
     n = len(closes)
     out = [None] * n
     if n <= period * 2:
@@ -219,21 +303,22 @@ def adx_series(highs, lows, closes, period=14):
         mdm.append(dn if (dn > up and dn > 0) else 0.0)
         tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     atr = sum(tr[1:period + 1]) / period
-    pdi_s = sum(pdm[1:period + 1])
-    mdi_s = sum(mdm[1:period + 1])
+    pdi_s = sum(pdm[1:period + 1]) / period
+    mdi_s = sum(mdm[1:period + 1]) / period
     dx_list = []
     for i in range(period + 1, n):
         atr = (atr * (period - 1) + tr[i]) / period
-        pdi_s = (pdi_s * (period - 1) + pdm[i])
-        mdi_s = (mdi_s * (period - 1) + mdm[i])
-        pdi = 100 * (pdi_s / period) / atr if atr > 0 else 0
-        mdi = 100 * (mdi_s / period) / atr if atr > 0 else 0
-        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0
+        pdi_s = (pdi_s * (period - 1) + pdm[i]) / period
+        mdi_s = (mdi_s * (period - 1) + mdm[i]) / period
+        pdi = 100 * pdi_s / atr if atr > 1e-12 else 0.0
+        mdi = 100 * mdi_s / atr if atr > 1e-12 else 0.0
+        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 1e-12 else 0.0
         dx_list.append(dx)
         if len(dx_list) == period:
             out[i] = sum(dx_list) / period
         elif len(dx_list) > period:
-            out[i] = (out[i - 1] * (period - 1) + dx) / period
+            prev = out[i - 1] if out[i - 1] is not None else 0.0
+            out[i] = (prev * (period - 1) + dx) / period
     return out
 
 def bollinger(closes, period=20, mult=2.0):
@@ -332,136 +417,6 @@ def htf_trend_bear(ctx, idx):
 
 # ── Signal functions — each returns 'buy' / 'sell' / None on bar i ──
 
-def sig_m1_htf_trend_mom_vol(ctx, i, bias_ctxs):
-    """
-    Confirmation 1: 4h trend (EMA21 vs EMA50) bullish/bearish
-    Confirmation 2: 1h RSI in momentum zone (45-65 long / 35-55 short, not extreme, showing push)
-    Confirmation 3: 1h volume above its 20-bar average (real participation)
-    All three must agree.
-    """
-    closes, rsi, vols = ctx['closes'], ctx['rsi'], ctx['vols']
-    e9, e21 = ctx['e9'], ctx['e21']
-    if i < 25 or rsi[i] is None or e9[i] is None or e21[i] is None:
-        return None
-    htf_ctx, htf_idx = bias_ctxs['4h']
-    if htf_ctx is None or htf_idx is None:
-        return None
-    bull_htf = htf_trend_bull(htf_ctx, htf_idx)
-    bear_htf = htf_trend_bear(htf_ctx, htf_idx)
-    if bull_htf is None:
-        return None
-    avg_vol = sum(vols[i-20:i]) / 20
-    vol_confirm = vols[i] > avg_vol * 1.2
-    crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
-    crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
-    if bull_htf and crossed_up and 45 <= rsi[i] <= 68 and vol_confirm:
-        return 'buy'
-    if bear_htf and crossed_dn and 32 <= rsi[i] <= 55 and vol_confirm:
-        return 'sell'
-    return None
-
-def sig_m2_stack_adx_struct(ctx, i, bias_ctxs):
-    """
-    Confirmation 1: full EMA stack aligned (9>21>50 for long, 9<21<50 for short)
-    Confirmation 2: ADX rising over last 3 bars (trend strengthening, not fading)
-    Confirmation 3: structure confirms - higher low formed (long) / lower high formed (short)
-                     relative to the prior 10-bar swing
-    """
-    e9, e21, e50, adx = ctx['e9'], ctx['e21'], ctx['e50'], ctx['adx']
-    highs, lows = ctx['highs'], ctx['lows']
-    if i < 15 or None in (e9[i], e21[i], e50[i], adx[i], adx[i-3]):
-        return None
-    stack_bull = e9[i] > e21[i] > e50[i]
-    stack_bear = e9[i] < e21[i] < e50[i]
-    adx_rising = adx[i] > adx[i-3] and adx[i] > 23
-    prior_swing_low = min(lows[i-10:i-2])
-    prior_swing_high = max(highs[i-10:i-2])
-    higher_low = lows[i] > prior_swing_low and lows[i-1] > prior_swing_low
-    lower_high = highs[i] < prior_swing_high and highs[i-1] < prior_swing_high
-    if stack_bull and adx_rising and higher_low:
-        return 'buy'
-    if stack_bear and adx_rising and lower_high:
-        return 'sell'
-    return None
-
-def sig_m3_macd_align_bb(ctx, i, bias_ctxs):
-    """
-    Confirmation 1: 1h MACD histogram positive/negative and just turned (fresh momentum)
-    Confirmation 2: 4h MACD histogram agrees in direction (higher TF momentum aligned)
-    Confirmation 3: price is inside the BB (not already overextended chasing a move)
-    """
-    macd_hist, closes, bb_up, bb_low = ctx['macd_hist'], ctx['closes'], ctx['bb_up'], ctx['bb_low']
-    if i < 5 or None in (macd_hist[i], macd_hist[i-1], bb_up[i], bb_low[i]):
-        return None
-    htf_ctx, htf_idx = bias_ctxs['4h']
-    if htf_ctx is None or htf_idx is None:
-        return None
-    htf_hist = htf_ctx['macd_hist']
-    if htf_idx >= len(htf_hist) or htf_hist[htf_idx] is None:
-        return None
-    turned_up = macd_hist[i-1] <= 0 and macd_hist[i] > 0
-    turned_dn = macd_hist[i-1] >= 0 and macd_hist[i] < 0
-    htf_bull = htf_hist[htf_idx] > 0
-    htf_bear = htf_hist[htf_idx] < 0
-    inside_bb = bb_low[i] < closes[i] < bb_up[i]
-    if turned_up and htf_bull and inside_bb:
-        return 'buy'
-    if turned_dn and htf_bear and inside_bb:
-        return 'sell'
-    return None
-
-def sig_m4_3layer_mtf(ctx, i, bias_ctxs):
-    """
-    Confirmation 1: 30m EMA9/21 cross (entry trigger)
-    Confirmation 2: 1h trend aligned (EMA21 vs EMA50)
-    Confirmation 3: 2h trend aligned (EMA21 vs EMA50)
-    All three timeframes must agree on direction — strictest filter of the 5.
-    """
-    e9, e21 = ctx['e9'], ctx['e21']
-    if i < 2 or None in (e9[i], e21[i], e9[i-1], e21[i-1]):
-        return None
-    htf1_ctx, htf1_idx = bias_ctxs['1h']
-    htf2_ctx, htf2_idx = bias_ctxs['2h']
-    if htf1_ctx is None or htf1_idx is None or htf2_ctx is None or htf2_idx is None:
-        return None
-    bull_1h = htf_trend_bull(htf1_ctx, htf1_idx)
-    bear_1h = htf_trend_bear(htf1_ctx, htf1_idx)
-    bull_2h = htf_trend_bull(htf2_ctx, htf2_idx)
-    bear_2h = htf_trend_bear(htf2_ctx, htf2_idx)
-    if bull_1h is None or bull_2h is None:
-        return None
-    crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
-    crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
-    if crossed_up and bull_1h and bull_2h:
-        return 'buy'
-    if crossed_dn and bear_1h and bear_2h:
-        return 'sell'
-    return None
-
-def sig_m5_donchian_htf_adx(ctx, i, bias_ctxs):
-    """
-    Confirmation 1: 1h Donchian(20) breakout
-    Confirmation 2: 4h trend direction agrees with breakout direction
-    Confirmation 3: 1h ADX above 25 (real strength behind the breakout, not a fakeout)
-    """
-    closes, adx = ctx['closes'], ctx['adx']
-    dc_up, dc_low = ctx['dc_up'], ctx['dc_low']
-    if i < 21 or dc_up[i-1] is None or dc_low[i-1] is None or adx[i] is None:
-        return None
-    htf_ctx, htf_idx = bias_ctxs['4h']
-    if htf_ctx is None or htf_idx is None:
-        return None
-    bull_htf = htf_trend_bull(htf_ctx, htf_idx)
-    bear_htf = htf_trend_bear(htf_ctx, htf_idx)
-    if bull_htf is None:
-        return None
-    strong = adx[i] > 25
-    if closes[i] > dc_up[i-1] and bull_htf and strong:
-        return 'buy'
-    if closes[i] < dc_low[i-1] and bear_htf and strong:
-        return 'sell'
-    return None
-
 def sig_s8_mtf_confluence(ctx, i, bias_ctxs):
     """
     RESTORED, UNCHANGED from the batch where it scored PF 1.309 / WR ~57% / 223 trades.
@@ -489,126 +444,41 @@ def sig_s8_mtf_confluence(ctx, i, bias_ctxs):
         return 'sell'
     return None
 
-def sig_m6_vwap_trend_voldelta(ctx, i, bias_ctxs):
+def sig_s8_refined_mtf_confluence(ctx, i, bias_ctxs):
     """
-    VWAP Anchored Pullback + Volume Delta Momentum — real technique used by
-    high-volume futures traders (trades WITH trend, unlike the broken batch-2
-    VWAP-reversion attempt which faded it).
-    Confirmation 1: 4h trend established (EMA21 vs EMA50)
-    Confirmation 2: price pulls back to touch/near the rolling session VWAP on 1h,
-                     in the direction of the 4h trend (buy dips in uptrend, sell rips in downtrend)
-    Confirmation 3: volume delta accelerating — current bar volume > prior 3-bar avg
-                     AND rising over the last 2 bars (real participation returning on the bounce,
-                     not just a random spike)
+    REFINED variant of S8. Same core mechanism (15m EMA9/21 cross + 1h bias +
+    ADX filter), with two deliberate changes to test against the original:
+    1. Long-side bullish separation threshold raised from 0.2% to 0.35% — the
+       original showed a 56-long/188-short imbalance; this tests whether that
+       skew was a genuine regime effect (refinement won't fix it) or partly an
+       artifact of a looser long trigger (refinement should partially rebalance it).
+       Short-side threshold left unchanged at -0.2% for direct comparison.
+    2. ADX floor raised from 20 to 23 on both sides for modestly higher selectivity.
+    TP widened to 5.5% (from 5.0%) via STRATEGIES config; SL unchanged at 3.5%.
     """
-    closes, highs, lows, vols = ctx['closes'], ctx['highs'], ctx['lows'], ctx['vols']
-    if i < 30:
+    e9, e21, adx = ctx['e9'], ctx['e21'], ctx['adx']
+    if i < 1 or None in (e9[i], e21[i], e9[i-1], e21[i-1], adx[i]):
         return None
-    # rolling 24-bar (24h on 1h tf) VWAP approximation, computed inline to avoid
-    # needing a separate context field
-    window = 24
-    tp_vol, vol_sum = 0.0, 0.0
-    for j in range(i - window, i):
-        tp = (highs[j] + lows[j] + closes[j]) / 3.0
-        tp_vol += tp * vols[j]
-        vol_sum += vols[j]
-    if vol_sum <= 0:
-        return None
-    vwap = tp_vol / vol_sum
-
-    htf_ctx, htf_idx = bias_ctxs['4h']
+    htf_ctx, htf_idx = bias_ctxs['1h']
     if htf_ctx is None or htf_idx is None:
         return None
-    bull_htf = htf_trend_bull(htf_ctx, htf_idx)
-    bear_htf = htf_trend_bear(htf_ctx, htf_idx)
-    if bull_htf is None:
+    htf_e9, htf_e21 = htf_ctx['e9'], htf_ctx['e21']
+    if htf_idx >= len(htf_e9) or htf_e9[htf_idx] is None or htf_e21[htf_idx] is None or not htf_e21[htf_idx]:
         return None
-
-    near_vwap_from_above = lows[i] <= vwap * 1.003 and closes[i] > vwap * 0.997
-    near_vwap_from_below = highs[i] >= vwap * 0.997 and closes[i] < vwap * 1.003
-
-    avg_vol_3 = sum(vols[i-4:i-1]) / 3
-    vol_accelerating = vols[i] > avg_vol_3 * 1.15 and vols[i] > vols[i-1] > vols[i-2]
-
-    if bull_htf and near_vwap_from_above and closes[i] > closes[i-1] and vol_accelerating:
+    htf_sep = (htf_e9[htf_idx] - htf_e21[htf_idx]) / htf_e21[htf_idx] * 100
+    htf_bull = htf_sep > 0.35
+    htf_bear = htf_sep < -0.2
+    crossed_up = e9[i-1] <= e21[i-1] and e9[i] > e21[i]
+    crossed_dn = e9[i-1] >= e21[i-1] and e9[i] < e21[i]
+    if crossed_up and htf_bull and adx[i] > 23:
         return 'buy'
-    if bear_htf and near_vwap_from_below and closes[i] < closes[i-1] and vol_accelerating:
-        return 'sell'
-    return None
-
-def sig_m7_orb_relvol(ctx, i, bias_ctxs):
-    """
-    Opening Range Breakout + Relative Volume — classic high-liquidity-coin day
-    trading strategy. Works best on liquid coins because deep order books make
-    breakouts more reliable (thin coins fake out constantly).
-    Confirmation 1: mark a fixed opening range (first 4 bars of each UTC day on 1h tf
-                     = first 4 hours) using session-anchoring via bar-of-day math
-    Confirmation 2: current bar breaks above/below that range's high/low
-    Confirmation 3: relative volume vs the same window's average over the last 5
-                     sessions confirms real participation (not just a lone spike)
-    Confirmation 4: 4h trend agrees with breakout direction (avoids fading HTF trend)
-    """
-    closes, highs, lows, vols, ts = ctx['closes'], ctx['highs'], ctx['lows'], ctx['vols'], ctx['ts']
-    if i < 120:
-        return None
-    SECONDS_PER_DAY = 86400
-    bar_of_day = (ts[i] % SECONDS_PER_DAY) // 3600  # hour of day, 1h bars
-    if bar_of_day < 4:
-        return None  # still inside or before the opening range itself
-
-    day_start_ts = ts[i] - (ts[i] % SECONDS_PER_DAY)
-    # find the index of this day's first bar
-    day_start_idx = None
-    for j in range(i, max(i - 30, -1), -1):
-        if ts[j] < day_start_ts:
-            day_start_idx = j + 1
-            break
-    if day_start_idx is None or day_start_idx + 4 > i:
-        return None
-    or_high = max(highs[day_start_idx:day_start_idx + 4])
-    or_low = min(lows[day_start_idx:day_start_idx + 4])
-    if or_high <= or_low:
-        return None
-
-    # only trigger on the first breakout bar after the opening range (bar_of_day == 4)
-    if bar_of_day != 4:
-        return None
-
-    # relative volume: this bar's volume vs avg volume at the same hour-of-day over last 5 days
-    same_hour_vols = []
-    for back in range(1, 6):
-        target_ts = ts[i] - back * SECONDS_PER_DAY
-        idx = find_htf_index(ts, target_ts)
-        if idx is not None and 0 <= idx < len(vols):
-            same_hour_vols.append(vols[idx])
-    if len(same_hour_vols) < 3:
-        return None
-    avg_same_hour_vol = sum(same_hour_vols) / len(same_hour_vols)
-    rel_vol_confirm = vols[i] > avg_same_hour_vol * 1.4
-
-    htf_ctx, htf_idx = bias_ctxs['4h']
-    if htf_ctx is None or htf_idx is None:
-        return None
-    bull_htf = htf_trend_bull(htf_ctx, htf_idx)
-    bear_htf = htf_trend_bear(htf_ctx, htf_idx)
-    if bull_htf is None:
-        return None
-
-    if closes[i] > or_high and rel_vol_confirm and bull_htf:
-        return 'buy'
-    if closes[i] < or_low and rel_vol_confirm and bear_htf:
+    if crossed_dn and htf_bear and adx[i] > 23:
         return 'sell'
     return None
 
 SIGNAL_FUNCS = {
     'S8_MTF_CONFLUENCE': sig_s8_mtf_confluence,
-    'M1_HTF_TREND_MOM_VOL': sig_m1_htf_trend_mom_vol,
-    'M2_STACK_ADX_STRUCT': sig_m2_stack_adx_struct,
-    'M3_MACD_ALIGN_BB': sig_m3_macd_align_bb,
-    'M4_3LAYER_MTF': sig_m4_3layer_mtf,
-    'M5_DONCHIAN_HTF_ADX': sig_m5_donchian_htf_adx,
-    'M6_VWAP_TREND_VOLDELTA': sig_m6_vwap_trend_voldelta,
-    'M7_ORB_RELVOL': sig_m7_orb_relvol,
+    'S8R_MTF_CONFLUENCE_REFINED': sig_s8_refined_mtf_confluence,
 }
 
 # ── Backtest a single strategy against a single symbol's candles ──
