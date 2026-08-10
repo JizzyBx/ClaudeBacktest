@@ -19,6 +19,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install dependencies
+        run: pip install requests
+
       - name: Run shard ${{ matrix.shard }}
         run: python backtest.py ${{ matrix.shard }}
 
@@ -40,6 +43,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
 
       - name: Download all shards
         uses: actions/download-artifact@v4
