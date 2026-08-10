@@ -1,27 +1,23 @@
 """
-Micro-Profit Backtest — Options A & B
-======================================
-Option A: GMaxV1 signal (EMA9/21 crossover + EMA50 slope + ADX>=22)
-          on 15m AND 5m, testing 5 TP/SL combos each = 10 variants
-Option B: Bollinger Band(20,2) + RSI(14) mean reversion on 5m
-          Long: close < lower_BB and RSI < 35
-          Short: close > upper_BB and RSI > 65
-          TP=0.8% / SL=2.5%
-
-Coins    : 117 USDT-M futures
-Period   : up to 2 years back from Aug 2026 — each coin uses its own
-           available history (6-month coin → 6 months tested)
-Capital  : $10,000 | Risk 0.75% | Leverage 5x | Fee 0.05% | Slip 0.02%
-Metrics  : PF, WR, Sharpe, Max DD, Expectancy, Avg Win/Loss, Trade count
+4-Strategy Backtest — GMax Universe (117 coins)
+Period  : 2025-01 → 2026-07  (1.5 years)
+Capital : $10,000 | Leverage: 5x | Risk/trade: 0.75%
+Fees    : 0.05% entry + 0.02% slip (both sides)
+Strategies:
+  S1 — EMA Ribbon Squeeze + Volume (15m)
+  S2 — Opening Range Breakout (5m)
+  S3 — RSI(2) Extreme Reversion (15m)
+  S4 — Candle Body Momentum (15m)
+stdlib only — no pip installs
 """
 
-import sys, json, csv, io, zipfile, math, time, os
-from urllib.request import urlopen
+import sys, os, json, csv, io, zipfile, time
+from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 
-# ── Coin List (117) ────────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 ALL_SYMBOLS = [
     '1000000BOBUSDT','1000BONKUSDT','1000CATUSDT','1000RATSUSDT',
     '1000SATSUSDT','A2ZUSDT','ACHUSDT','AI16ZUSDT','AINUSDT','AIOTUSDT',
@@ -47,617 +43,877 @@ ALL_SYMBOLS = [
 NUM_SHARDS = 8
 WORKERS    = 16
 
-# ── Capital / Risk ─────────────────────────────────────────────────────────────
-CAPITAL   = 10_000.0
-RISK_PCT  = 0.0075   # 0.75%
-FEE       = 0.0005   # 0.05% per side
-SLIP      = 0.0002   # 0.02% per side
-LEVERAGE  = 5
-
-# ── Date range: Aug 2024 → Jul 2026 (2 years) ─────────────────────────────────
-START_YM = (2024, 8)
+# Date range: 1.5 years ending July 2026
+START_YM = (2025, 1)
 END_YM   = (2026, 7)
 
-# ── Variants ───────────────────────────────────────────────────────────────────
-# Option A: GMaxV1 signal on 15m and 5m, 5 TP/SL combos each
-OPTION_A_CONFIGS = [
-    # (label, timeframe, tp_pct, sl_pct, max_bars)
-    ('A_15m_TP0.5_SL2',   '15m', 0.005, 0.020,  48),
-    ('A_15m_TP1.0_SL3',   '15m', 0.010, 0.030,  48),
-    ('A_15m_TP1.5_SL5',   '15m', 0.015, 0.050,  96),
-    ('A_15m_TP2.0_SL6',   '15m', 0.020, 0.060,  96),
-    ('A_15m_TP3.0_SL15',  '15m', 0.030, 0.150, 960),  # baseline
-    ('A_5m_TP0.5_SL2',    '5m',  0.005, 0.020,  48),
-    ('A_5m_TP1.0_SL3',    '5m',  0.010, 0.030,  96),
-    ('A_5m_TP1.5_SL5',    '5m',  0.015, 0.050, 144),
-    ('A_5m_TP2.0_SL6',    '5m',  0.020, 0.060, 192),
-    ('A_5m_TP3.0_SL15',   '5m',  0.030, 0.150, 960),
-]
+# Capital & risk
+CAPITAL  = 10_000.0
+RISK_PCT = 0.0075    # 0.75% risk per trade
+LEVERAGE = 5
+FEE      = 0.0005    # 0.05% per side
+SLIP     = 0.0002    # 0.02% per side
 
-# Option B: BB+RSI mean reversion on 5m
-OPTION_B_CONFIG = {
-    'label':    'B_5m_BB_RSI',
-    'tf':       '5m',
-    'tp':       0.008,   # 0.8%
-    'sl':       0.025,   # 2.5%
-    'max_bars': 72,      # 6 hours max hold on 5m
-    'bb_period':  20,
-    'bb_std':     2.0,
-    'rsi_period': 14,
-    'rsi_long':   35,    # RSI < 35 for long
-    'rsi_short':  65,    # RSI > 65 for short
+# Strategy parameters
+STRATEGIES = {
+    'S1_Ribbon': {
+        'tf'      : '15m',
+        'tp'      : 0.010,   # 1.0%
+        'sl'      : 0.005,   # 0.5%
+        'max_bars': 48,
+        'min_bars': 100,     # warmup: EMA34 needs ~34, ADX needs ~42 — use 100 to be safe
+    },
+    'S2_ORB': {
+        'tf'      : '5m',
+        'tp'      : 0.015,   # 1.5%
+        'sl'      : 0.005,   # 0.5%
+        'max_bars': 36,
+        'min_bars': 80,      # warmup: ADX14 × 3 = 42, padding to 80
+    },
+    'S3_RSI2': {
+        'tf'      : '15m',
+        'tp'      : 0.012,   # 1.2%
+        'sl'      : 0.006,   # 0.6%
+        'max_bars': 24,
+        'min_bars': 250,     # warmup: EMA200 needs 200 bars minimum
+    },
+    'S4_BodyMom': {
+        'tf'      : '15m',
+        'tp'      : 0.010,   # 1.0%
+        'sl'      : 0.005,   # 0.5%
+        'max_bars': 32,
+        'min_bars': 100,     # warmup: EMA50 + ADX14
+    },
 }
 
-# ── Data Fetch ─────────────────────────────────────────────────────────────────
-BASE_URLS = [
-    "https://data.binance.vision/data/futures/um/monthly/klines",
-    "https://data.binance.com/data/futures/um/monthly/klines",
-]
 
-def fetch_month(symbol, tf, year, month):
-    fname = f"{symbol}-{tf}-{year}-{month:02d}.zip"
-    for base in BASE_URLS:
-        url = f"{base}/{symbol}/{tf}/{fname}"
-        for attempt in range(3):
+# ── Data fetch ─────────────────────────────────────────────────────────────────
+BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines"
+
+def fetch_month(symbol, year, month, tf):
+    """Fetch one month of OHLCV for symbol/tf. Returns list of (ts,o,h,l,c,v) or []."""
+    url = f"{BASE_URL}/{symbol}/{tf}/{symbol}-{tf}-{year}-{month:02d}.zip"
+    try:
+        req  = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        data = urlopen(req, timeout=30).read()
+        zf   = zipfile.ZipFile(io.BytesIO(data))
+        name = zf.namelist()[0]
+        raw  = zf.read(name).decode("utf-8")
+        rows = list(csv.reader(io.StringIO(raw)))
+        out  = []
+        for r in rows:
+            if len(r) < 6: continue
             try:
-                raw = urlopen(url, timeout=20).read()
-                with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                    csvname = z.namelist()[0]
-                    lines = z.read(csvname).decode().splitlines()
-                rows = []
-                for line in lines:
-                    parts = line.split(',')
-                    if len(parts) < 5: continue
-                    try:
-                        ts = int(parts[0])
-                        if ts > 10**14: ts //= 1000
-                        o, h, l, c = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-                        v = float(parts[5]) if len(parts) > 5 else 0.0
-                        rows.append((ts, o, h, l, c, v))
-                    except (ValueError, IndexError):
-                        continue
-                return rows
-            except HTTPError as e:
-                if e.code == 404: return []
-                time.sleep(1.5 ** attempt)
-            except Exception:
-                time.sleep(1.5 ** attempt)
-    return []
+                ts = int(r[0])
+                # convert microseconds to ms if needed
+                if ts > 10**14: ts //= 1000
+                out.append((ts, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+            except (ValueError, IndexError):
+                continue
+        return out
+    except HTTPError:
+        return []
+    except Exception:
+        return []
 
-def month_range(start_ym, end_ym):
-    y, m = start_ym
-    while (y, m) <= end_ym:
-        yield y, m
+def fetch_symbol(symbol, tf):
+    """Fetch all months in range. Dedup by ts, sort ascending."""
+    y, m = START_YM
+    ey, em = END_YM
+    months = []
+    while (y, m) <= (ey, em):
+        months.append((y, m))
         m += 1
         if m > 12: m = 1; y += 1
 
-def fetch_symbol(symbol, tf):
-    all_rows = []
-    for y, m in month_range(START_YM, END_YM):
-        all_rows.extend(fetch_month(symbol, tf, y, m))
-    if not all_rows: return []
+    all_candles = []
+    for yr, mo in months:
+        all_candles.extend(fetch_month(symbol, yr, mo, tf))
+
+    # dedup by timestamp, sort
     seen = {}
-    for r in all_rows:
-        seen[r[0]] = r
+    for c in all_candles:
+        seen[c[0]] = c
     return sorted(seen.values(), key=lambda x: x[0])
 
-# ── Indicators (pure Python) ───────────────────────────────────────────────────
-def ema_series(values, period):
-    # Seeds from values[0] — matches GMaxV1 live bot exactly
-    if not values: return []
+
+# ── Indicators ─────────────────────────────────────────────────────────────────
+# All match GMaxV1.py exactly
+
+def ema(values, period):
+    """EMA seeded from first value — matches GMaxV1 live bot."""
     k = 2.0 / (period + 1)
-    result = [values[0]]
+    r = [values[0]]
     for v in values[1:]:
-        result.append(v * k + result[-1] * (1 - k))
-    return result
+        r.append(v * k + r[-1] * (1 - k))
+    return r
 
-def adx_series(highs, lows, closes, period=14):
-    n = len(closes)
-    result = [None] * n
-    if n < period * 3: return result
-    plus_dm  = [0.0] * n
-    minus_dm = [0.0] * n
-    tr_vals  = [0.0] * n
-    for i in range(1, n):
-        up   = highs[i]  - highs[i-1]
+def adx_calc(highs, lows, closes, period=14):
+    """Wilder-smoothed ADX — exact copy from GMaxV1."""
+    if len(closes) < period * 3:
+        return 0.0, 0.0, 0.0
+    pdm, mdm, trs = [], [], []
+    for i in range(1, len(closes)):
+        up   = highs[i] - highs[i-1]
         down = lows[i-1] - lows[i]
-        plus_dm[i]  = up   if up > down and up > 0   else 0.0
-        minus_dm[i] = down if down > up and down > 0 else 0.0
-        tr_vals[i]  = max(highs[i] - lows[i],
-                          abs(highs[i] - closes[i-1]),
-                          abs(lows[i]  - closes[i-1]))
-    def smooth(arr, p):
-        s = [0.0] * n
-        s[p] = sum(arr[1:p+1])
-        for i in range(p+1, n):
-            s[i] = s[i-1] - s[i-1]/p + arr[i]
-        return s
-    str14   = smooth(tr_vals,  period)
-    spdm14  = smooth(plus_dm,  period)
-    smdm14  = smooth(minus_dm, period)
-    dx_vals = [None] * n
-    for i in range(period, n):
-        if str14[i] == 0: continue
-        pdi = 100 * spdm14[i] / str14[i]
-        mdi = 100 * smdm14[i] / str14[i]
-        denom = pdi + mdi
-        if denom == 0: continue
-        dx_vals[i] = 100 * abs(pdi - mdi) / denom
-    # smooth DX into ADX
-    start = period * 2
-    if n <= start: return result
-    valid_dx = [dx_vals[i] for i in range(period, start) if dx_vals[i] is not None]
-    if not valid_dx: return result
-    adx_prev = sum(valid_dx) / len(valid_dx) if valid_dx else 0
-    result[start - 1] = adx_prev
-    for i in range(start, n):
-        if dx_vals[i] is None: continue
-        adx_prev = (adx_prev * (period - 1) + dx_vals[i]) / period
-        result[i] = adx_prev
-    return result
+        pdm.append(up   if up > down and up > 0   else 0.0)
+        mdm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(highs[i]-lows[i],
+                       abs(highs[i]-closes[i-1]),
+                       abs(lows[i]-closes[i-1])))
+    def ws(v, p):
+        if len(v) < p: return []
+        r = [sum(v[:p])]
+        for x in v[p:]: r.append(r[-1] - r[-1]/p + x)
+        return r
+    st = ws(trs, period); sp = ws(pdm, period); sm = ws(mdm, period)
+    if not st: return 0.0, 0.0, 0.0
+    pdi = [100*p/t if t else 0 for p,t in zip(sp, st)]
+    mdi = [100*m/t if t else 0 for m,t in zip(sm, st)]
+    dx  = [100*abs(p-m)/(p+m) if (p+m) else 0 for p,m in zip(pdi, mdi)]
+    if len(dx) < period: return 0.0, pdi[-1], mdi[-1]
+    adx_v = sum(dx[:period]) / period
+    for d in dx[period:]: adx_v = (adx_v*(period-1) + d) / period
+    return max(0.0, min(100.0, adx_v)), pdi[-1], mdi[-1]
 
-def rsi_series(closes, period=14):
-    n = len(closes)
-    result = [None] * n
-    if n <= period: return result
+def rsi_period(closes, period):
+    """RSI with arbitrary period (used for RSI-2)."""
+    if len(closes) < period + 1: return 50.0
     gains, losses = [], []
-    for i in range(1, period + 1):
+    for i in range(1, len(closes)):
         d = closes[i] - closes[i-1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    for i in range(period, n):
-        if i > period:
-            d = closes[i] - closes[i-1]
-            avg_gain = (avg_gain * (period - 1) + max(d, 0))  / period
-            avg_loss = (avg_loss * (period - 1) + max(-d, 0)) / period
-        if avg_loss == 0:
-            result[i] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            result[i] = 100 - 100 / (1 + rs)
-    return result
+        gains.append(max(d, 0.0)); losses.append(max(-d, 0.0))
+    if len(gains) < period: return 50.0
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        ag = (ag*(period-1) + gains[i]) / period
+        al = (al*(period-1) + losses[i]) / period
+    if al == 0: return 100.0
+    return 100 - (100 / (1 + ag/al))
 
-def bb_series(closes, period=20, num_std=2.0):
-    n = len(closes)
-    upper = [None] * n
-    lower = [None] * n
-    mid   = [None] * n
-    for i in range(period - 1, n):
-        window = closes[i - period + 1: i + 1]
-        m = sum(window) / period
-        var = sum((x - m) ** 2 for x in window) / period
-        s = math.sqrt(var)
-        mid[i]   = m
-        upper[i] = m + num_std * s
-        lower[i] = m - num_std * s
-    return upper, mid, lower
 
-# ── Signal Functions ───────────────────────────────────────────────────────────
-def signal_gmaxv1(i, opens, highs, lows, closes,
-                  ema9, ema21, ema50, adx):
-    """GMaxV1: EMA9/21 crossover + EMA50 slope + ADX>=22
-    Matches live bot check_signal_G() exactly:
-    - EMA50 slope uses 10-bar lookback with 0.05% threshold
-    - EMA seeded from first value (not SMA)
-    - ADX checked after crossover confirmed
+# ── Signal functions ───────────────────────────────────────────────────────────
+
+def signal_S1_ribbon(i, opens, highs, lows, closes, vols):
     """
-    if i < 11: return None  # need i-10 for slope
-    # EMA50 slope — 10-bar lookback, 0.05% threshold (live bot exact)
-    if ema50[i-10] == 0: return None
-    slope_pct  = (ema50[i] - ema50[i-10]) / ema50[i-10] * 100
-    trend_up   = slope_pct >  0.05
-    trend_down = slope_pct < -0.05
-    if not trend_up and not trend_down: return None  # flat — skip
-    # EMA9/21 crossover on last closed bar
-    cross_up   = ema9[i] > ema21[i] and ema9[i-1] <= ema21[i-1]
-    cross_down = ema9[i] < ema21[i] and ema9[i-1] >= ema21[i-1]
-    if not cross_up and not cross_down: return None
-    if trend_up   and not cross_up:   return None  # trend/cross direction mismatch
-    if trend_down and not cross_down: return None
-    # ADX >= 22
-    if adx[i] is None or adx[i] < 22: return None
-    return 'buy' if cross_up else 'sell'
+    EMA Ribbon Squeeze + Volume on 15m.
+    Squeeze = all 5 EMAs within 0.3% of each other.
+    Entry when squeeze just resolved + ribbon aligned + vol>1.5x + ADX>=25.
+    Signal on bar i, entry on bar i+1 open.
+    """
+    # need at least 50 bars for EMA34 to be meaningful
+    if i < 50: return None
 
-def signal_bb_rsi(i, closes, upper_bb, lower_bb, rsi, cfg):
-    """BB+RSI mean reversion"""
-    if upper_bb[i] is None or lower_bb[i] is None: return None
-    if rsi[i] is None: return None
-    if closes[i] < lower_bb[i] and rsi[i] < cfg['rsi_long']:  return 'buy'
-    if closes[i] > upper_bb[i] and rsi[i] > cfg['rsi_short']: return 'sell'
+    c_slice = closes[:i+1]
+    e5  = ema(c_slice, 5)
+    e8  = ema(c_slice, 8)
+    e13 = ema(c_slice, 13)
+    e21 = ema(c_slice, 21)
+    e34 = ema(c_slice, 34)
+
+    # Check squeeze on previous bar (i-1)
+    prev = [e5[-2], e8[-2], e13[-2], e21[-2], e34[-2]]
+    prev_mid = sum(prev) / 5
+    if prev_mid == 0: return None
+    prev_squeeze = (max(prev) - min(prev)) / prev_mid < 0.003
+
+    # Check squeeze on current bar (i)
+    cur = [e5[-1], e8[-1], e13[-1], e21[-1], e34[-1]]
+    cur_mid = sum(cur) / 5
+    if cur_mid == 0: return None
+    cur_squeeze = (max(cur) - min(cur)) / cur_mid < 0.003
+
+    # Must have been in squeeze and just broken out
+    if not (prev_squeeze and not cur_squeeze): return None
+
+    # Ribbon fully aligned
+    long_align  = e5[-1] > e8[-1] > e13[-1] > e21[-1] > e34[-1]
+    short_align = e5[-1] < e8[-1] < e13[-1] < e21[-1] < e34[-1]
+    if not long_align and not short_align: return None
+
+    # Volume: current bar vs 20-bar avg of the bars BEFORE current bar
+    start_v = max(0, i - 20)
+    avg_vol  = sum(vols[start_v:i]) / max(1, i - start_v)
+    if avg_vol == 0: return None
+    if vols[i] < 1.5 * avg_vol: return None
+
+    # ADX >= 25
+    adx_v, _, _ = adx_calc(highs[:i+1], lows[:i+1], closes[:i+1], 14)
+    if adx_v < 25: return None
+
+    return 'buy' if long_align else 'sell'
+
+
+def signal_S2_orb(i, opens, highs, lows, closes, vols, day_ranges, day_traded):
+    """
+    Opening Range Breakout on 5m.
+    day_ranges: dict { day_key: (or_high, or_low, avg_vol_OR) }
+    day_traded: set of day_keys that already had a trade for this symbol
+    Signal on bar i (must be bar 4+ of the day), entry on bar i+1 open.
+    """
+    ts      = int(opens[i])   # we pass timestamps as opens array trick — see backtest_S2
+    day_key = ts // 86400000
+
+    if day_key not in day_ranges: return None
+    if day_key in day_traded:     return None
+
+    or_high, or_low, or_avg_vol = day_ranges[day_key]
+    if or_high == or_low: return None
+
+    # breakout: close breaks above OR high + 0.1% buffer
+    buf_high = or_high * 1.001
+    buf_low  = or_low  * 0.999
+
+    sig = None
+    if closes[i] > buf_high:
+        sig = 'buy'
+    elif closes[i] < buf_low:
+        sig = 'sell'
+    if sig is None: return None
+
+    # Volume check
+    start_v = max(0, i - 20)
+    avg_vol  = sum(vols[start_v:i]) / max(1, i - start_v)
+    if avg_vol == 0: return None
+    if vols[i] < 2.0 * avg_vol: return None
+
+    # ADX >= 22
+    adx_v, _, _ = adx_calc(highs[:i+1], lows[:i+1], closes[:i+1], 14)
+    if adx_v < 22: return None
+
+    return sig
+
+
+def signal_S3_rsi2(i, opens, highs, lows, closes, vols):
+    """
+    RSI(2) Extreme Reversion on 15m.
+    Long: RSI(2) < 5 for 2 consecutive bars AND above EMA200.
+    Short: RSI(2) > 95 for 2 consecutive bars AND below EMA200.
+    ADX between 15 and 35.
+    """
+    if i < 220: return None   # need EMA200 warm up
+
+    rsi_cur  = rsi_period(closes[:i+1], 2)
+    rsi_prev = rsi_period(closes[:i],   2)
+
+    # EMA200
+    e200 = ema(closes[:i+1], 200)
+    price = closes[i]
+
+    # ADX between 15 and 35 (avoid flat AND violent trend)
+    adx_v, _, _ = adx_calc(highs[:i+1], lows[:i+1], closes[:i+1], 14)
+    if not (15 <= adx_v <= 35): return None
+
+    if rsi_prev < 5 and rsi_cur < 5 and price > e200[-1]:
+        return 'buy'
+    if rsi_prev > 95 and rsi_cur > 95 and price < e200[-1]:
+        return 'sell'
     return None
 
-# ── Position Sizing ────────────────────────────────────────────────────────────
-def position_size(sl_pct):
-    risk_usd  = CAPITAL * RISK_PCT
-    notional  = min(risk_usd / sl_pct, CAPITAL * LEVERAGE)
-    return notional
 
-# ── Backtest Single Symbol — Option A ─────────────────────────────────────────
-def backtest_a(symbol, candles, tp, sl, max_bars):
-    if len(candles) < 100: return []
+def signal_S4_body(i, opens, highs, lows, closes, vols):
+    """
+    Candle Body Momentum on 15m.
+    Body ratio >= 0.75 + EMA21/50 aligned + ADX>=22 + vol>=1.2x.
+    Next candle confirmation: bar[i+1] open within 0.2% of bar[i] close.
+    NOTE: this signal is evaluated on bar i-1, confirmed on bar i open.
+    We pass i as the CONFIRMATION bar. Signal bar = i-1.
+    """
+    if i < 60: return None
+    sig_bar = i - 1   # the strong body candle
+    if sig_bar < 1: return None
+
+    o  = opens[sig_bar]
+    h  = highs[sig_bar]
+    l  = lows[sig_bar]
+    c  = closes[sig_bar]
+    rng = h - l
+    if rng == 0: return None
+    body = abs(c - o)
+    ratio = body / rng
+    if ratio < 0.75: return None
+
+    # EMA21, EMA50 on signal bar
+    e21 = ema(closes[:sig_bar+1], 21)
+    e50 = ema(closes[:sig_bar+1], 50)
+
+    # ADX on signal bar
+    adx_v, _, _ = adx_calc(highs[:sig_bar+1], lows[:sig_bar+1], closes[:sig_bar+1], 14)
+    if adx_v < 22: return None
+
+    # Volume on signal bar vs 20-bar avg before signal bar
+    start_v = max(0, sig_bar - 20)
+    avg_vol  = sum(vols[start_v:sig_bar]) / max(1, sig_bar - start_v)
+    if avg_vol == 0: return None
+    if vols[sig_bar] < 1.2 * avg_vol: return None
+
+    # Direction
+    bull = c > o and c > e21[-1] and e21[-1] > e50[-1]
+    bear = c < o and c < e21[-1] and e21[-1] < e50[-1]
+    if not bull and not bear: return None
+
+    # Confirmation: bar i open must be within 0.2% of signal bar close
+    conf_open = opens[i]
+    if c == 0: return None
+    if abs(conf_open - c) / c > 0.002: return None
+
+    return 'buy' if bull else 'sell'
+
+
+# ── Single-symbol backtest ─────────────────────────────────────────────────────
+
+def _position_size(sl_pct):
+    """Risk-based notional capped by leverage."""
+    if sl_pct <= 0: return 0.0
+    return min(CAPITAL * RISK_PCT / sl_pct, CAPITAL * LEVERAGE)
+
+def backtest_15m(symbol, candles, strat_name, cfg):
+    """Generic 15m backtest runner for S1, S3, S4."""
+    TP      = cfg['tp']
+    SL      = cfg['sl']
+    MAX_B   = cfg['max_bars']
+    MIN_B   = cfg['min_bars']
+    trades  = []
+
+    n = len(candles)
+    if n < MIN_B + 2: return trades
+
+    ts_arr = [c[0] for c in candles]
     opens  = [c[1] for c in candles]
     highs  = [c[2] for c in candles]
     lows   = [c[3] for c in candles]
     closes = [c[4] for c in candles]
-    ts_arr = [c[0] for c in candles]
+    vols   = [c[5] for c in candles]
 
-    ema9  = ema_series(closes, 9)   # list, same length, no Nones
-    ema21 = ema_series(closes, 21)
-    ema50 = ema_series(closes, 50)
-    adx   = adx_series(highs, lows, closes, 14)  # list with Nones at start
+    notional = _position_size(SL)
+    if notional <= 0: return trades
 
-    trades = []
-    n = len(closes)
-    notional = position_size(sl)
-    i = 0
-    while i < n - 1:
-        sig = signal_gmaxv1(i, opens, highs, lows, closes,
-                             ema9, ema21, ema50, adx)
-        if sig is None:
-            i += 1; continue
-        entry_open = opens[i + 1]
-        if sig == 'buy':
-            ep = entry_open * (1 + FEE + SLIP)
-            tp_price = ep * (1 + tp)
-            sl_price = ep * (1 - sl)
-        else:
-            ep = entry_open * (1 - FEE - SLIP)
-            tp_price = ep * (1 - tp)
-            sl_price = ep * (1 + sl)
+    in_trade   = False
+    side       = None
+    entry_price = 0.0
+    entry_ts   = 0
+    entry_bar  = 0
 
-        entry_ts = ts_arr[i + 1]
-        exit_i, exit_price, reason = i + 1, ep, 'max_hold'
-        for j in range(i + 2, min(i + 2 + max_bars, n)):
-            h, l = highs[j], lows[j]
-            if sig == 'buy':
-                if l <= sl_price:
-                    exit_price, reason, exit_i = sl_price, 'sl', j; break
-                if h >= tp_price:
-                    exit_price, reason, exit_i = tp_price, 'tp', j; break
+    for i in range(MIN_B, n - 1):
+        # ── Manage open position ──
+        if in_trade:
+            bars_held = i - entry_bar
+            bar_h = highs[i]
+            bar_l = lows[i]
+            bar_c = closes[i]
+
+            if side == 'buy':
+                tp_price = entry_price * (1 + TP)
+                sl_price = entry_price * (1 - SL)
+                hit_sl   = bar_l <= sl_price
+                hit_tp   = bar_h >= tp_price
             else:
-                if h >= sl_price:
-                    exit_price, reason, exit_i = sl_price, 'sl', j; break
-                if l <= tp_price:
-                    exit_price, reason, exit_i = tp_price, 'tp', j; break
-        else:
-            exit_i = min(i + 1 + max_bars, n - 1)
-            exit_price = closes[exit_i]
-            reason = 'max_hold' if exit_i < n - 1 else 'end_of_data'
+                tp_price = entry_price * (1 - TP)
+                sl_price = entry_price * (1 + SL)
+                hit_sl   = bar_h >= sl_price
+                hit_tp   = bar_l <= tp_price
 
-        if sig == 'buy':
-            net = (exit_price - ep) / ep - (FEE + SLIP)
-        else:
-            net = (ep - exit_price) / ep - (FEE + SLIP)
-        pnl = notional * net
+            exit_price = None
+            reason     = None
 
+            # SL checked first (conservative)
+            if hit_sl:
+                exit_price = sl_price
+                reason     = 'sl'
+            elif hit_tp:
+                exit_price = tp_price
+                reason     = 'tp'
+            elif bars_held >= MAX_B:
+                exit_price = bar_c
+                reason     = 'max_hold'
+
+            if exit_price is not None:
+                if side == 'buy':
+                    gross = (exit_price - entry_price) / entry_price
+                else:
+                    gross = (entry_price - exit_price) / entry_price
+                net  = gross - (FEE + SLIP)   # exit side fee+slip
+                pnl  = notional * net
+                trades.append({
+                    'symbol'     : symbol,
+                    'strategy'   : strat_name,
+                    'side'       : side,
+                    'entry_ts'   : entry_ts,
+                    'exit_ts'    : ts_arr[i],
+                    'entry_price': round(entry_price, 8),
+                    'exit_price' : round(exit_price,  8),
+                    'pnl'        : round(pnl, 4),
+                    'reason'     : reason,
+                    'bars'       : bars_held,
+                })
+                in_trade = False
+                continue   # don't look for new entry same bar
+
+        # ── Look for new signal (only if flat) ──
+        if not in_trade:
+            sig = None
+            if strat_name == 'S1_Ribbon':
+                sig = signal_S1_ribbon(i, opens, highs, lows, closes, vols)
+            elif strat_name == 'S3_RSI2':
+                sig = signal_S3_rsi2(i, opens, highs, lows, closes, vols)
+            elif strat_name == 'S4_BodyMom':
+                # Body momentum needs i+1 to be the confirmation bar
+                # so we check signal on i, confirm on i+1 open
+                # but here i is the signal bar, i+1 is entry
+                sig = signal_S4_body(i + 1, opens, highs, lows, closes, vols)
+
+            if sig is not None:
+                # Entry on bar i+1 open, adjusted for fee+slip
+                raw_entry = opens[i + 1]
+                if sig == 'buy':
+                    entry_price = raw_entry * (1 + FEE + SLIP)
+                else:
+                    entry_price = raw_entry * (1 - FEE - SLIP)
+                side       = sig
+                entry_ts   = ts_arr[i + 1]
+                entry_bar  = i + 1
+                in_trade   = True
+
+    # Close any open trade at end of data
+    if in_trade:
+        exit_price = closes[-1]
+        if side == 'buy':
+            gross = (exit_price - entry_price) / entry_price
+        else:
+            gross = (entry_price - exit_price) / entry_price
+        net  = gross - (FEE + SLIP)
+        pnl  = notional * net
         trades.append({
-            'symbol':      symbol,
-            'side':        sig,
-            'entry_ts':    entry_ts,
-            'exit_ts':     ts_arr[exit_i],
-            'entry_price': ep,
-            'exit_price':  exit_price,
-            'pnl':         pnl,
-            'reason':      reason,
-            'bars':        exit_i - (i + 1),
+            'symbol'     : symbol,
+            'strategy'   : strat_name,
+            'side'       : side,
+            'entry_ts'   : entry_ts,
+            'exit_ts'    : ts_arr[-1],
+            'entry_price': round(entry_price, 8),
+            'exit_price' : round(exit_price,  8),
+            'pnl'        : round(pnl, 4),
+            'reason'     : 'end_of_data',
+            'bars'       : len(candles) - 1 - entry_bar,
         })
-        i = exit_i + 1
+
     return trades
 
-# ── Backtest Single Symbol — Option B ─────────────────────────────────────────
-def backtest_b(symbol, candles, cfg):
-    if len(candles) < 50: return []
+
+def backtest_S2_orb(symbol, candles):
+    """ORB 5m backtest — requires day grouping pre-pass."""
+    cfg    = STRATEGIES['S2_ORB']
+    TP     = cfg['tp']
+    SL     = cfg['sl']
+    MAX_B  = cfg['max_bars']
+    MIN_B  = cfg['min_bars']
+    trades = []
+
+    n = len(candles)
+    if n < MIN_B + 2: return trades
+
+    ts_arr = [c[0] for c in candles]
     opens  = [c[1] for c in candles]
     highs  = [c[2] for c in candles]
     lows   = [c[3] for c in candles]
     closes = [c[4] for c in candles]
-    ts_arr = [c[0] for c in candles]
+    vols   = [c[5] for c in candles]
 
-    rsi_vals               = rsi_series(closes, cfg['rsi_period'])
-    upper_bb, _, lower_bb  = bb_series(closes, cfg['bb_period'], cfg['bb_std'])
+    notional = _position_size(SL)
+    if notional <= 0: return trades
 
-    tp, sl, max_bars = cfg['tp'], cfg['sl'], cfg['max_bars']
-    notional = position_size(sl)
-    trades = []
-    n = len(closes)
-    i = 0
-    while i < n - 1:
-        sig = signal_bb_rsi(i, closes, upper_bb, lower_bb, rsi_vals, cfg)
-        if sig is None:
-            i += 1; continue
-        entry_open = opens[i + 1]
-        if sig == 'buy':
-            ep = entry_open * (1 + FEE + SLIP)
-            tp_price = ep * (1 + tp)
-            sl_price = ep * (1 - sl)
-        else:
-            ep = entry_open * (1 - FEE - SLIP)
-            tp_price = ep * (1 - tp)
-            sl_price = ep * (1 + sl)
+    # ── Pre-pass: build opening range per UTC day ──
+    # day_candles: { day_key: [ (bar_idx, candle), ... ] }
+    day_candles = defaultdict(list)
+    for idx, c in enumerate(candles):
+        dk = c[0] // 86400000
+        day_candles[dk].append((idx, c))
 
-        entry_ts = ts_arr[i + 1]
-        exit_i, exit_price, reason = i + 1, ep, 'max_hold'
-        for j in range(i + 2, min(i + 2 + max_bars, n)):
-            h, l = highs[j], lows[j]
-            if sig == 'buy':
-                if l <= sl_price:
-                    exit_price, reason, exit_i = sl_price, 'sl', j; break
-                if h >= tp_price:
-                    exit_price, reason, exit_i = tp_price, 'tp', j; break
+    # day_ranges: { day_key: (or_high, or_low, avg_vol_first3) }
+    day_ranges = {}
+    for dk, bars in day_candles.items():
+        if len(bars) < 4: continue   # need at least 4 bars (3 OR + 1 signal)
+        or_high = max(bars[0][1][2], bars[1][1][2], bars[2][1][2])
+        or_low  = min(bars[0][1][3], bars[1][1][3], bars[2][1][3])
+        or_avg_vol = (bars[0][1][5] + bars[1][1][5] + bars[2][1][5]) / 3.0
+        day_ranges[dk] = (or_high, or_low, or_avg_vol)
+
+    in_trade    = False
+    side        = None
+    entry_price = 0.0
+    entry_ts    = 0
+    entry_bar   = 0
+    day_traded  = set()   # day_keys where a trade was already taken
+
+    for i in range(MIN_B, n - 1):
+        if in_trade:
+            bars_held = i - entry_bar
+            bar_h = highs[i]
+            bar_l = lows[i]
+            bar_c = closes[i]
+
+            if side == 'buy':
+                tp_price = entry_price * (1 + TP)
+                sl_price = entry_price * (1 - SL)
+                hit_sl   = bar_l <= sl_price
+                hit_tp   = bar_h >= tp_price
             else:
-                if h >= sl_price:
-                    exit_price, reason, exit_i = sl_price, 'sl', j; break
-                if l <= tp_price:
-                    exit_price, reason, exit_i = tp_price, 'tp', j; break
-        else:
-            exit_i = min(i + 1 + max_bars, n - 1)
-            exit_price = closes[exit_i]
-            reason = 'max_hold' if exit_i < n - 1 else 'end_of_data'
+                tp_price = entry_price * (1 - TP)
+                sl_price = entry_price * (1 + SL)
+                hit_sl   = bar_h >= sl_price
+                hit_tp   = bar_l <= tp_price
 
-        if sig == 'buy':
-            net = (exit_price - ep) / ep - (FEE + SLIP)
+            exit_price = None
+            reason     = None
+
+            if hit_sl:
+                exit_price = sl_price; reason = 'sl'
+            elif hit_tp:
+                exit_price = tp_price; reason = 'tp'
+            elif bars_held >= MAX_B:
+                exit_price = bar_c;   reason = 'max_hold'
+
+            if exit_price is not None:
+                if side == 'buy':
+                    gross = (exit_price - entry_price) / entry_price
+                else:
+                    gross = (entry_price - exit_price) / entry_price
+                net = gross - (FEE + SLIP)
+                pnl = notional * net
+                trades.append({
+                    'symbol'     : symbol,
+                    'strategy'   : 'S2_ORB',
+                    'side'       : side,
+                    'entry_ts'   : entry_ts,
+                    'exit_ts'    : ts_arr[i],
+                    'entry_price': round(entry_price, 8),
+                    'exit_price' : round(exit_price,  8),
+                    'pnl'        : round(pnl, 4),
+                    'reason'     : reason,
+                    'bars'       : bars_held,
+                })
+                in_trade = False
+                continue
+
+        if not in_trade:
+            dk = ts_arr[i] // 86400000
+            if dk in day_ranges and dk not in day_traded:
+                or_high, or_low, or_avg_vol = day_ranges[dk]
+                if or_high != or_low:
+                    buf_high = or_high * 1.001
+                    buf_low  = or_low  * 0.999
+                    sig = None
+                    if closes[i] > buf_high:
+                        sig = 'buy'
+                    elif closes[i] < buf_low:
+                        sig = 'sell'
+
+                    if sig is not None:
+                        # Volume: bar i vs 20-bar avg before it
+                        start_v = max(0, i - 20)
+                        avg_vol  = sum(vols[start_v:i]) / max(1, i - start_v)
+                        if avg_vol > 0 and vols[i] >= 2.0 * avg_vol:
+                            adx_v, _, _ = adx_calc(highs[:i+1], lows[:i+1], closes[:i+1], 14)
+                            if adx_v >= 22:
+                                raw_entry = opens[i + 1]
+                                if sig == 'buy':
+                                    entry_price = raw_entry * (1 + FEE + SLIP)
+                                else:
+                                    entry_price = raw_entry * (1 - FEE - SLIP)
+                                side       = sig
+                                entry_ts   = ts_arr[i + 1]
+                                entry_bar  = i + 1
+                                in_trade   = True
+                                day_traded.add(dk)
+
+    # Close open trade at end of data
+    if in_trade:
+        exit_price = closes[-1]
+        if side == 'buy':
+            gross = (exit_price - entry_price) / entry_price
         else:
-            net = (ep - exit_price) / ep - (FEE + SLIP)
+            gross = (entry_price - exit_price) / entry_price
+        net = gross - (FEE + SLIP)
         pnl = notional * net
-
         trades.append({
-            'symbol':      symbol,
-            'side':        sig,
-            'entry_ts':    entry_ts,
-            'exit_ts':     ts_arr[exit_i],
-            'entry_price': ep,
-            'exit_price':  exit_price,
-            'pnl':         pnl,
-            'reason':      reason,
-            'bars':        exit_i - (i + 1),
+            'symbol'     : symbol,
+            'strategy'   : 'S2_ORB',
+            'side'       : side,
+            'entry_ts'   : entry_ts,
+            'exit_ts'    : ts_arr[-1],
+            'entry_price': round(entry_price, 8),
+            'exit_price' : round(exit_price,  8),
+            'pnl'        : round(pnl, 4),
+            'reason'     : 'end_of_data',
+            'bars'       : len(candles) - 1 - entry_bar,
         })
-        i = exit_i + 1
+
     return trades
+
 
 # ── Stats ──────────────────────────────────────────────────────────────────────
-def stats(trades, tf_minutes=5):
+
+def stats(trades):
     if not trades:
-        return {'total': 0, 'win_rate': 0, 'profit_factor': 0,
-                'net_pnl': 0, 'max_drawdown': 0, 'avg_win': 0,
-                'avg_loss': 0, 'expectancy': 0, 'sharpe': 0,
-                'longs': 0, 'shorts': 0, 'monthly': {}, 'per_coin': {}}
+        return {
+            'total': 0, 'win_rate': 0.0, 'profit_factor': 0.0,
+            'net_pnl': 0.0, 'max_drawdown': 0.0,
+            'avg_win': 0.0, 'avg_loss': 0.0, 'expectancy': 0.0,
+            'longs': 0, 'shorts': 0, 'monthly': {}, 'per_coin': {},
+        }
+
     wins   = [t['pnl'] for t in trades if t['pnl'] > 0]
     losses = [t['pnl'] for t in trades if t['pnl'] <= 0]
-    gross_win  = sum(wins)
-    gross_loss = abs(sum(losses))
-    pf  = gross_win / gross_loss if gross_loss > 0 else float('inf')
-    wr  = len(wins) / len(trades) * 100
-    aw  = sum(wins)   / len(wins)   if wins   else 0
-    al  = sum(losses) / len(losses) if losses else 0
-    exp = (wr/100 * aw) + ((1 - wr/100) * al)
+    gross_profit = sum(wins)
+    gross_loss   = abs(sum(losses))
+    net_pnl      = sum(t['pnl'] for t in trades)
+
+    pf   = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+    wr   = 100.0 * len(wins) / len(trades)
+    avg_w = gross_profit / len(wins)   if wins   else 0.0
+    avg_l = sum(losses) / len(losses)  if losses else 0.0
+    exp   = (wr/100 * avg_w) + ((1 - wr/100) * avg_l)
 
     # Max drawdown
-    equity = 0.0
-    peak   = 0.0
-    max_dd = 0.0
+    equity = 0.0; peak = 0.0; max_dd = 0.0
     for t in sorted(trades, key=lambda x: x['entry_ts']):
         equity += t['pnl']
         if equity > peak: peak = equity
         dd = peak - equity
         if dd > max_dd: max_dd = dd
 
-    # Sharpe — daily PnL buckets
-    daily = defaultdict(float)
-    for t in trades:
-        day = t['entry_ts'] // (86400 * 1000)
-        daily[day] += t['pnl']
-    daily_vals = list(daily.values())
-    if len(daily_vals) > 1:
-        mean_d = sum(daily_vals) / len(daily_vals)
-        var_d  = sum((x - mean_d) ** 2 for x in daily_vals) / len(daily_vals)
-        std_d  = math.sqrt(var_d)
-        sharpe = (mean_d / std_d * math.sqrt(365)) if std_d > 0 else 0
-    else:
-        sharpe = 0
-
     # Monthly
-    monthly = defaultdict(lambda: {'pnl': 0.0, 'n': 0, 'w': 0})
+    monthly = {}
     for t in trades:
-        from datetime import datetime
-        dt  = datetime.utcfromtimestamp(t['entry_ts'] / 1000)
-        key = f"{dt.year}-{dt.month:02d}"
+        ts_s = t['entry_ts'] / 1000
+        import time as _time
+        lt   = _time.gmtime(ts_s)
+        key  = f"{lt.tm_year}-{lt.tm_mon:02d}"
+        if key not in monthly: monthly[key] = {'pnl': 0.0, 'n': 0, 'w': 0}
         monthly[key]['pnl'] += t['pnl']
         monthly[key]['n']   += 1
         if t['pnl'] > 0: monthly[key]['w'] += 1
 
-    # Per-coin
-    per_coin = defaultdict(lambda: {'pnl': 0.0, 'n': 0, 'w': 0, 'wr': 0.0})
+    # Per coin
+    per_coin = {}
     for t in trades:
-        s = t['symbol']
-        per_coin[s]['pnl'] += t['pnl']
-        per_coin[s]['n']   += 1
-        if t['pnl'] > 0: per_coin[s]['w'] += 1
-    for s in per_coin:
-        n_ = per_coin[s]['n']
-        per_coin[s]['wr'] = per_coin[s]['w'] / n_ * 100 if n_ > 0 else 0
+        sym = t['symbol']
+        if sym not in per_coin: per_coin[sym] = {'pnl': 0.0, 'n': 0, 'w': 0}
+        per_coin[sym]['pnl'] += t['pnl']
+        per_coin[sym]['n']   += 1
+        if t['pnl'] > 0: per_coin[sym]['w'] += 1
+    for sym, d in per_coin.items():
+        d['wr'] = round(100.0 * d['w'] / d['n'], 1) if d['n'] > 0 else 0.0
 
     return {
-        'total':         len(trades),
-        'win_rate':      round(wr, 2),
+        'total'        : len(trades),
+        'win_rate'     : round(wr, 2),
         'profit_factor': round(pf, 4),
-        'net_pnl':       round(sum(t['pnl'] for t in trades), 4),
-        'max_drawdown':  round(max_dd, 4),
-        'avg_win':       round(aw, 4),
-        'avg_loss':      round(al, 4),
-        'expectancy':    round(exp, 4),
-        'sharpe':        round(sharpe, 4),
-        'longs':         sum(1 for t in trades if t['side'] == 'buy'),
-        'shorts':        sum(1 for t in trades if t['side'] == 'sell'),
-        'monthly':       {k: dict(v) for k, v in sorted(monthly.items())},
-        'per_coin':      {k: dict(v) for k, v in per_coin.items()},
+        'net_pnl'      : round(net_pnl, 2),
+        'max_drawdown' : round(max_dd, 2),
+        'avg_win'      : round(avg_w, 4),
+        'avg_loss'     : round(avg_l, 4),
+        'expectancy'   : round(exp, 4),
+        'longs'        : sum(1 for t in trades if t['side'] == 'buy'),
+        'shorts'       : sum(1 for t in trades if t['side'] == 'sell'),
+        'monthly'      : monthly,
+        'per_coin'     : per_coin,
     }
 
-# ── Shard Runner ───────────────────────────────────────────────────────────────
+
+# ── Shard runner ───────────────────────────────────────────────────────────────
+
+def run_symbol(symbol):
+    """Fetch all timeframes needed and run all 4 strategies. Returns list of trades."""
+    all_trades = []
+
+    # Timeframes needed: 15m for S1/S3/S4, 5m for S2
+    candles_15m = fetch_symbol(symbol, '15m')
+    candles_5m  = fetch_symbol(symbol, '5m')
+
+    # S1 — Ribbon Squeeze (15m)
+    if len(candles_15m) >= STRATEGIES['S1_Ribbon']['min_bars'] + 2:
+        t = backtest_15m(symbol, candles_15m, 'S1_Ribbon', STRATEGIES['S1_Ribbon'])
+        all_trades.extend(t)
+
+    # S2 — ORB (5m)
+    if len(candles_5m) >= STRATEGIES['S2_ORB']['min_bars'] + 2:
+        t = backtest_S2_orb(symbol, candles_5m)
+        all_trades.extend(t)
+
+    # S3 — RSI2 Reversion (15m)
+    if len(candles_15m) >= STRATEGIES['S3_RSI2']['min_bars'] + 2:
+        t = backtest_15m(symbol, candles_15m, 'S3_RSI2', STRATEGIES['S3_RSI2'])
+        all_trades.extend(t)
+
+    # S4 — Body Momentum (15m)
+    if len(candles_15m) >= STRATEGIES['S4_BodyMom']['min_bars'] + 2:
+        t = backtest_15m(symbol, candles_15m, 'S4_BodyMom', STRATEGIES['S4_BodyMom'])
+        all_trades.extend(t)
+
+    return all_trades
+
+
 def run_shard(shard_idx):
-    t0 = time.time()
-    my_symbols = ALL_SYMBOLS[shard_idx::NUM_SHARDS]
-    print(f"[Shard {shard_idx}] {len(my_symbols)} coins")
+    t0      = time.time()
+    symbols = ALL_SYMBOLS[shard_idx::NUM_SHARDS]
+    print(f"[Shard {shard_idx}] Starting {len(symbols)} symbols", flush=True)
 
-    # Fetch all needed timeframes
-    needed_tfs = set()
-    for label, tf, tp, sl, mb in OPTION_A_CONFIGS:
-        needed_tfs.add(tf)
-    needed_tfs.add(OPTION_B_CONFIG['tf'])
+    all_trades   = []
+    with_data    = []
+    no_data      = []
 
-    # Fetch candles per (symbol, tf)
-    candle_cache = {}   # (symbol, tf) -> list of candles
-
-    def fetch_task(symbol, tf):
-        return (symbol, tf, fetch_symbol(symbol, tf))
-
-    tasks = [(sym, tf) for sym in my_symbols for tf in needed_tfs]
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(fetch_task, sym, tf): (sym, tf) for sym, tf in tasks}
-        for fut in as_completed(futs):
-            sym, tf, candles = fut.result()
-            candle_cache[(sym, tf)] = candles
-            if candles:
-                print(f"  [{shard_idx}] {sym} {tf}: {len(candles)} bars")
-            else:
-                print(f"  [{shard_idx}] {sym} {tf}: NO DATA")
+        futures = {ex.submit(run_symbol, sym): sym for sym in symbols}
+        done    = 0
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            done += 1
+            try:
+                trades = fut.result()
+                if trades:
+                    all_trades.extend(trades)
+                    with_data.append(sym)
+                else:
+                    no_data.append(sym)
+            except Exception as e:
+                print(f"[Shard {shard_idx}] ERROR {sym}: {e}", flush=True)
+                no_data.append(sym)
+            if done % 5 == 0:
+                print(f"[Shard {shard_idx}] {done}/{len(symbols)} done", flush=True)
 
-    # Run all variants
-    # Structure: { variant_label: { symbol: [trades] } }
-    variant_trades = defaultdict(list)
-
-    for sym in my_symbols:
-        # Option A variants
-        for (label, tf, tp, sl, mb) in OPTION_A_CONFIGS:
-            candles = candle_cache.get((sym, tf), [])
-            if not candles: continue
-            t = backtest_a(sym, candles, tp, sl, mb)
-            variant_trades[label].extend(t)
-
-        # Option B
-        b_tf = OPTION_B_CONFIG['tf']
-        candles = candle_cache.get((sym, b_tf), [])
-        if candles:
-            t = backtest_b(sym, candles, OPTION_B_CONFIG)
-            variant_trades[OPTION_B_CONFIG['label']].extend(t)
-
-    # Compute per-variant stats for this shard
-    variant_stats = {}
-    for label, trades in variant_trades.items():
-        tf_min = 5 if '5m' in label else 15
-        variant_stats[label] = stats(trades, tf_min)
-
-    shard_data = {
-        'shard':          shard_idx,
-        'symbols':        my_symbols,
-        'variant_trades': {k: v for k, v in variant_trades.items()},
-        'variant_stats':  variant_stats,
-        'elapsed':        round(time.time() - t0, 2),
+    elapsed = time.time() - t0
+    result  = {
+        'shard'    : shard_idx,
+        'symbols'  : symbols,
+        'with_data': with_data,
+        'no_data'  : no_data,
+        'trades'   : all_trades,
+        'stats'    : stats(all_trades),
+        'elapsed'  : round(elapsed, 1),
     }
-    with open(f'shard_{shard_idx}.json', 'w') as f:
-        json.dump(shard_data, f)
-    print(f"[Shard {shard_idx}] Done in {shard_data['elapsed']}s")
+
+    fname = f"shard_{shard_idx}.json"
+    with open(fname, 'w') as f:
+        json.dump(result, f)
+    print(f"[Shard {shard_idx}] Done in {elapsed:.0f}s — {len(all_trades)} trades, wrote {fname}", flush=True)
+
 
 # ── Merge ──────────────────────────────────────────────────────────────────────
+
 def merge_shards():
-    all_variant_trades = defaultdict(list)
+    all_trades   = []
+    all_symbols  = []
+    with_data    = []
 
     for idx in range(NUM_SHARDS):
-        fname = f'shard_{idx}.json'
+        fname = f"shard_{idx}.json"
         if not os.path.exists(fname):
-            print(f"WARNING: {fname} missing"); continue
+            print(f"WARNING: {fname} not found — skipping", flush=True)
+            continue
         with open(fname) as f:
-            d = json.load(f)
-        for label, trades in d['variant_trades'].items():
-            all_variant_trades[label].extend(trades)
+            shard = json.load(f)
+        all_trades.extend(shard['trades'])
+        all_symbols.extend(shard['symbols'])
+        with_data.extend(shard.get('with_data', []))
 
-    # All variant labels in order
-    all_labels = [cfg[0] for cfg in OPTION_A_CONFIGS] + [OPTION_B_CONFIG['label']]
+    agg = stats(all_trades)
 
-    # Compute final stats per variant
-    final = {}
-    for label in all_labels:
-        trades = all_variant_trades.get(label, [])
-        tf_min = 5 if '5m' in label else 15
-        final[label] = {
-            'stats':  stats(trades, tf_min),
-            'trades': len(trades),
-        }
+    # Per-strategy breakdown
+    strat_names = ['S1_Ribbon', 'S2_ORB', 'S3_RSI2', 'S4_BodyMom']
+    strat_stats = {}
+    for s in strat_names:
+        sub = [t for t in all_trades if t.get('strategy') == s]
+        strat_stats[s] = stats(sub)
 
-    # Write JSON report
     report = {
-        'period':    f"{START_YM[0]}-{START_YM[1]:02d} to {END_YM[0]}-{END_YM[1]:02d}",
-        'coins':     len(ALL_SYMBOLS),
-        'capital':   CAPITAL,
-        'leverage':  LEVERAGE,
-        'risk_pct':  RISK_PCT,
-        'fee':       FEE,
-        'slip':      SLIP,
-        'variants':  final,
+        'period'        : f"{START_YM[0]}-{START_YM[1]:02d} to {END_YM[0]}-{END_YM[1]:02d}",
+        'symbols_total' : len(all_symbols),
+        'symbols_with_data': len(with_data),
+        'aggregate'     : agg,
+        'by_strategy'   : strat_stats,
+        'trades'        : all_trades,
     }
+
     with open('backtest_report.json', 'w') as f:
         json.dump(report, f, indent=2)
 
-    # Write summary txt
-    PASS = lambda s: '✅ PASS' if s['profit_factor'] >= 1.5 and s['win_rate'] >= 42 else '❌ FAIL'
-
+    # ── Summary text ──
     lines = []
     lines.append("=" * 72)
-    lines.append("  MICRO-PROFIT BACKTEST — Options A & B")
-    lines.append(f"  Period  : {report['period']}  |  Coins: {report['coins']}")
-    lines.append(f"  Capital : ${CAPITAL:,.0f}  |  Leverage: {LEVERAGE}x  |  Risk/trade: {RISK_PCT*100:.2f}%")
-    lines.append(f"  Fees    : {FEE*100:.2f}% + {SLIP*100:.2f}% slip (both sides)")
+    lines.append("  4-STRATEGY BACKTEST REPORT")
+    lines.append(f"  Period   : {report['period']}")
+    lines.append(f"  Symbols  : {report['symbols_total']} attempted, {report['symbols_with_data']} with data")
+    lines.append(f"  Capital  : ${CAPITAL:,.0f}  Leverage: {LEVERAGE}x  Risk/trade: {RISK_PCT*100}%")
+    lines.append(f"  Fees     : {FEE*100}% + {SLIP*100}% slip (both sides)")
     lines.append("=" * 72)
     lines.append("")
-    lines.append(f"{'Variant':<22} {'Trades':>7} {'WR%':>7} {'PF':>7} {'Sharpe':>8} {'MaxDD$':>9} {'NetPnL$':>10} {'Expect$':>9}  Result")
-    lines.append("-" * 100)
 
-    for label in all_labels:
-        if label not in final: continue
-        s = final[label]['stats']
-        n = final[label]['trades']
-        lines.append(
-            f"{label:<22} {n:>7} {s['win_rate']:>7.1f} {s['profit_factor']:>7.3f} "
-            f"{s['sharpe']:>8.3f} {s['max_drawdown']:>9.2f} {s['net_pnl']:>10.2f} "
-            f"{s['expectancy']:>9.4f}  {PASS(s)}"
-        )
+    lines.append(f"{'Strategy':<16} {'Trades':>7} {'WR%':>6} {'PF':>6} {'MaxDD$':>10} {'NetPnL$':>10}  Result")
+    lines.append("-" * 72)
+    for s in strat_names:
+        ss   = strat_stats[s]
+        pf   = ss['profit_factor']
+        wr   = ss['win_rate']
+        ok   = "✅ PASS" if pf >= 1.5 and wr >= 42 else "❌ FAIL"
+        lines.append(f"{s:<16} {ss['total']:>7} {wr:>6.1f} {pf:>6.3f} {ss['max_drawdown']:>10.2f} {ss['net_pnl']:>10.2f}  {ok}")
 
     lines.append("")
-    lines.append("─" * 72)
-    lines.append("OPTION A — GMaxV1 Signal (EMA9/21 + EMA50 slope + ADX>=22)")
-    lines.append("  15m timeframe: 5 TP/SL combos  |  5m timeframe: 5 TP/SL combos")
-    lines.append("  Baseline: A_15m_TP3.0_SL15 = original GMaxV1 parameters")
-    lines.append("")
-    lines.append("OPTION B — Bollinger Band(20,2) + RSI(14) Mean Reversion on 5m")
-    lines.append("  Long: close < lower_BB AND RSI < 35")
-    lines.append("  Short: close > upper_BB AND RSI > 65")
-    lines.append("  TP=0.8% / SL=2.5% / Max hold=72 bars (6h)")
-    lines.append("─" * 72)
+    lines.append("── AGGREGATE (all strategies combined) ──")
+    a = agg
+    lines.append(f"  Trades        : {a['total']}")
+    lines.append(f"  Win Rate      : {a['win_rate']:.2f}%")
+    lines.append(f"  Profit Factor : {a['profit_factor']:.4f}")
+    lines.append(f"  Net PnL       : ${a['net_pnl']:,.2f}")
+    lines.append(f"  Max Drawdown  : ${a['max_drawdown']:,.2f}")
+    lines.append(f"  Avg Win       : ${a['avg_win']:.4f}")
+    lines.append(f"  Avg Loss      : ${a['avg_loss']:.4f}")
+    lines.append(f"  Expectancy    : ${a['expectancy']:.4f}")
+    lines.append(f"  Longs         : {a['longs']}  Shorts: {a['shorts']}")
     lines.append("")
 
-    # Per-coin top 20 for each passing variant
-    for label in all_labels:
-        if label not in final: continue
-        s = final[label]['stats']
-        if not s['per_coin']: continue
-        ranked = sorted(s['per_coin'].items(), key=lambda x: x[1]['pnl'], reverse=True)[:20]
-        lines.append(f"  Top coins — {label}:")
-        for sym, d in ranked:
-            lines.append(f"    {sym:<22} trades={d['n']:>4}  wr={d['wr']:>5.1f}%  pnl=${d['pnl']:>9.2f}")
+    # Top 20 coins per strategy by net PnL
+    for s in strat_names:
+        ss = strat_stats[s]
+        lines.append(f"── Top 20 coins — {s} ──")
+        top = sorted(ss['per_coin'].items(), key=lambda x: x[1]['pnl'], reverse=True)[:20]
+        for sym, d in top:
+            lines.append(f"  {sym:<24} trades={d['n']:>4}  wr={d['wr']:>5.1f}%  pnl=${d['pnl']:>9.2f}")
         lines.append("")
 
-    lines.append("=" * 72)
-    txt = "\n".join(lines)
-    with open('backtest_summary.txt', 'w') as f:
-        f.write(txt)
-    print(txt)
-    print("\n✅ Merge complete — backtest_report.json + backtest_summary.txt written")
+    # Monthly PnL (aggregate)
+    lines.append("── Monthly PnL (aggregate all strategies) ──")
+    for mo in sorted(a['monthly'].keys()):
+        md = a['monthly'][mo]
+        lines.append(f"  {mo}  n={md['n']:>5}  pnl=${md['pnl']:>9.2f}")
+    lines.append("")
 
-# ── Entry Point ────────────────────────────────────────────────────────────────
+    # RECOMMENDATION
+    any_pass = any(
+        strat_stats[s]['profit_factor'] >= 1.5 and strat_stats[s]['win_rate'] >= 42
+        for s in strat_names
+    )
+    lines.append("── RECOMMENDATION ──")
+    if any_pass:
+        lines.append("  ✅ AT LEAST ONE STRATEGY USABLE (PF >= 1.5, WR >= 42%)")
+    else:
+        lines.append("  ❌ NO STRATEGY MEETS THRESHOLD — do not trade live")
+    lines.append("=" * 72)
+
+    summary = "\n".join(lines)
+    with open('backtest_summary.txt', 'w') as f:
+        f.write(summary)
+
+    print(summary, flush=True)
+    print("\nWrote: backtest_report.json, backtest_summary.txt", flush=True)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: python backtest.py <shard_idx|merge>"); sys.exit(1)
+        print("Usage: python backtest_4strats.py <shard_idx|merge>")
+        sys.exit(1)
     arg = sys.argv[1]
     if arg == 'merge':
         merge_shards()
