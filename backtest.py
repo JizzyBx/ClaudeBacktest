@@ -347,8 +347,9 @@ def compute_stats(trades):
     if not trades:
         return {
             'total': 0, 'win_rate': 0.0, 'profit_factor': 0.0, 'net_pnl': 0.0,
-            'max_drawdown': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0, 'expectancy': 0.0,
-            'longs': 0, 'shorts': 0,
+            'max_drawdown': 0.0, 'max_drawdown_pct': 0.0, 'sharpe': 0.0,
+            'avg_win': 0.0, 'avg_loss': 0.0, 'expectancy': 0.0,
+            'longs': 0, 'shorts': 0, 'coins_traded': 0, 'coins_profitable': 0,
         }
     wins = [t['pnl'] for t in trades if t['pnl'] > 0]
     losses = [t['pnl'] for t in trades if t['pnl'] <= 0]
@@ -358,16 +359,48 @@ def compute_stats(trades):
     pf = (gross_win / gross_loss) if gross_loss > 0 else (float('inf') if gross_win > 0 else 0.0)
     win_rate = len(wins) / len(trades) * 100
 
-    # max drawdown from cumulative equity curve, sorted by exit time
+    # equity curve, sorted by exit time, starting from CAPITAL (so % DD is meaningful)
     sorted_trades = sorted(trades, key=lambda t: t['exit_ts'])
-    equity = 0.0; peak = 0.0; max_dd = 0.0
+    equity = CAPITAL
+    peak = CAPITAL
+    max_dd = 0.0        # in $
+    max_dd_pct = 0.0     # in %
     for t in sorted_trades:
         equity += t['pnl']
         if equity > peak:
             peak = equity
         dd = peak - equity
+        dd_pct = (dd / peak * 100) if peak > 0 else 0.0
         if dd > max_dd:
             max_dd = dd
+        if dd_pct > max_dd_pct:
+            max_dd_pct = dd_pct
+
+    # Sharpe ratio: computed on the per-trade return series (pnl / capital-at-risk-equivalent),
+    # then annualized using average trades/day over the backtest span. Not a daily-return Sharpe
+    # (trades are irregular in time) -- this is the standard "trade-based Sharpe" approximation.
+    returns = [t['pnl'] / CAPITAL for t in sorted_trades]
+    n = len(returns)
+    if n >= 2:
+        mean_r = sum(returns) / n
+        var_r = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
+        std_r = var_r ** 0.5
+        if std_r > 0:
+            span_days = (sorted_trades[-1]['exit_ts'] - sorted_trades[0]['entry_ts']) / 86400.0
+            span_days = max(span_days, 1.0)
+            trades_per_day = n / span_days
+            # annualize the per-trade Sharpe by sqrt(trades per year)
+            sharpe = (mean_r / std_r) * ((trades_per_day * 365.0) ** 0.5)
+        else:
+            sharpe = 0.0
+    else:
+        sharpe = 0.0
+
+    coin_pnl = defaultdict(float)
+    for t in trades:
+        coin_pnl[t['symbol']] += t['pnl']
+    coins_traded = len(coin_pnl)
+    coins_profitable = sum(1 for v in coin_pnl.values() if v > 0)
 
     return {
         'total': len(trades),
@@ -375,12 +408,35 @@ def compute_stats(trades):
         'profit_factor': round(pf, 3) if pf != float('inf') else 999.0,
         'net_pnl': round(net_pnl, 2),
         'max_drawdown': round(max_dd, 2),
+        'max_drawdown_pct': round(max_dd_pct, 2),
+        'sharpe': round(sharpe, 3),
         'avg_win': round(sum(wins)/len(wins), 2) if wins else 0.0,
         'avg_loss': round(sum(losses)/len(losses), 2) if losses else 0.0,
         'expectancy': round(net_pnl/len(trades), 4),
         'longs': sum(1 for t in trades if t['side'] == 'buy'),
         'shorts': sum(1 for t in trades if t['side'] == 'sell'),
+        'coins_traded': coins_traded,
+        'coins_profitable': coins_profitable,
     }
+
+def compute_per_coin_stats(trades):
+    """Per-symbol breakdown for a single variant's trade list."""
+    by_coin = defaultdict(list)
+    for t in trades:
+        by_coin[t['symbol']].append(t)
+    out = {}
+    for sym, tlist in by_coin.items():
+        wins = [t['pnl'] for t in tlist if t['pnl'] > 0]
+        losses = [t['pnl'] for t in tlist if t['pnl'] <= 0]
+        gross_win = sum(wins); gross_loss = abs(sum(losses))
+        pf = (gross_win/gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+        out[sym] = {
+            'trades': len(tlist),
+            'win_rate': round(len(wins)/len(tlist)*100, 2) if tlist else 0.0,
+            'profit_factor': round(pf, 3),
+            'net_pnl': round(sum(t['pnl'] for t in tlist), 2),
+        }
+    return out
 
 # ══════════════════════════════════════════════════════════════
 # SHARD RUNNER
@@ -476,6 +532,24 @@ def merge_shards():
             'stats': stats,
         }
 
+    # ── ranked list, PF desc then WR desc ──
+    ranked = sorted(
+        variant_results.items(),
+        key=lambda kv: (kv[1]['stats']['profit_factor'], kv[1]['stats']['win_rate']),
+        reverse=True,
+    )
+
+    # per-coin breakdown for baseline + top 5 ranked variants (kept out of the huge
+    # all-variants blob to keep JSON size sane; only where it's actually useful)
+    per_coin_vids = {'P14_T22_FLAT'}  # baseline always included
+    for vid, _ in ranked[:5]:
+        per_coin_vids.add(vid)
+
+    per_coin_breakdown = {}
+    for vid in per_coin_vids:
+        trades = all_variant_trades.get(vid, [])
+        per_coin_breakdown[vid] = compute_per_coin_stats(trades)
+
     report = {
         'period_range': f"{START_YM} to {END_YM}",
         'timeframe': TIMEFRAME,
@@ -488,59 +562,91 @@ def merge_shards():
             'rising_lookback': RISING_LOOKBACK,
         },
         'variants': variant_results,
+        'per_coin_breakdown': per_coin_breakdown,
         'elapsed_total_shard_seconds': round(total_elapsed, 1),
     }
     with open('backtest_report.json', 'w') as f:
         json.dump(report, f)
 
-    # ── comparison table, ranked by profit_factor desc ──
-    ranked = sorted(
-        variant_results.items(),
-        key=lambda kv: (kv[1]['stats']['profit_factor'], kv[1]['stats']['win_rate']),
-        reverse=True,
-    )
-
+    # ══════════════════════════════════════════════════════
+    # TEXT SUMMARY
+    # ══════════════════════════════════════════════════════
     lines = []
-    lines.append("=" * 100)
+    lines.append("=" * 130)
     lines.append("G MAX V1 — ADX VARIANT SWEEP BACKTEST")
-    lines.append("=" * 100)
+    lines.append("=" * 130)
     lines.append(f"Period: {START_YM} to {END_YM}  |  Timeframe: {TIMEFRAME}  |  Universe coins")
     lines.append(f"Symbols attempted: {len(all_symbols)}  |  Symbols with data: {len(all_with_data)}")
     lines.append(f"Capital: ${CAPITAL:,.0f}  |  Risk/trade: {RISK_PCT*100:.2f}%  |  Leverage: {LEVERAGE}x")
     lines.append(f"Fee: {FEE*100:.3f}%  |  Slippage: {SLIP*100:.3f}%  |  TP: {TP_PCT*100:.1f}%  SL: {SL_PCT*100:.1f}%")
-    lines.append(f"Fixed pipeline: EMA50 slope filter + EMA9/21 crossover (identical to live)")
+    lines.append("Fixed pipeline: EMA50 slope filter + EMA9/21 crossover (identical to live)")
     lines.append(f"Rising-ADX lookback: {RISING_LOOKBACK} bars")
+    lines.append("Sharpe = annualized, computed from per-trade return series (see notes at bottom)")
     lines.append("")
-    lines.append(f"{'RANK':<5}{'VARIANT':<20}{'PERIOD':<8}{'THRESH':<8}{'RISING':<8}"
-                  f"{'TRADES':<9}{'WR%':<8}{'PF':<8}{'NET_PNL':<12}{'MAX_DD':<10}{'EXP':<9}")
-    lines.append("-" * 100)
+    lines.append(
+        f"{'RANK':<5}{'VARIANT':<18}{'PER':<5}{'THR':<5}{'RISE':<7}"
+        f"{'COINS':<8}{'TRADES':<8}{'WR%':<8}{'PF':<7}{'SHARPE':<8}"
+        f"{'NET_PNL($)':<12}{'MAX_DD($)':<11}{'MAX_DD%':<9}{'EXP($)':<8}"
+    )
+    lines.append("-" * 130)
     for rank, (vid, v) in enumerate(ranked, 1):
         s = v['stats']
         lines.append(
-            f"{rank:<5}{vid:<20}{v['period']:<8}{v['thresh']:<8}{str(v['rising']):<8}"
-            f"{s['total']:<9}{s['win_rate']:<8}{s['profit_factor']:<8}"
-            f"{s['net_pnl']:<12}{s['max_drawdown']:<10}{s['expectancy']:<9}"
+            f"{rank:<5}{vid:<18}{v['period']:<5}{v['thresh']:<5}{str(v['rising']):<7}"
+            f"{s['coins_traded']:<8}{s['total']:<8}{s['win_rate']:<8}{s['profit_factor']:<7}"
+            f"{s['sharpe']:<8}{s['net_pnl']:<12}{s['max_drawdown']:<11}{s['max_drawdown_pct']:<9}"
+            f"{s['expectancy']:<8}"
         )
     lines.append("")
 
     baseline = variant_results.get('P14_T22_FLAT')
     if baseline:
         bs = baseline['stats']
-        lines.append("-" * 100)
-        lines.append(f"BASELINE (current live config P14_T22_FLAT): trades={bs['total']} "
-                      f"WR={bs['win_rate']}% PF={bs['profit_factor']} net_pnl={bs['net_pnl']} "
-                      f"max_dd={bs['max_drawdown']}")
-        lines.append("-" * 100)
+        lines.append("-" * 130)
+        lines.append(
+            f"BASELINE (current live config P14_T22_FLAT): coins={bs['coins_traded']} "
+            f"({bs['coins_profitable']} profitable) trades={bs['total']} WR={bs['win_rate']}% "
+            f"PF={bs['profit_factor']} sharpe={bs['sharpe']} net_pnl=${bs['net_pnl']} "
+            f"max_dd=${bs['max_drawdown']} ({bs['max_drawdown_pct']}%)"
+        )
+        lines.append("-" * 130)
+
+    # ── per-coin breakdown section for baseline + top 5 ──
+    lines.append("")
+    lines.append("=" * 130)
+    lines.append("PER-COIN BREAKDOWN (baseline + top 5 ranked variants)")
+    lines.append("=" * 130)
+    for vid in ['P14_T22_FLAT'] + [v for v, _ in ranked[:5]]:
+        if vid not in per_coin_breakdown:
+            continue
+        coin_stats = per_coin_breakdown[vid]
+        tag = " (BASELINE)" if vid == 'P14_T22_FLAT' else ""
+        lines.append("")
+        lines.append(f"--- {vid}{tag} ---")
+        sorted_coins = sorted(coin_stats.items(), key=lambda kv: kv[1]['net_pnl'], reverse=True)
+        lines.append(f"{'SYMBOL':<16}{'TRADES':<9}{'WR%':<8}{'PF':<8}{'NET_PNL($)':<12}")
+        for sym, cs in sorted_coins:
+            lines.append(f"{sym:<16}{cs['trades']:<9}{cs['win_rate']:<8}{cs['profit_factor']:<8}{cs['net_pnl']:<12}")
+        profitable = sum(1 for cs in coin_stats.values() if cs['net_pnl'] > 0)
+        lines.append(f"  -> {profitable}/{len(coin_stats)} coins profitable")
 
     lines.append("")
     lines.append(f"Total shard compute time: {total_elapsed:.1f}s")
-    lines.append("=" * 100)
+    lines.append("=" * 130)
+    lines.append("")
+    lines.append("NOTES:")
+    lines.append("- Sharpe is computed on the per-trade return series (pnl / starting capital),")
+    lines.append("  annualized via sqrt(trades_per_year). It is a trade-based approximation,")
+    lines.append("  not a daily-equity-curve Sharpe -- treat it as directionally comparative")
+    lines.append("  across variants, not as a textbook portfolio Sharpe.")
+    lines.append("- MAX_DD% is drawdown as a percent of peak equity (starting from $" + f"{CAPITAL:,.0f})")
+    lines.append("- Per-coin breakdown is limited to baseline + top 5 variants to keep output readable.")
 
     with open('backtest_summary.txt', 'w') as f:
         f.write("\n".join(lines))
 
-    print("\n".join(lines[:20]))
-    print(f"... full comparison table for all {len(VARIANTS)} variants written to backtest_summary.txt")
+    print("\n".join(lines[:24]))
+    print(f"... full comparison table (all {len(VARIANTS)} variants) + per-coin breakdown written to backtest_summary.txt")
 
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
