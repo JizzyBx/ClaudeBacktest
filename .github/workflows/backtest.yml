@@ -6,11 +6,11 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+        shard: [0,1,2,3,4,5,6,7,8,9]
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +22,7 @@ jobs:
       - name: Run shard ${{ matrix.shard }}
         run: python backtest.py ${{ matrix.shard }}
 
-      - name: Upload shard result
+      - name: Upload shard
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
@@ -32,7 +32,7 @@ jobs:
   merge:
     needs: backtest
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -47,13 +47,10 @@ jobs:
           pattern: shard-*
           merge-multiple: true
 
-      - name: Merge and generate report
+      - name: Merge & report
         run: python backtest.py merge
 
-      - name: Zip results
-        run: zip backtest_results.zip backtest_report.json backtest_summary.txt
-
-      - name: Upload final zip
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
