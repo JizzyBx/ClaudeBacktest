@@ -1,4 +1,4 @@
-name: Micro-Profit Backtest (A+B)
+name: 4-Strategy Backtest
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
