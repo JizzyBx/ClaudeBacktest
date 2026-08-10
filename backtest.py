@@ -2199,4 +2199,414 @@ a.back{display:block;text-align:center;color:var(--blue);margin-bottom:10px;font
 <div class="card"><div class="lbl">Avg Loss</div><div class="val r">${{'%.2f'|format(a.avg_loss)}}</div></div>
 <div class="card"><div class="lbl">Avg R:R</div><div class="val y">{{a.avg_rr}}</div></div>
 <div class="card"><div class="lbl">Max Win Streak</div><div class="val g">{{a.max_win_streak}}</div></div>
-<div class="card"><div class="lbl">Max Loss Streak</div><div class="val r">{{a.max_loss_stre
+<div class="card"><div class="lbl">Max Loss Streak</div><div class="val r">{{a.max_loss_streak}}</div></div>
+<div class="card"><div class="lbl">Current Streak</div><div class="val {{'g' if a.cur_streak_type=='win' else 'r'}}">{{a.cur_streak}} {{a.cur_streak_type}}</div></div>
+</div>
+
+<div class="section">
+<div class="sh">🏆 Best / Worst Trade</div>
+{% if a.best_trade %}
+<div class="stat-row"><span>Best — {{a.best_trade.symbol}}</span><b class="g">${{'%+.3f'|format(a.best_trade.pnl)}}</b></div>
+<div class="stat-row"><span>Worst — {{a.worst_trade.symbol}}</span><b class="r">${{'%+.3f'|format(a.worst_trade.pnl)}}</b></div>
+{% else %}<div class="empty">No trades yet</div>{% endif %}
+</div>
+
+<div class="section">
+<div class="sh">📈 Equity Curve — cumulative PnL per trade</div>
+{% if eq_bars %}
+<div class="eq-row">
+{% for b in eq_bars %}
+<div class="eq-bar" style="height:{{b.pct}}%;background:{{'var(--green)' if b.val>=0 else 'var(--red)'}}"></div>
+{% endfor %}
+</div>
+<div class="stat-row"><span>Running total</span><b class="{{'g' if a.equity_curve[-1]>=0 else 'r'}}">${{'%+.3f'|format(a.equity_curve[-1])}}</b></div>
+{% else %}<div class="empty">No trades yet</div>{% endif %}
+</div>
+
+<div class="section">
+<div class="sh">📆 Daily P&amp;L — last 14 days</div>
+<div class="dc-row">
+{% for d in daily_pnl %}
+<div class="dc-col"><div class="dc-bar" style="height:{{d.bar_pct}}%;background:{{'var(--green)' if d.pnl>=0 else 'var(--red)'}}"></div></div>
+{% endfor %}
+</div>
+<div style="display:flex;gap:3px">
+{% for d in daily_pnl %}
+<div class="dc-lbl" style="flex:1;min-width:16px">{{d.label}}</div>
+{% endfor %}
+</div>
+</div>
+
+<div class="section">
+<div class="sh">🟢 Top 10 Profitable Coins</div>
+{% if top_gainers %}
+{% for g in top_gainers %}
+<div class="gl-row">
+  <span class="gl-name"><a href="/coin/{{g.symbol}}">{{g.name}}</a></span>
+  <div class="gl-track"><div class="gl-fill g" style="width:{{g.bar_pct}}%"></div></div>
+  <span class="gl-val g">${{'%+.2f'|format(g.pnl)}}</span>
+</div>
+{% endfor %}
+{% else %}<div class="empty">No profitable coins yet</div>{% endif %}
+</div>
+
+<div class="section">
+<div class="sh">🔴 Top 10 Losing Coins</div>
+{% if top_losers %}
+{% for l in top_losers %}
+<div class="gl-row">
+  <span class="gl-name"><a href="/coin/{{l.symbol}}">{{l.name}}</a></span>
+  <div class="gl-track"><div class="gl-fill r" style="width:{{l.bar_pct}}%"></div></div>
+  <span class="gl-val r">${{'%+.2f'|format(l.pnl)}}</span>
+</div>
+{% endfor %}
+{% else %}<div class="empty">No losing coins yet</div>{% endif %}
+</div>
+</body></html>'''
+
+# ── Inject theme CSS into all templates ───────────────────
+for _tpl_name in ('SETUP_HTML','DASH_HTML','SETTINGS_HTML','HISTORY_HTML','COIN_HTML','DATA_HTML'):
+    _tpl = globals()[_tpl_name]
+    _tpl = _tpl.replace('<style>', '<style>'+THEME_CSS, 1)
+    _tpl = _tpl.replace('<body>', '<body data-theme="{{theme}}">', 1)
+    globals()[_tpl_name] = _tpl
+
+# ── Flask routes ───────────────────────────────────────────
+def _badge_class(sig):
+    if sig=='buy': return 'bg'
+    if sig=='sell': return 'bs'
+    return 'bw'
+
+def _signal_row(symbol):
+    sg = state['last_signals'].get(symbol)
+    if not sg:
+        return {'name':display_name(symbol),'reason':'scanning...','badge':'bw',
+                'adx':'--','trend':'','crossed':'','time':'',
+                'symbol':symbol,'coin_enabled':is_coin_enabled(symbol)}
+    return {'name':display_name(symbol),'reason':sg.get('reason','--'),
+            'badge':_badge_class(sg.get('signal')),'adx':sg.get('adx','--'),
+            'trend':sg.get('trend',''),'crossed':sg.get('crossed',''),
+            'time':sg.get('time',''),'symbol':symbol,
+            'coin_enabled':is_coin_enabled(symbol)}
+
+@app.route('/')
+def dashboard():
+    if not is_configured():
+        return redirect('/setup')
+    coins = active_coins()
+    sort_mode = current_sort_mode()
+    rows_raw  = [_signal_row(sym) for sym in coins]
+
+    if sort_mode == 'recently_traded':
+        rows_raw.sort(key=lambda r: (
+            0 if r['coin_enabled'] else 1,
+            _sort_score_recently_traded(r['symbol'])
+        ))
+    elif sort_mode == 'about_to_trade':
+        rows_raw.sort(key=lambda r: (
+            0 if r['coin_enabled'] else 1,
+            _sort_score_about_to_trade(r['symbol'])
+        ))
+    else:
+        rows_raw.sort(key=lambda r: (0 if r['coin_enabled'] else 1))
+
+    signal_rows = rows_raw
+
+    extra_coins = extra_signals_list()
+    extra_rows_raw = [_signal_row(sym) for sym in extra_coins]
+    if sort_mode == 'recently_traded':
+        extra_rows_raw.sort(key=lambda r: (
+            0 if r['coin_enabled'] else 1,
+            _sort_score_recently_traded(r['symbol'])
+        ))
+    elif sort_mode == 'about_to_trade':
+        extra_rows_raw.sort(key=lambda r: (
+            0 if r['coin_enabled'] else 1,
+            _sort_score_about_to_trade(r['symbol'])
+        ))
+    else:
+        extra_rows_raw.sort(key=lambda r: (0 if r['coin_enabled'] else 1))
+    extra_signal_rows = extra_rows_raw
+    extra_msg = request.args.get('extra_msg', '')
+    extra_msg_type = request.args.get('extra_msg_type', '')
+
+    positions=[]
+    for sym,p in state['open_positions'].items():
+        positions.append({'symbol':sym,'name':display_name(sym),
+                           'side':p['side'],'entry':p['entry'],'tp':p.get('tp'),
+                           'sl':p.get('sl'),'opened':p.get('opened','--')})
+    top_coins=[]
+    for name,d in coin_stats()[:10]:
+        top_coins.append({'name':name,'symbol':d.get('symbol') or name,
+                           'wr':d['wr'],'wins':d['wins'],'losses':d['losses'],'pnl':d['total_pnl']})
+    recent=[]
+    for t in reversed(state['trades'][-15:]):
+        recent.append({'symbol':t['symbol'],'name':display_name(t['symbol']),
+                        'side':t['side'].upper(),'pnl':t['pnl'],
+                        'closed':t.get('closed',''),'reason':t.get('reason','')})
+    ov = overall_stats()
+    wr = f"{ov['wr']:.0f}%" if (ov['wins']+ov['losses']) else "--"
+    pf_display = f"{ov['pf']:.2f}" if ov['pf'] not in (0.0, float('inf')) else ("∞" if ov['pf']==float('inf') else "--")
+    coin_mode = load_config().get('coin_mode', 'whitelist')
+    live_pnl_enabled = get_settings().get('live_pnl', True)
+
+    return render_template_string(DASH_HTML,
+        scan_count=state['scan_count'], next_scan=state['next_scan'],
+        api_status=state['api_status'], api_error=state['api_error'],
+        balance=state['balance'], total_pnl=ov['total_pnl'], today_pnl=ov['today_pnl'],
+        wr=wr, pf_display=pf_display,
+        signal_rows=signal_rows, positions=positions, pos_count=len(positions),
+        top_coins=top_coins, recent_trades=recent, trade_count=len(state['trades']),
+        coin_mode=coin_mode, wl_count=len(COINS_WHITELIST), universe_count=len(COINS_UNIVERSE),
+        active_coin_count=len(coins),
+        extra_signal_rows=extra_signal_rows, extra_count=len(extra_coins),
+        extra_msg=extra_msg, extra_msg_type=extra_msg_type,
+        start_time=state['start_time'], now=_dt(),
+        candle_sync_active=state['candle_sync_active'],
+        next_candle_time=state['next_candle_time'],
+        candle_sync_count=state['candle_sync_count'],
+        last_candle_sync=state['last_candle_sync'],
+        sort_mode=sort_mode, sort_labels=SORT_LABELS, sort_modes=SORT_MODES,
+        live_pnl_enabled=live_pnl_enabled,
+        theme=current_theme())
+
+@app.route('/setup', methods=['GET','POST'])
+def setup():
+    if request.method=='GET':
+        return render_template_string(SETUP_HTML, error=None, theme=current_theme())
+    api_key = request.form.get('api_key','').strip()
+    api_secret = request.form.get('api_secret','').strip()
+    tg_token = request.form.get('tg_token','').strip()
+    tg_chat_id = request.form.get('tg_chat_id','').strip()
+    if not api_key or not api_secret:
+        return render_template_string(SETUP_HTML, error="API key and secret are required", theme=current_theme())
+    save_config_data({'api_key':api_key,'api_secret':api_secret,
+                       'tg_token':tg_token,'tg_chat_id':tg_chat_id})
+    start_bot()
+    start_tg_poll_once()
+    return redirect('/')
+
+@app.route('/set_sort/<mode>', methods=['POST'])
+def set_sort_route(mode):
+    set_sort_mode(mode)
+    return redirect('/')
+
+@app.route('/toggle_universe', methods=['POST'])
+def toggle_universe():
+    mode = load_config().get('coin_mode', 'whitelist')
+    new_mode = 'universe' if mode == 'whitelist' else 'whitelist'
+    save_config_data({'coin_mode': new_mode})
+    return redirect('/')
+
+@app.route('/toggle/coin/<symbol>', methods=['POST'])
+def toggle_coin_route(symbol):
+    toggle_coin(symbol)
+    return redirect(request.referrer or '/')
+
+@app.route('/enable_all_coins', methods=['POST'])
+def enable_all_coins_route():
+    enable_all_coins()
+    return redirect(request.referrer or '/')
+
+@app.route('/extra/add', methods=['POST'])
+def extra_add_route():
+    symbol = request.form.get('symbol', '')
+    status, msg = add_extra_signal(symbol)
+    return redirect(f'/?extra_msg={quote(msg)}&extra_msg_type={status}')
+
+@app.route('/extra/remove/<symbol>', methods=['POST'])
+def extra_remove_route(symbol):
+    remove_extra_signal(symbol.upper())
+    return redirect('/')
+
+@app.route('/settings', methods=['GET','POST'])
+def settings_page():
+    saved=False
+    if request.method=='POST':
+        old_margin_type = get_settings()['margin_type']
+        try:
+            data={
+                'margin_usd': float(request.form.get('margin_usd', 1.0)),
+                'margin_percent': float(request.form.get('margin_percent', 2.0)),
+                'margin_mode': request.form.get('margin_mode','fixed'),
+                'leverage': int(request.form.get('leverage', 5)),
+                'margin_type': request.form.get('margin_type','CROSSED'),
+                'cooldown_min': int(request.form.get('cooldown_min', 5)),
+                'scan_every': int(request.form.get('scan_every', 120)),
+                'theme': request.form.get('theme','classic'),
+                'live_pnl': request.form.get('live_pnl','on') == 'on',
+                'share_signals': request.form.get('share_signals','off') == 'on',
+                'signal_channel': request.form.get('signal_channel','').strip(),
+            }
+            if data['margin_mode'] not in ('fixed','percent'): data['margin_mode']='fixed'
+            if data['margin_type'] not in ('CROSSED','ISOLATED'): data['margin_type']='CROSSED'
+            if data['theme'] not in THEMES: data['theme']='classic'
+            save_config_data(data)
+            if data['margin_type']!=old_margin_type and client:
+                threading.Thread(target=apply_margin_type_all, daemon=True).start()
+        except (ValueError, TypeError):
+            pass
+        api_key = request.form.get('api_key','').strip()
+        api_secret = request.form.get('api_secret','').strip()
+        tg_token = request.form.get('tg_token','').strip()
+        tg_chat_id = request.form.get('tg_chat_id','').strip()
+        creds={}
+        if api_key: creds['api_key']=api_key
+        if api_secret: creds['api_secret']=api_secret
+        if tg_token: creds['tg_token']=tg_token
+        if tg_chat_id: creds['tg_chat_id']=tg_chat_id
+        if creds: save_config_data(creds)
+        if api_key or api_secret:
+            try:
+                init_client()
+                state['api_status']='ok'; state['api_error']=''
+            except Exception as e:
+                _note_api_error(str(e))
+        if tg_token or tg_chat_id:
+            start_tg_poll_once()
+        return redirect('/settings?saved=1')
+    cfg = load_config()
+    s = get_settings()
+    # Merge extra fields not in DEFAULT_SETTINGS into s for template access
+    s['share_signals'] = cfg.get('share_signals', False)
+    s['signal_channel'] = cfg.get('signal_channel', '')
+    s_obj = type('S', (), s)()  # namespace for template dot-access
+    return render_template_string(SETTINGS_HTML, s=s_obj, themes=THEMES,
+        theme_labels=THEME_LABELS,
+        api_key=cfg.get('api_key',''), tg_token=cfg.get('tg_token',''),
+        tg_chat_id=cfg.get('tg_chat_id',''), saved=request.args.get('saved')=='1',
+        theme=current_theme())
+
+@app.route('/history')
+def history_page():
+    trades=[]
+    for t in reversed(state['trades']):
+        trades.append({'symbol':t['symbol'],'name':display_name(t['symbol']),
+                        'side':t['side'].upper(),'pnl':t['pnl'],'entry':t.get('entry'),
+                        'exit':t.get('exit'),'closed':t.get('closed',''),
+                        'reason':t.get('reason','')})
+    return render_template_string(HISTORY_HTML, trades=trades, theme=current_theme())
+
+@app.route('/data')
+def data_center():
+    a = advanced_stats()
+    eq_bars=[]
+    if a['equity_curve']:
+        max_abs = max([abs(v) for v in a['equity_curve']] or [1]) or 1
+        for v in a['equity_curve']:
+            eq_bars.append({'val':v,'pct':max(2,round(abs(v)/max_abs*100))})
+
+    daily = daily_pnl_series(14)
+    max_abs_day = max([abs(d['pnl']) for d in daily] or [1]) or 1
+    for d in daily:
+        d['bar_pct'] = min(100, round(abs(d['pnl'])/max_abs_day*100))
+
+    sym_stats = symbol_stats()
+    ranked = sorted(sym_stats.items(), key=lambda x:x[1]['total_pnl'], reverse=True)
+    gainers = [r for r in ranked if r[1]['total_pnl']>0][:10]
+    losers  = [r for r in ranked if r[1]['total_pnl']<0][-10:][::-1]
+    max_gain = max([d['total_pnl'] for _,d in gainers] or [1]) or 1
+    max_loss = max([abs(d['total_pnl']) for _,d in losers] or [1]) or 1
+    top_gainers=[{'symbol':sym,'name':display_name(sym),'pnl':d['total_pnl'],
+                  'bar_pct':min(100,round(d['total_pnl']/max_gain*100))} for sym,d in gainers]
+    top_losers=[{'symbol':sym,'name':display_name(sym),'pnl':d['total_pnl'],
+                 'bar_pct':min(100,round(abs(d['total_pnl'])/max_loss*100))} for sym,d in losers]
+
+    return render_template_string(DATA_HTML, a=a, eq_bars=eq_bars, daily_pnl=daily,
+        top_gainers=top_gainers, top_losers=top_losers, theme=current_theme())
+
+@app.route('/coin/<symbol>')
+def coin_detail(symbol):
+    symbol = symbol.upper()
+    ov = symbol_stats(symbol)
+    ov['pf_display'] = (f"{ov['pf']:.2f}" if ov['pf'] not in (0.0, float('inf'))
+                         else ('∞' if ov['pf']==float('inf') else '--'))
+    coin_enabled = is_coin_enabled(symbol)
+    is_extra = is_extra_signal(symbol)
+    trades=[]
+    for t in reversed(state['trades']):
+        if t['symbol']!=symbol: continue
+        trades.append({'side':t['side'].upper(),'pnl':t['pnl'],
+                        'entry':t.get('entry'),'exit':t.get('exit'),
+                        'closed':t.get('closed',''),'reason':t.get('reason','')})
+    return render_template_string(COIN_HTML, coin=display_name(symbol), symbol=symbol,
+        overall=type('O', (), ov)(), coin_enabled=coin_enabled, is_extra=is_extra, trades=trades,
+        theme=current_theme())
+
+@app.route('/scan', methods=['POST','GET'])
+def force_scan():
+    state['scan_requested']=True
+    return redirect('/')
+
+@app.route('/close/<symbol>', methods=['POST','GET'])
+def close_route(symbol):
+    if client and symbol in state['open_positions']:
+        close_position(symbol, reason='manual_close')
+    return redirect('/')
+
+@app.route('/clear/cache', methods=['POST','GET'])
+def clear_cache():
+    state['last_signals'].clear()
+    return redirect('/')
+
+@app.route('/clear/data', methods=['POST','GET'])
+def clear_data():
+    state['trades'].clear(); state['wins']=0; state['losses']=0
+    state['total_pnl']=0.0; state['today_pnl']=0.0
+    if HISTORY_PATH.exists(): HISTORY_PATH.unlink()
+    return redirect('/')
+
+@app.route('/api/state')
+def api_state():
+    return jsonify({
+        'balance':state['balance'],'total_pnl':state['total_pnl'],
+        'wins':state['wins'],'losses':state['losses'],
+        'open_positions':state['open_positions'],
+        'scan_count':state['scan_count'],'next_scan':state['next_scan'],
+        'api_status':state['api_status'],
+        'coin_mode':load_config().get('coin_mode','whitelist'),
+    })
+
+@app.route('/api/live_pnl')
+def api_live_pnl():
+    """Return live unrealized PnL for each open position using current mark price."""
+    result = {}
+    positions = state['open_positions']
+    if not positions or not client:
+        return jsonify({'positions': {}})
+    for symbol, pos in positions.items():
+        try:
+            ticker = client.futures_symbol_ticker(symbol=symbol)
+            mark = float(ticker['price'])
+            entry = float(pos['entry'])
+            qty   = float(pos['qty'])
+            if pos['side'] == 'buy':
+                pnl = (mark - entry) * qty
+                pct = ((mark - entry) / entry) * 100
+            else:
+                pnl = (entry - mark) * qty
+                pct = ((entry - mark) / entry) * 100
+            result[symbol] = {
+                'pnl': round(pnl, 4),
+                'pct': round(pct, 3),
+                'mark': mark,
+            }
+        except Exception:
+            result[symbol] = {'pnl': None, 'pct': None, 'mark': None}
+    return jsonify({'positions': result})
+
+@app.route('/api/candle_countdown')
+def api_candle_countdown():
+    """Return seconds remaining to the next 15m candle open."""
+    try:
+        secs = seconds_to_next_candle()
+        return jsonify({'seconds': round(secs, 1), 'next_time': state['next_candle_time']})
+    except Exception as e:
+        return jsonify({'seconds': None, 'error': str(e)})
+
+# ── Main ────────────────────────────────────────────────────
+if __name__ == '__main__':
+    if is_configured():
+        start_bot()
+        start_tg_poll_once()
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
