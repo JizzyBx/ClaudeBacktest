@@ -1,13 +1,17 @@
 """
-G Max V1 — ADX Variant Sweep Backtest
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Tests 36 ADX filter variants (6 thresholds x 3 periods x rising-ADX on/off)
-against the SAME fixed pipeline as live Strategy G VAR_D:
-  EMA50 slope filter -> EMA9/21 crossover -> ADX gate (varied)
-  TP 3.0% | SL 15.0% | Max hold 960 bars (10d) | 15m | Universe coins
+G Max V1 — Focused ADX Variant Backtest (Baseline + Candidates + Higher-Threshold Sweep)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2-year robustness check (Aug 2024-Jul 2026) on the 6 variants that matter, following
+the full 36-variant 1-year sweep documented in HANDOFF_GMax_ADX_Strategy.md:
+  - P14_T22_FLAT  = BASELINE (live config)
+  - P21_T25_FLAT  = Candidate A (best Sharpe in the 1yr sweep)
+  - P21_T28_FLAT  = Candidate B (best PF / lowest DD in the 1yr sweep)
+  - P21_T30/32/35_FLAT = higher-threshold exploration (does PF keep improving or
+    does trade count get too thin to trust?)
 
-Everything except the ADX gate is byte-identical to GMaxV1.py's check_signal_G().
-Candles are fetched ONCE per coin and reused across all 36 variants (fast).
+Same fixed pipeline as live Strategy G VAR_D (EMA50 slope -> EMA9/21 crossover),
+only the ADX gate (period/threshold) varies. All variants are FLAT mode (no
+rising-ADX filter) -- rising mode underperformed consistently in the 1yr sweep.
 
 stdlib only. Run:
   python backtest.py <shard_idx>   # 0..7
@@ -24,7 +28,7 @@ from collections import defaultdict
 NUM_SHARDS = 8
 WORKERS    = 16
 
-START_YM = (2025, 8)
+START_YM = (2024, 8)
 END_YM   = (2026, 7)
 TIMEFRAME = "15m"
 
@@ -39,22 +43,30 @@ SL_PCT   = 0.150
 MAX_BARS = 960
 MIN_BARS = 70
 
-# ── ADX variant matrix ──────────────────────────────────────
-ADX_THRESHOLDS   = [18, 20, 22, 25, 28, 30]
-ADX_PERIODS      = [10, 14, 21]
-ADX_RISING_MODES = [False, True]   # True = require adx[i] > adx[i-3]
-RISING_LOOKBACK  = 3
+RISING_LOOKBACK  = 3   # unused by this focused run (all variants below are FLAT mode —
+                        # rising-ADX consistently underperformed in the full 1yr/36-variant
+                        # sweep, see HANDOFF_GMax_ADX_Strategy.md Section 4)
 
+# ── Focused variant set ──────────────────────────────────────
+# Baseline (live) + the two candidates picked from the full 1yr sweep + higher-threshold
+# P21 exploration, all re-tested over 2 years (Aug 2024-Jul 2026) to check robustness.
+# All FLAT mode (rising-ADX filter dropped — see note above).
 def build_variants():
+    explicit = [
+        {'period': 14, 'thresh': 22, 'rising': False},  # BASELINE (live config)
+        {'period': 21, 'thresh': 25, 'rising': False},  # Candidate A (best Sharpe, 1yr)
+        {'period': 21, 'thresh': 28, 'rising': False},  # Candidate B (best PF/lowest DD, 1yr)
+        {'period': 21, 'thresh': 30, 'rising': False},  # higher-threshold exploration
+        {'period': 21, 'thresh': 32, 'rising': False},  # higher-threshold exploration
+        {'period': 21, 'thresh': 35, 'rising': False},  # higher-threshold exploration
+    ]
     variants = []
-    for period in ADX_PERIODS:
-        for thresh in ADX_THRESHOLDS:
-            for rising in ADX_RISING_MODES:
-                vid = f"P{period}_T{thresh}_{'RISE' if rising else 'FLAT'}"
-                variants.append({'id': vid, 'period': period, 'thresh': thresh, 'rising': rising})
+    for v in explicit:
+        vid = f"P{v['period']}_T{v['thresh']}_{'RISE' if v['rising'] else 'FLAT'}"
+        variants.append({'id': vid, **v})
     return variants
 
-VARIANTS = build_variants()   # 36 entries
+VARIANTS = build_variants()   # 6 focused entries (see comments above)
 
 # ══════════════════════════════════════════════════════════════
 # COIN UNIVERSE (from GMaxV1.py COINS_UNIVERSE)
@@ -307,7 +319,8 @@ def backtest_symbol_all_variants(symbol, candles):
         base_sig[i] = base_trigger(closes, e9, e21, e50, i)
 
     # precompute ADX series per period (only 3 periods needed, reused across thresholds)
-    adx_by_period = {p: adx_series_calc(highs, lows, closes, p) for p in ADX_PERIODS}
+    needed_periods = sorted(set(v['period'] for v in VARIANTS))
+    adx_by_period = {p: adx_series_calc(highs, lows, closes, p) for p in needed_periods}
 
     results = {}
     for variant in VARIANTS:
@@ -573,14 +586,14 @@ def merge_shards():
     # ══════════════════════════════════════════════════════
     lines = []
     lines.append("=" * 130)
-    lines.append("G MAX V1 — ADX VARIANT SWEEP BACKTEST")
+    lines.append("G MAX V1 — FOCUSED ADX BACKTEST (Baseline + Candidates + Higher-Threshold, 2yr)")
     lines.append("=" * 130)
     lines.append(f"Period: {START_YM} to {END_YM}  |  Timeframe: {TIMEFRAME}  |  Universe coins")
     lines.append(f"Symbols attempted: {len(all_symbols)}  |  Symbols with data: {len(all_with_data)}")
     lines.append(f"Capital: ${CAPITAL:,.0f}  |  Risk/trade: {RISK_PCT*100:.2f}%  |  Leverage: {LEVERAGE}x")
     lines.append(f"Fee: {FEE*100:.3f}%  |  Slippage: {SLIP*100:.3f}%  |  TP: {TP_PCT*100:.1f}%  SL: {SL_PCT*100:.1f}%")
     lines.append("Fixed pipeline: EMA50 slope filter + EMA9/21 crossover (identical to live)")
-    lines.append(f"Rising-ADX lookback: {RISING_LOOKBACK} bars")
+    lines.append("All variants FLAT mode (no rising-ADX filter — dropped after 1yr sweep, see handoff doc)")
     lines.append("Sharpe = annualized, computed from per-trade return series (see notes at bottom)")
     lines.append("")
     lines.append(
