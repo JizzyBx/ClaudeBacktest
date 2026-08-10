@@ -143,15 +143,12 @@ def fetch_symbol(symbol, tf):
 
 # ── Indicators (pure Python) ───────────────────────────────────────────────────
 def ema_series(values, period):
-    result = [None] * len(values)
-    if len(values) < period: return result
-    sma = sum(values[:period]) / period
-    result[period - 1] = sma
+    # Seeds from values[0] — matches GMaxV1 live bot exactly
+    if not values: return []
     k = 2.0 / (period + 1)
-    prev = sma
-    for i in range(period, len(values)):
-        prev = values[i] * k + prev * (1 - k)
-        result[i] = prev
+    result = [values[0]]
+    for v in values[1:]:
+        result.append(v * k + result[-1] * (1 - k))
     return result
 
 def adx_series(highs, lows, closes, period=14):
@@ -240,21 +237,28 @@ def bb_series(closes, period=20, num_std=2.0):
 # ── Signal Functions ───────────────────────────────────────────────────────────
 def signal_gmaxv1(i, opens, highs, lows, closes,
                   ema9, ema21, ema50, adx):
-    """GMaxV1: EMA9/21 crossover + EMA50 slope + ADX>=22"""
-    if i < 2: return None
-    for arr in (ema9, ema21, ema50, adx):
-        if arr[i] is None or arr[i-1] is None: return None
-    if adx[i] < 22: return None
-    # EMA50 slope
-    if ema50[i-1] is None: return None
-    slope_up   = ema50[i] > ema50[i-1]
-    slope_down = ema50[i] < ema50[i-1]
-    # crossover
-    cross_up   = ema9[i-1] <= ema21[i-1] and ema9[i] > ema21[i]
-    cross_down = ema9[i-1] >= ema21[i-1] and ema9[i] < ema21[i]
-    if cross_up   and slope_up:   return 'buy'
-    if cross_down and slope_down: return 'sell'
-    return None
+    """GMaxV1: EMA9/21 crossover + EMA50 slope + ADX>=22
+    Matches live bot check_signal_G() exactly:
+    - EMA50 slope uses 10-bar lookback with 0.05% threshold
+    - EMA seeded from first value (not SMA)
+    - ADX checked after crossover confirmed
+    """
+    if i < 11: return None  # need i-10 for slope
+    # EMA50 slope — 10-bar lookback, 0.05% threshold (live bot exact)
+    if ema50[i-10] == 0: return None
+    slope_pct  = (ema50[i] - ema50[i-10]) / ema50[i-10] * 100
+    trend_up   = slope_pct >  0.05
+    trend_down = slope_pct < -0.05
+    if not trend_up and not trend_down: return None  # flat — skip
+    # EMA9/21 crossover on last closed bar
+    cross_up   = ema9[i] > ema21[i] and ema9[i-1] <= ema21[i-1]
+    cross_down = ema9[i] < ema21[i] and ema9[i-1] >= ema21[i-1]
+    if not cross_up and not cross_down: return None
+    if trend_up   and not cross_up:   return None  # trend/cross direction mismatch
+    if trend_down and not cross_down: return None
+    # ADX >= 22
+    if adx[i] is None or adx[i] < 22: return None
+    return 'buy' if cross_up else 'sell'
 
 def signal_bb_rsi(i, closes, upper_bb, lower_bb, rsi, cfg):
     """BB+RSI mean reversion"""
@@ -279,10 +283,10 @@ def backtest_a(symbol, candles, tp, sl, max_bars):
     closes = [c[4] for c in candles]
     ts_arr = [c[0] for c in candles]
 
-    ema9  = ema_series(closes, 9)
+    ema9  = ema_series(closes, 9)   # list, same length, no Nones
     ema21 = ema_series(closes, 21)
     ema50 = ema_series(closes, 50)
-    adx   = adx_series(highs, lows, closes, 14)
+    adx   = adx_series(highs, lows, closes, 14)  # list with Nones at start
 
     trades = []
     n = len(closes)
