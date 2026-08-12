@@ -1,33 +1,23 @@
 """
-Liquidity Wall Absorption Strategy — Backtest
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OHLC-only approximation of the "Liquidity Walls [TradingIQ]" concept.
+RSI Mean Reversion Strategy — Backtest
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fully OHLC-native mean-reversion strategy. No proxy/approximation needed --
+RSI and candle direction are computed directly and exactly from kline data,
+unlike the prior liquidity-wall-absorption attempt (which had to fake delta
+from candle shape and showed no edge: PF 0.76, WR 31.5% over 1yr/96 coins).
 
-NOTE ON FIDELITY:
-The original TradingView indicator uses lower-timeframe (1s/1-tick) signed
-volume / delta reconstruction to detect "absorption" (strong delta, weak
-price response). Binance's public kline archives only provide OHLCV per
-candle -- no trade-level/tick data -- so true delta cannot be reconstructed
-here. This backtest instead uses an OHLC-only proxy for the same idea:
+LOGIC:
+    1. RSI(14) reaches an extreme:
+         - oversold:   RSI <= RSI_OVERSOLD (default 30)  -> watch for long
+         - overbought: RSI >= RSI_OVERBOUGHT (default 70) -> watch for short
+    2. Reversal confirmation candle (avoids catching a falling knife):
+         - after oversold: wait for a bullish close (c > o) while RSI is
+           still <= RSI_OVERSOLD + RSI_CONFIRM_BAND -> enter long
+         - after overbought: wait for a bearish close (c < o) while RSI is
+           still >= RSI_OVERBOUGHT - RSI_CONFIRM_BAND -> enter short
+    3. Entry on next bar open, same TP/SL/max-hold framework as before.
 
-    "effort vs result" proxy:
-        - volume is elevated vs recent average (effort)
-        - candle body is small relative to its range (weak result / rejection)
-    -> flagged as an "inefficient" (absorption) candle
-    -> the candle's high (if upper wick dominant / bearish absorption) or
-       low (if lower wick dominant / bullish absorption) becomes a
-       projected "liquidity wall" zone, active until price closes through it
-
-    entry: price returns to an active zone and prints a rejection candle
-    back in the direction away from the zone -> enter opposite the
-    absorbed side (fade back into range)
-
-This is NOT the TradingIQ delta model. It is a stated approximation built
-because only kline data is available. Results should be read as "does the
-wick-rejection/volume-spike proxy have edge" -- not as a validation of the
-original indicator.
-
-Coin list: GMaxV1 COINS_UNIVERSE (117 coins)
+Coin list: GMaxV1 COINS_UNIVERSE (96 coins with data, per last run)
 Data: Binance USDT-M futures monthly kline archives, stdlib only
 """
 
@@ -79,13 +69,16 @@ LEVERAGE  = 5
 TP_PCT   = 0.025          # 2.5%
 SL_PCT   = 0.0125         # 1.25%  (2:1 R:R)
 MAX_BARS = 48             # 12h on 15m
-MIN_BARS = 100            # warmup for volume avg / zone tracking
+MIN_BARS = 100            # warmup for RSI
 
 # Strategy-specific params
-VOL_LOOKBACK   = 20       # bars for average volume
-VOL_MULT       = 1.5      # volume must be >= this x average to count as "effort"
-BODY_RATIO_MAX = 0.35     # body/range must be <= this to count as "weak result"
-ZONE_MAX_AGE   = 200      # bars a zone stays valid even if not touched (avoid infinite stale zones)
+RSI_PERIOD      = 14
+RSI_OVERSOLD    = 30
+RSI_OVERBOUGHT  = 70
+RSI_CONFIRM_BAND = 5      # after extreme, still allow confirmation while RSI within
+                           # this many points of the extreme (e.g. RSI<=35 still counts
+                           # as "was oversold, now confirming" for a few bars)
+RSI_CONFIRM_MAX_BARS = 6  # give up waiting for confirmation after this many bars
 
 # ══════════════════════════════════════════════════════════════════
 # Data fetch
@@ -154,81 +147,84 @@ def fetch_symbol(symbol):
     return candles
 
 # ══════════════════════════════════════════════════════════════════
-# Strategy: Liquidity Wall (OHLC absorption proxy)
+# Strategy: RSI Mean Reversion
 # ══════════════════════════════════════════════════════════════════
 
-def avg_volume(volumes, i, lookback):
-    lo = max(0, i - lookback)
-    window = volumes[lo:i]
-    if not window:
-        return None
-    return sum(window) / len(window)
+def compute_rsi(closes, period):
+    """
+    Standard Wilder RSI, computed once per symbol over the full close series.
+    Returns a list same length as closes; first `period` values are None
+    (not enough data to warm up).
+    """
+    n = len(closes)
+    rsi = [None] * n
+    if n <= period:
+        return rsi
 
-def is_inefficient_candle(o, h, l, c, v, avg_vol):
-    """Effort-vs-result proxy: elevated volume + small body relative to range."""
-    if avg_vol is None or avg_vol <= 0:
-        return None
-    rng = h - l
-    if rng <= 0:
-        return None
-    body = abs(c - o)
-    body_ratio = body / rng
-    if v < avg_vol * VOL_MULT:
-        return None
-    if body_ratio > BODY_RATIO_MAX:
-        return None
-    # Determine side of absorption via wick dominance
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-    if upper_wick > lower_wick:
-        # buying pushed up, got rejected -> wall ABOVE (bearish absorption)
-        return ('above', h)
+    gains = [0.0] * n
+    losses = [0.0] * n
+    for i in range(1, n):
+        delta = closes[i] - closes[i - 1]
+        gains[i] = max(delta, 0.0)
+        losses[i] = max(-delta, 0.0)
+
+    avg_gain = sum(gains[1:period + 1]) / period
+    avg_loss = sum(losses[1:period + 1]) / period
+
+    def rsi_from_avgs(ag, al):
+        if al == 0:
+            return 100.0
+        rs = ag / al
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    rsi[period] = rsi_from_avgs(avg_gain, avg_loss)
+
+    for i in range(period + 1, n):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsi[i] = rsi_from_avgs(avg_gain, avg_loss)
+
+    return rsi
+
+def signal(i, opens, closes, rsi_values, state):
+    """
+    Evaluated on closed bar i. Returns ('buy'|'sell'|None, updated_state).
+    state: dict tracking a pending setup, e.g.
+        {'side': 'long'|'short', 'triggered_at': i} or None
+    Caller owns state per-symbol (reset after each trade / at start).
+    """
+    r = rsi_values[i]
+    if r is None:
+        return None, state
+
+    o, c = opens[i], closes[i]
+
+    # 1. No pending setup: check if we just hit an extreme -> arm a watch
+    if state is None:
+        if r <= RSI_OVERSOLD:
+            state = {'side': 'long', 'triggered_at': i}
+        elif r >= RSI_OVERBOUGHT:
+            state = {'side': 'short', 'triggered_at': i}
+        return None, state
+
+    # 2. Pending setup: check for confirmation or expiry
+    bars_since = i - state['triggered_at']
+    if bars_since > RSI_CONFIRM_MAX_BARS:
+        return None, None  # gave up waiting, clear state
+
+    if state['side'] == 'long':
+        # keep watching only while still within the confirm band
+        if r > RSI_OVERSOLD + RSI_CONFIRM_BAND:
+            return None, None  # bounced too far already without a clean confirm bar, drop
+        if c > o:
+            return 'buy', None  # confirmed -> fire signal, clear state
+        return None, state  # still waiting
     else:
-        # selling pushed down, got rejected -> wall BELOW (bullish absorption)
-        return ('below', l)
-
-def signal(i, opens, highs, lows, closes, volumes, active_zones):
-    """
-    Evaluated on closed bar i. Returns ('buy'|'sell'|None, updated_zones).
-    active_zones: list of dicts {'side': 'above'|'below', 'price': float, 'born': i}
-    Mutates and returns the zone list (caller owns state per-symbol).
-    """
-    o, h, l, c, v = opens[i], highs[i], lows[i], closes[i], volumes[i]
-    av = avg_volume(volumes, i, VOL_LOOKBACK)
-
-    # 1. Detect new absorption candle -> add zone
-    result = is_inefficient_candle(o, h, l, c, v, av)
-    if result:
-        side, price = result
-        active_zones.append({'side': side, 'price': price, 'born': i})
-
-    # 2. Invalidate zones price has closed through
-    still_active = []
-    for z in active_zones:
-        if i - z['born'] > ZONE_MAX_AGE:
-            continue  # stale, drop
-        if z['side'] == 'above' and c > z['price']:
-            continue  # broken through upside -> invalidated
-        if z['side'] == 'below' and c < z['price']:
-            continue  # broken through downside -> invalidated
-        still_active.append(z)
-    active_zones[:] = still_active
-
-    # 3. Check for a retest + rejection at an active zone (on THIS closed bar)
-    sig = None
-    for z in active_zones:
-        if z['side'] == 'above':
-            # price wicked up into the zone but closed back below it -> bearish rejection
-            if h >= z['price'] and c < z['price'] and c < o:
-                sig = 'sell'
-                break
-        else:
-            # price wicked down into the zone but closed back above it -> bullish rejection
-            if l <= z['price'] and c > z['price'] and c > o:
-                sig = 'buy'
-                break
-
-    return sig, active_zones
+        if r < RSI_OVERBOUGHT - RSI_CONFIRM_BAND:
+            return None, None
+        if c < o:
+            return 'sell', None
+        return None, state
 
 # ══════════════════════════════════════════════════════════════════
 # Backtest single symbol
@@ -246,15 +242,17 @@ def backtest(symbol, candles):
     volumes = [r[5] for r in candles]
     ts      = [r[0] for r in candles]
 
+    rsi_values = compute_rsi(closes, RSI_PERIOD)
+
     n = len(candles)
-    active_zones = []
+    setup_state = None
     in_position = False
     pos = None
 
     i = MIN_BARS
     while i < n - 1:
         if not in_position:
-            sig, active_zones = signal(i, opens, highs, lows, closes, volumes, active_zones)
+            sig, setup_state = signal(i, opens, closes, rsi_values, setup_state)
             if sig in ('buy', 'sell'):
                 entry_idx = i + 1
                 if entry_idx >= n:
@@ -324,7 +322,7 @@ def backtest(symbol, candles):
                 })
                 in_position = False
                 pos = None
-                active_zones = []  # reset context after a trade closes
+                setup_state = None  # reset context after a trade closes
             i += 1
 
     return trades
@@ -498,8 +496,8 @@ def write_summary(report, with_data):
 
     lines = []
     lines.append("=" * 60)
-    lines.append("LIQUIDITY WALL ABSORPTION STRATEGY — BACKTEST SUMMARY")
-    lines.append("(OHLC-only proxy — NOT the raw TradingIQ delta model)")
+    lines.append("RSI MEAN REVERSION STRATEGY — BACKTEST SUMMARY")
+    lines.append(f"(RSI({RSI_PERIOD}) extreme + reversal confirm, OHLC-native)")
     lines.append("=" * 60)
     lines.append(f"Period:            {report['period']}")
     lines.append(f"Timeframe:         {report['timeframe']}")
@@ -563,3 +561,4 @@ if __name__ == "__main__":
         merge_shards()
     else:
         run_shard(int(arg))
+
