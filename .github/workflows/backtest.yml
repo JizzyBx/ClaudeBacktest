@@ -1,4 +1,4 @@
-name: GMax Final Stage Backtest
+name: Liquidity Wall Absorption Backtest
 
 on:
   workflow_dispatch:
@@ -14,11 +14,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Run shard ${{ matrix.shard }}
         run: python backtest.py ${{ matrix.shard }}
+
       - name: Upload shard result
         uses: actions/upload-artifact@v4
         with:
@@ -30,20 +33,26 @@ jobs:
     needs: backtest
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Download all shards
         uses: actions/download-artifact@v4
         with:
           pattern: shard-*
           merge-multiple: true
+
       - name: Merge and generate report
         run: python backtest.py merge
+
       - name: Zip results
         run: zip backtest_results.zip backtest_report.json backtest_summary.txt
+
       - name: Upload final zip
         uses: actions/upload-artifact@v4
         with:
