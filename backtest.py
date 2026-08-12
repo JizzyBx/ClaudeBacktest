@@ -128,7 +128,9 @@ def fetch_month(symbol, year, month):
                         continue
                     try:
                         ts = int(float(row[0]))
-                        if ts > 10**14:
+                        # Normalize to Unix seconds regardless of source unit.
+                        # seconds ~1.7e9, ms ~1.7e12, us ~1.7e15, ns ~1.7e18
+                        while ts > 10**11:
                             ts = ts // 1000
                         o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
                         v = float(row[5])
@@ -365,8 +367,13 @@ def stats(trades):
     monthly = {}
     per_coin = {}
     for t in trades_sorted:
-        dt = datetime.fromtimestamp(t['entry_ts'], tz=timezone.utc)
-        key = f"{dt.year:04d}-{dt.month:02d}"
+        try:
+            dt = datetime.fromtimestamp(t['entry_ts'], tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            # Malformed timestamp slipped through fetch parsing — bucket it
+            # separately instead of crashing the whole stats pass.
+            dt = None
+        key = f"{dt.year:04d}-{dt.month:02d}" if dt else "UNKNOWN"
         m = monthly.setdefault(key, {'pnl': 0.0, 'n': 0, 'w': 0})
         m['pnl'] += t['pnl']; m['n'] += 1
         if t['pnl'] > 0: m['w'] += 1
@@ -556,4 +563,3 @@ if __name__ == "__main__":
         merge_shards()
     else:
         run_shard(int(arg))
-
