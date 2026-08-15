@@ -1,10 +1,10 @@
-name: Liquidity Wall Absorption Backtest
+name: GMax Candle Analysis
 
 on:
   workflow_dispatch:
 
 jobs:
-  backtest:
+  analyse:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -20,9 +20,9 @@ jobs:
           python-version: "3.11"
 
       - name: Run shard ${{ matrix.shard }}
-        run: python backtest.py ${{ matrix.shard }}
+        run: python candle_analysis.py ${{ matrix.shard }}
 
-      - name: Upload shard result
+      - name: Upload shard
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
@@ -30,7 +30,7 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: backtest
+    needs: analyse
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -47,15 +47,15 @@ jobs:
           pattern: shard-*
           merge-multiple: true
 
-      - name: Merge and generate report
-        run: python backtest.py merge
+      - name: Merge
+        run: python candle_analysis.py merge
 
       - name: Zip results
-        run: zip backtest_results.zip backtest_report.json backtest_summary.txt
+        run: zip candle_results.zip candle_report.json candle_summary.txt
 
-      - name: Upload final zip
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
-          path: backtest_results.zip
+          name: candle-results
+          path: candle_results.zip
           retention-days: 30
