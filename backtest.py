@@ -96,7 +96,9 @@ def fetch_month(symbol, year, month):
                         continue
                     try:
                         ts = int(row[0])
-                        if ts > 10**14:
+                        if ts > 10**14:      # microseconds -> ms
+                            ts = ts // 1000
+                        if ts > 10**11:      # ms -> seconds (Binance klines are ms; ~1.7e12 for 2024)
                             ts = ts // 1000
                         o = float(row[1]); h = float(row[2])
                         l = float(row[3]); c = float(row[4])
@@ -531,4 +533,3 @@ if __name__ == "__main__":
         merge_shards()
     else:
         run_shard(int(arg))
-
