@@ -1,10 +1,10 @@
-name: GMax Candle Analysis
+name: G Max Multi-Variant Backtest
 
 on:
   workflow_dispatch:
 
 jobs:
-  analyse:
+  backtest:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -20,9 +20,9 @@ jobs:
           python-version: "3.11"
 
       - name: Run shard ${{ matrix.shard }}
-        run: python candle_analysis.py ${{ matrix.shard }}
+        run: python backtest.py ${{ matrix.shard }}
 
-      - name: Upload shard
+      - name: Upload shard result
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
@@ -30,7 +30,7 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: analyse
+    needs: backtest
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -47,15 +47,15 @@ jobs:
           pattern: shard-*
           merge-multiple: true
 
-      - name: Merge
-        run: python candle_analysis.py merge
+      - name: Merge and generate report
+        run: python backtest.py merge
 
       - name: Zip results
-        run: zip candle_results.zip candle_report.json candle_summary.txt
+        run: zip backtest_results.zip backtest_report.json backtest_summary.txt
 
-      - name: Upload
+      - name: Upload final zip
         uses: actions/upload-artifact@v4
         with:
-          name: candle-results
-          path: candle_results.zip
+          name: backtest-results
+          path: backtest_results.zip
           retention-days: 30
