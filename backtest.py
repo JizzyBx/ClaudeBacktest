@@ -85,7 +85,11 @@ def fetch_month(symbol, tf, year, month):
                         ts = int(row[0])
                     except ValueError:
                         continue  # header row
+                    # Binance kline open_time is milliseconds; normalize to seconds.
+                    # (>10**14 case = microseconds, seen on some archive variants)
                     if ts > 10**14:
+                        ts = ts // 1_000_000
+                    else:
                         ts = ts // 1000
                     o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
                     rows.append((ts, o, h, l, c))
