@@ -1,4 +1,4 @@
-name: KAMA + RSI Multi-Timeframe Backtest
+name: G Max VAR_D Volume Filter Backtest
 
 on:
   workflow_dispatch:
@@ -10,7 +10,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        timeframe: [30m, 1h, 2h, 4h]
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
 
     steps:
@@ -20,20 +19,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run ${{ matrix.timeframe }} shard ${{ matrix.shard }}
-        run: python backtest.py ${{ matrix.timeframe }} ${{ matrix.shard }}
+      - name: Run shard ${{ matrix.shard }}
+        run: python backtest.py ${{ matrix.shard }}
 
-      - name: Upload shard
+      - name: Upload shard result
         uses: actions/upload-artifact@v4
         with:
-          name: shard-${{ matrix.timeframe }}-${{ matrix.shard }}
-          path: shard_${{ matrix.timeframe }}_${{ matrix.shard }}.json
+          name: shard-${{ matrix.shard }}
+          path: shard_${{ matrix.shard }}.json
           retention-days: 1
 
   merge:
     needs: backtest
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -48,8 +47,11 @@ jobs:
           pattern: shard-*
           merge-multiple: true
 
-      - name: Merge all timeframes into one zip
+      - name: Merge and generate report
         run: python backtest.py merge
+
+      - name: Zip results
+        run: zip backtest_results.zip backtest_report.json backtest_summary.txt
 
       - name: Upload final zip
         uses: actions/upload-artifact@v4
