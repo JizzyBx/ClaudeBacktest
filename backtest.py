@@ -56,8 +56,9 @@ BARS_PER_DAY = 96
 # ── Variants: (name, tp_pct, sl_pct) ──
 VARIANTS = [
     ('TP3_SL15',   0.030, 0.150),
-    ('TP0.5_SL10', 0.005, 0.100),
-    ('TP0.5_SL12', 0.005, 0.120),
+    ('TP1_SL15',   0.010, 0.150),
+    ('TP1.5_SL15', 0.015, 0.150),
+    ('TP0.8_SL10', 0.008, 0.100),
 ]
 
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines/{sym}/{tf}/{sym}-{tf}-{y:04d}-{m:02d}.zip"
@@ -465,7 +466,7 @@ def merge_shards():
 
     lines = []
     lines.append("=" * 70)
-    lines.append("G MAX TP/SL BACKTEST — BASELINE vs TP0.5/SL10 vs TP0.5/SL12")
+    lines.append("G MAX TP/SL BACKTEST — BASELINE vs TP1/SL15 vs TP1.5/SL15 vs TP0.8/SL10")
     lines.append("=" * 70)
     lines.append(f"Period: {START_YM} to {END_YM}  |  Timeframe: {TIMEFRAME}")
     lines.append(f"Symbols attempted: {len(all_symbols)}  |  With data: {len(all_with_data)}")
