@@ -21,7 +21,7 @@ Variants (4 shards, one per timeframe): 15m, 30m, 1h, 4h
 stdlib only. Data: data.binance.vision futures monthly klines.
 """
 
-import sys, json, time, zipfile, io, csv, urllib.request, urllib.error
+import sys, json, time, zipfile, io, csv, urllib.request, urllib.error, bisect
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from math import sqrt
@@ -38,10 +38,10 @@ FEE       = 0.0004
 SLIP      = 0.0002
 LEVERAGE  = 10
 
-MIN_RR   = 1.5      # minimum reward:risk, else skip trade
+MIN_RR   = 1.2      # minimum reward:risk, else skip trade (loosened from 1.5)
 ATR_BUF_MULT = 0.5  # SL buffer beyond level = 0.5 * ATR(14)
-RSI_LONG_MAX  = 35
-RSI_SHORT_MIN = 65
+RSI_LONG_MAX  = 42   # loosened from 35 — still below-midline, less strict
+RSI_SHORT_MIN = 58   # loosened from 65 — still above-midline, less strict
 FRACTAL_N = 5
 MIN_BARS = 260       # need enough bars for EMA200 warmup on trend TF
 
@@ -203,34 +203,23 @@ def trend_asof(ts_list, is_up_list, target_ts):
             hi = mid - 1
     return is_up_list[lo]
 
+REJECTION_WICK_MIN = 0.35   # loosened from 0.5 — lower wick / range ratio required
+REJECTION_CLOSE_POS_MIN = 0.4  # loosened from 0.5 — close must be in upper X% of range
+
 # ── Signal / trade construction ────────────────────────────
 def is_rejection_candle_long(o, h, l, c):
     rng = h - l
     if rng <= 0:
         return False
     lower_wick = min(o, c) - l
-    return (lower_wick / rng >= 0.5) and (c >= (l + rng * 0.5))
+    return (lower_wick / rng >= REJECTION_WICK_MIN) and (c >= (l + rng * REJECTION_CLOSE_POS_MIN))
 
 def is_rejection_candle_short(o, h, l, c):
     rng = h - l
     if rng <= 0:
         return False
     upper_wick = h - max(o, c)
-    return (upper_wick / rng >= 0.5) and (c <= (l + rng * 0.5))
-
-def next_level_above(pivots_sorted, price):
-    """pivots_sorted: list of (idx, price) sorted by price asc. Return the smallest
-    pivot price strictly greater than `price`, or None."""
-    for _, p in pivots_sorted:
-        if p > price:
-            return p
-    return None
-
-def next_level_below(pivots_sorted_desc, price):
-    for _, p in pivots_sorted_desc:
-        if p < price:
-            return p
-    return None
+    return (upper_wick / rng >= REJECTION_WICK_MIN) and (c <= (l + rng * (1 - REJECTION_CLOSE_POS_MIN)))
 
 # ── Backtest single symbol ─────────────────────────────────
 def backtest(symbol, candles, tf, trend_lookup):
@@ -248,21 +237,19 @@ def backtest(symbol, candles, tf, trend_lookup):
     atr = atr_series(highs, lows, closes, 14)
     res_pivots, sup_pivots = fractal_pivots(highs, lows, FRACTAL_N)
 
-    # sorted views for "next level" lookups
-    res_by_price_asc = sorted(res_pivots, key=lambda x: x[1])
-    sup_by_price_desc = sorted(sup_pivots, key=lambda x: -x[1])
-
     ts_trend, is_up_trend = trend_lookup
     max_bars = MAX_BARS_BY_TF.get(tf, 240)
 
     # Build a rolling "known pivots so far" index — pivot at index k is only
-    # usable for signals at bar i >= k + FRACTAL_N (confirmation delay)
+    # usable for signals at bar i >= k + FRACTAL_N (confirmation delay).
+    # known_res_asc / known_sup_desc are maintained sorted-by-price incrementally
+    # (bisect.insort) so TP lookups never use pivots from the future (no lookahead).
     trades = []
     i = FRACTAL_N * 2
-    last_res_idx = 0
-    last_sup_idx = 0
-    known_res = []  # (idx, price) confirmed so far, chronological
+    known_res = []          # (idx, price) confirmed so far, chronological
     known_sup = []
+    known_res_asc = []      # prices only, kept sorted ascending
+    known_sup_desc = []     # prices only, kept sorted descending (via negated bisect)
 
     res_ptr = 0
     sup_ptr = 0
@@ -270,9 +257,15 @@ def backtest(symbol, candles, tf, trend_lookup):
     while i < n - 1:
         # advance known pivots up to what's confirmed by bar i
         while res_ptr < len(res_pivots) and res_pivots[res_ptr][0] + FRACTAL_N <= i:
-            known_res.append(res_pivots[res_ptr]); res_ptr += 1
+            idx, p = res_pivots[res_ptr]
+            known_res.append((idx, p))
+            bisect.insort(known_res_asc, p)
+            res_ptr += 1
         while sup_ptr < len(sup_pivots) and sup_pivots[sup_ptr][0] + FRACTAL_N <= i:
-            known_sup.append(sup_pivots[sup_ptr]); sup_ptr += 1
+            idx, p = sup_pivots[sup_ptr]
+            known_sup.append((idx, p))
+            bisect.insort(known_sup_desc, -p)  # negated so ascending bisect == descending price
+            sup_ptr += 1
 
         if not known_res or not known_sup:
             i += 1
@@ -291,7 +284,7 @@ def backtest(symbol, candles, tf, trend_lookup):
         nearest_sup = max((p for _, p in known_sup if p <= price), default=None)
         nearest_res = min((p for _, p in known_res if p >= price), default=None)
 
-        zone_tol = atr[i] * 0.3  # "touching" tolerance
+        zone_tol = atr[i] * 0.5  # "touching" tolerance (loosened from 0.3)
 
         if trend_up and nearest_sup is not None and (price - nearest_sup) <= zone_tol:
             if is_rejection_candle_long(o, h, l, c) and rsi[i] <= RSI_LONG_MAX:
@@ -304,14 +297,17 @@ def backtest(symbol, candles, tf, trend_lookup):
             i += 1
             continue
 
-        # structure-based SL/TP
+        # structure-based SL/TP — use only pivots confirmed as of bar i (no lookahead)
         buf = atr[i] * ATR_BUF_MULT
         if sig == 'buy':
             sl_level = nearest_sup - buf
-            tp_level = next_level_above(res_by_price_asc, price)
+            pos = bisect.bisect_right(known_res_asc, price)
+            tp_level = known_res_asc[pos] if pos < len(known_res_asc) else None
         else:
             sl_level = nearest_res + buf
-            tp_level = next_level_below(sup_by_price_desc, price)
+            neg_price = -price
+            pos = bisect.bisect_right(known_sup_desc, neg_price)
+            tp_level = -known_sup_desc[pos] if pos < len(known_sup_desc) else None
 
         if tp_level is None:
             i += 1
@@ -502,7 +498,7 @@ def merge_shards():
     lines.append("=" * 70)
     lines.append("G MAX SR-TREND — STRUCTURE-BASED BACKTEST SUMMARY")
     lines.append(f"Period: {START_YM} to {END_YM}  |  Coins: {', '.join(ALL_SYMBOLS)}")
-    lines.append(f"Trend: 4h EMA200  |  Confirm: rejection candle + RSI(14) 35/65  |  "
+    lines.append(f"Trend: 4h EMA200  |  Confirm: rejection candle + RSI(14) {RSI_LONG_MAX}/{RSI_SHORT_MIN}  |  "
                  f"TP/SL: structure-based (next S/R / ATR buffer)  |  Min R:R: {MIN_RR}")
     lines.append(f"Leverage: {LEVERAGE}x  Capital: ${CAPITAL:.0f}  Risk/trade: {RISK_PCT*100:.1f}%")
     lines.append("=" * 70)
@@ -516,7 +512,14 @@ def merge_shards():
     for name, d in ordered:
         s = d['stats']
         pf_disp = f"{s['profit_factor']:.2f}" if s['profit_factor'] != float('inf') else "inf"
-        verdict = "USABLE" if (s['profit_factor'] >= 1.5 and s['win_rate'] >= 42) else "NOT USABLE"
+        # Require a minimum sample size before calling anything USABLE — a 1-2 trade
+        # sample hitting PF/WR thresholds is noise, not edge.
+        MIN_TRADES_FOR_VERDICT = 30
+        verdict = ("USABLE" if (s['total'] >= MIN_TRADES_FOR_VERDICT and
+                                 s['profit_factor'] >= 1.5 and s['win_rate'] >= 42)
+                   else "NOT USABLE")
+        if s['total'] < MIN_TRADES_FOR_VERDICT:
+            verdict += f" (n={s['total']}, need {MIN_TRADES_FOR_VERDICT}+)"
         mark = "\u2705" if verdict == "USABLE" else "\u274c"
         lines.append(f"{name:<8}{s['total']:>8}{s['win_rate']:>9.2f}%{pf_disp:>8}"
                      f"{s['net_pnl']:>12.2f}{s['max_drawdown']:>9.2f}{s['sharpe_ratio']:>9.3f}"
@@ -556,3 +559,4 @@ if __name__ == "__main__":
         merge_shards()
     else:
         run_shard(int(arg))
+
