@@ -1,5 +1,5 @@
 """
-G Max — Multi-Variant Backtest (ADX>=26, 7 TP/SL combos)
+G Max — Tight TP/SL Backtest (ADX>=26, baseline vs TP1/SL5 vs TP0.5/SL2)
 Volume filter ($3M/24h), 5x leverage, full 96-coin universe, 15m
 Data: Binance USDT-M futures monthly kline archives (stdlib only)
 Usage:
@@ -56,12 +56,8 @@ BARS_PER_DAY = 96
 # ── Variants: (name, tp_pct, sl_pct) ──
 VARIANTS = [
     ('TP3_SL15', 0.030, 0.150),
-    ('TP3_SL10', 0.030, 0.100),
-    ('TP3_SL8',  0.030, 0.080),
-    ('TP3_SL6',  0.030, 0.060),
-    ('TP4_SL12', 0.040, 0.120),
-    ('TP2_SL8',  0.020, 0.080),
-    ('TP2_SL6',  0.020, 0.060),
+    ('TP1_SL5',  0.010, 0.050),
+    ('TP0.5_SL2', 0.005, 0.020),
 ]
 
 BASE_URL = "https://data.binance.vision/data/futures/um/monthly/klines/{sym}/{tf}/{sym}-{tf}-{y:04d}-{m:02d}.zip"
@@ -469,7 +465,7 @@ def merge_shards():
 
     lines = []
     lines.append("=" * 70)
-    lines.append("G MAX MULTI-VARIANT BACKTEST — ADX>=26, 7 TP/SL COMBOS")
+    lines.append("G MAX TIGHT TP/SL BACKTEST — BASELINE vs TP1/SL5 vs TP0.5/SL2")
     lines.append("=" * 70)
     lines.append(f"Period: {START_YM} to {END_YM}  |  Timeframe: {TIMEFRAME}")
     lines.append(f"Symbols attempted: {len(all_symbols)}  |  With data: {len(all_with_data)}")
