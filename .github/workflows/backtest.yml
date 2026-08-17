@@ -1,4 +1,4 @@
-name: G Max Multi-Timeframe Backtest
+name: G Max Compounding Equity Backtest
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run shard ${{ matrix.shard }}
+      - name: Fetch shard ${{ matrix.shard }} data
         run: python backtest.py ${{ matrix.shard }}
 
       - name: Upload shard result
@@ -32,7 +32,7 @@ jobs:
   merge:
     needs: backtest
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +47,7 @@ jobs:
           pattern: shard-*
           merge-multiple: true
 
-      - name: Merge and generate report
+      - name: Run global simulation and generate report
         run: python backtest.py merge
 
       - name: Zip results
