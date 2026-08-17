@@ -90,6 +90,8 @@ def fetch_month(symbol, year, month, timeframe):
                     if not row or row[0] in ('open_time',):
                         continue
                     ts = int(float(row[0]))
+                    # Normalize to milliseconds. Binance archives are ms, but
+                    # some symbol/date ranges use microseconds (16 digits).
                     if ts > 10**14:
                         ts = ts // 1000
                     o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
@@ -262,7 +264,7 @@ def stats(trades):
         peak = max(peak, equity)
         dd = peak - equity
         max_dd = max(max_dd, dd)
-        ym = datetime.fromtimestamp(t['exit_ts'], tz=timezone.utc).strftime('%Y-%m')
+        ym = datetime.fromtimestamp(t['exit_ts'] / 1000, tz=timezone.utc).strftime('%Y-%m')
         m = monthly.setdefault(ym, {'pnl': 0.0, 'n': 0, 'w': 0})
         m['pnl'] += t['pnl']; m['n'] += 1
         if t['pnl'] > 0: m['w'] += 1
