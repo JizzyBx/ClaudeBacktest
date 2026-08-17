@@ -220,30 +220,44 @@ def run_global_simulation(coin_data):
     Returns (trades, balance_curve) where balance_curve is a list of
     (timestamp, balance) snapshots taken after every trade closes.
     """
-    # Build global sorted list of unique timestamps across all coins
-    ts_set = set()
-    for d in coin_data.values():
-        ts_set.update(d['ts'])
-    global_ts = sorted(ts_set)
-
-    # For each coin, build ts -> bar_index lookup for O(1) access during the walk
+    # Build ts -> bar_index lookup per coin (needed for entry_i/bars_held math)
     ts_to_idx = {}
     for sym, d in coin_data.items():
         ts_to_idx[sym] = {t: i for i, t in enumerate(d['ts'])}
+
+    # Event-driven index: for each global timestamp, which coins actually
+    # have a candle there. Avoids scanning all 96 coins on every step —
+    # each coin only appears in the timestamps it actually has data for.
+    ts_to_coins = {}
+    for sym, d in coin_data.items():
+        for t in d['ts']:
+            ts_to_coins.setdefault(t, []).append(sym)
+    global_ts = sorted(ts_to_coins.keys())
 
     balance = START_CAPITAL
     open_positions = {}  # symbol -> {side, entry_p, entry_i, entry_ts}
     trades = []
     balance_curve = [(global_ts[0] if global_ts else 0, balance)]
 
-    for t in global_ts:
-        # ── Phase 1: process exits for coins with an open position at this ts
-        for sym in list(open_positions.keys()):
-            d = coin_data[sym]
-            idx_map = ts_to_idx[sym]
-            if t not in idx_map:
+    total_steps = len(global_ts)
+    t0 = time.time()
+
+    for step_num, t in enumerate(global_ts):
+        if step_num % 200000 == 0 and step_num > 0:
+            elapsed = time.time() - t0
+            pct = step_num / total_steps * 100
+            print(f"  progress: {step_num}/{total_steps} ({pct:.1f}%) "
+                  f"| {len(trades)} trades so far | balance ${balance:.2f} "
+                  f"| {elapsed:.0f}s elapsed", flush=True)
+
+        coins_here = ts_to_coins[t]
+
+        # ── Phase 1: process exits for open coins that have a candle at this ts
+        for sym in coins_here:
+            if sym not in open_positions:
                 continue
-            i = idx_map[t]
+            d = coin_data[sym]
+            i = ts_to_idx[sym][t]
             pos = open_positions[sym]
             bars_held = i - pos['entry_i']
             hi, lo, cl = d['high'][i], d['low'][i], d['close'][i]
@@ -290,13 +304,11 @@ def run_global_simulation(coin_data):
                 del open_positions[sym]
 
         # ── Phase 2: process new entries at this ts (signal fired on bar i-1)
-        for sym, d in coin_data.items():
+        for sym in coins_here:
             if sym in open_positions:
                 continue  # per-coin lock: already open, skip
-            idx_map = ts_to_idx[sym]
-            if t not in idx_map:
-                continue
-            i = idx_map[t]
+            d = coin_data[sym]
+            i = ts_to_idx[sym][t]
             if i == 0:
                 continue
             sig = d['signals'].get(i - 1)
