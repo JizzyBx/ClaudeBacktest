@@ -1,42 +1,44 @@
 """
-G Max — Multi-Timeframe Backtest (15m / 1H / 4H)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Runs the SAME strategy logic (EMA50 slope + EMA9/21 cross + ADX>=22 filter,
-TP 3% / SL 15%) across three timeframes to compare which one the bot should
-actually trade on. Full 117-coin universe, 2-year lookback (auto-shrinks per
-coin to whatever history exists — no padding), 5x leverage.
+G Max — 15m Entries Gated by 4H Trend Confirmation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Tests whether requiring the 4H EMA50 slope to agree with the 15m signal
+direction fixes "wrong trend" entries. Two variants run side by side:
 
-Usage on GitHub Actions:
-    python backtest.py <shard_idx>   # 0-7, runs one shard for ALL 3 timeframes
-    python backtest.py merge         # merges all shards, writes final report
+  'baseline'  = original 15m-only logic (EMA50 slope + EMA9/21 cross + ADX>=22)
+  'confirmed' = same 15m logic, but ALSO requires 4H EMA50 slope to agree
+                in direction before the entry is allowed
+
+Same TP 3% / SL 15% / ADX>=22 / 5x leverage / 96-coin universe / 2yr for both,
+so the comparison isolates the effect of the trend-confirmation gate only.
+
+No lookahead: at 15m bar i, the 4H trend used is the LAST 4H candle that had
+fully closed before that 15m bar's timestamp — never a 4H candle still forming.
 
 stdlib only.
 """
-import json, time, sys, math, urllib.request, zipfile, io, csv
+import json, time, sys, urllib.request, zipfile, io, csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from bisect import bisect_right
 
 # ── Config ───────────────────────────────────────────────────
-START_YM   = (2024, 8)     # 2 years back from ~Aug 2026
+START_YM   = (2024, 8)
 END_YM     = (2026, 7)
-TIMEFRAMES = ['15m', '1h', '4h']
+ENTRY_TF   = '15m'
+CONFIRM_TF = '4h'
+VARIANTS   = ['baseline', 'confirmed']
 
 CAPITAL    = 1000.0
-RISK_PCT   = 0.02          # 2% risk per trade
-FEE        = 0.0004        # 0.04% taker
-SLIP       = 0.0005        # 0.05% slippage
+RISK_PCT   = 0.02
+FEE        = 0.0004
+SLIP       = 0.0005
 LEVERAGE   = 5
 
 TP_PCT     = 0.030
 SL_PCT     = 0.150
-MIN_BARS   = 100           # warmup needed before signals are valid
+MIN_BARS   = 100
 
-# Effectively "no cap" — safety ceiling only, ~90 days per timeframe
-MAX_BARS = {
-    '15m': 90 * 24 * 4,    # 8640 bars
-    '1h':  90 * 24,        # 2160 bars
-    '4h':  90 * 6,         # 540 bars
-}
+MAX_BARS_15M = 90 * 24 * 4   # ~90 days safety ceiling, same as before
 
 NUM_SHARDS = 8
 WORKERS    = 16
@@ -90,8 +92,6 @@ def fetch_month(symbol, year, month, timeframe):
                     if not row or row[0] in ('open_time',):
                         continue
                     ts = int(float(row[0]))
-                    # Normalize to milliseconds. Binance archives are ms, but
-                    # some symbol/date ranges use microseconds (16 digits).
                     if ts > 10**14:
                         ts = ts // 1000
                     o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
@@ -110,8 +110,7 @@ def fetch_symbol(symbol, timeframe):
     dedup = {}
     for c in all_candles:
         dedup[c[0]] = c
-    rows = sorted(dedup.values(), key=lambda x: x[0])
-    return rows
+    return sorted(dedup.values(), key=lambda x: x[0])
 
 # ── Indicators (mirrors production GMaxV1.py exactly) ─────────
 def ema(values, period):
@@ -146,103 +145,158 @@ def adx_calc(highs, lows, closes, period=14):
         adx = (adx*(period-1) + d) / period
     return max(0.0, min(100.0, adx))
 
-# ── Signal (identical logic to check_signal_G, timeframe-agnostic) ─
-def signal(i, closes, highs, lows, e9, e21, e50):
-    if i < 10 or i >= len(closes):
+# ── 4H trend lookup (no lookahead) ──────────────────────────
+def build_4h_trend_lookup(candles_4h):
+    """
+    Returns (close_ts_list, trend_list) where trend_list[k] is the trend
+    direction ('up'/'down'/None) known as of the CLOSE of 4H candle k.
+    close_ts_list[k] = open_ts of candle k + 4h (i.e. when it closed / became final).
+    """
+    if len(candles_4h) < 60:
+        return [], []
+    closes = [c[4] for c in candles_4h]
+    e50 = ema(closes, 50)
+    close_ts = []
+    trend = []
+    four_h_ms = 4 * 60 * 60 * 1000
+    for k in range(len(candles_4h)):
+        close_ts.append(candles_4h[k][0] + four_h_ms)
+        if k < 10:
+            trend.append(None)
+            continue
+        slope_pct = (e50[k] - e50[k-10]) / e50[k-10] * 100
+        if slope_pct > 0.05:
+            trend.append('up')
+        elif slope_pct < -0.05:
+            trend.append('down')
+        else:
+            trend.append(None)
+    return close_ts, trend
+
+def confirm_trend_at(ts_ms, close_ts_list, trend_list):
+    """
+    Given a 15m bar's timestamp, find the most recent 4H candle that had
+    FULLY CLOSED strictly before this timestamp, and return its trend.
+    bisect_right on close_ts gives the index of the first candle closing
+    AFTER ts_ms; the confirmed candle is the one just before that.
+    """
+    if not close_ts_list:
         return None
+    idx = bisect_right(close_ts_list, ts_ms) - 1
+    if idx < 0:
+        return None
+    return trend_list[idx]
+
+# ── Signal (identical to production check_signal_G) ──────────
+def raw_signal(i, closes, highs, lows, e9, e21, e50):
+    """Returns (side, slope_dir) or (None, None). slope_dir used for the gate."""
+    if i < 10 or i >= len(closes):
+        return None, None
     slope_pct = (e50[i] - e50[i-10]) / e50[i-10] * 100
     trend_up = slope_pct > 0.05
     trend_down = slope_pct < -0.05
     if not trend_up and not trend_down:
-        return None
+        return None, None
     crossed_up = e9[i] > e21[i] and e9[i-1] <= e21[i-1]
     crossed_down = e9[i] < e21[i] and e9[i-1] >= e21[i-1]
     if trend_up and not crossed_up:
-        return None
+        return None, None
     if trend_down and not crossed_down:
-        return None
+        return None, None
     adx_val = adx_calc(highs[:i+1], lows[:i+1], closes[:i+1], 14)
     if adx_val < 22:
-        return None
-    return 'buy' if crossed_up else 'sell'
+        return None, None
+    if crossed_up:
+        return 'buy', 'up'
+    return 'sell', 'down'
 
-# ── Backtest single symbol ──────────────────────────────────
-def backtest(symbol, candles, timeframe):
-    if len(candles) < MIN_BARS:
-        return []
-    closes = [c[4] for c in candles]
-    highs  = [c[2] for c in candles]
-    lows   = [c[3] for c in candles]
-    opens  = [c[1] for c in candles]
-    ts_arr = [c[0] for c in candles]
+# ── Backtest single symbol, both variants ────────────────────
+def backtest_symbol(symbol, candles_15m, candles_4h):
+    if len(candles_15m) < MIN_BARS:
+        return {'baseline': [], 'confirmed': []}
+
+    closes = [c[4] for c in candles_15m]
+    highs  = [c[2] for c in candles_15m]
+    lows   = [c[3] for c in candles_15m]
+    opens  = [c[1] for c in candles_15m]
+    ts_arr = [c[0] for c in candles_15m]
 
     e9  = ema(closes, 9)
     e21 = ema(closes, 21)
     e50 = ema(closes, 50)
 
-    trades = []
-    in_pos = False
-    side = None; entry_p = 0.0; entry_i = 0; entry_ts = 0
-    max_bars = MAX_BARS[timeframe]
+    close_ts_4h, trend_4h = build_4h_trend_lookup(candles_4h)
+    have_4h = len(close_ts_4h) > 0
 
-    i = MIN_BARS
-    n = len(candles)
-    while i < n - 1:
-        if not in_pos:
-            sig = signal(i, closes, highs, lows, e9, e21, e50)
-            if sig:
-                side = sig
-                entry_i = i + 1
-                if entry_i >= n:
-                    break
-                entry_p = opens[entry_i] * (1 + FEE + SLIP) if side == 'buy' \
-                          else opens[entry_i] * (1 - FEE - SLIP)
-                entry_ts = ts_arr[entry_i]
-                in_pos = True
-                i = entry_i
-                continue
-        else:
-            bars_held = i - entry_i
-            hi, lo, cl = highs[i], lows[i], closes[i]
-            exit_p = None; reason = None
-            if side == 'buy':
-                sl_price = entry_p * (1 - SL_PCT)
-                tp_price = entry_p * (1 + TP_PCT)
-                if lo <= sl_price:
-                    exit_p, reason = sl_price, 'sl'
-                elif hi >= tp_price:
-                    exit_p, reason = tp_price, 'tp'
+    out = {}
+    for variant in VARIANTS:
+        if variant == 'confirmed' and not have_4h:
+            out[variant] = []
+            continue
+
+        trades = []
+        in_pos = False
+        side = None; entry_p = 0.0; entry_i = 0; entry_ts = 0
+        n = len(candles_15m)
+        i = MIN_BARS
+        while i < n - 1:
+            if not in_pos:
+                sig, slope_dir = raw_signal(i, closes, highs, lows, e9, e21, e50)
+                if sig:
+                    if variant == 'confirmed':
+                        htf_trend = confirm_trend_at(ts_arr[i], close_ts_4h, trend_4h)
+                        if htf_trend != slope_dir:
+                            i += 1
+                            continue
+                    side = sig
+                    entry_i = i + 1
+                    if entry_i >= n:
+                        break
+                    entry_p = opens[entry_i] * (1 + FEE + SLIP) if side == 'buy' \
+                              else opens[entry_i] * (1 - FEE - SLIP)
+                    entry_ts = ts_arr[entry_i]
+                    in_pos = True
+                    i = entry_i
+                    continue
             else:
-                sl_price = entry_p * (1 + SL_PCT)
-                tp_price = entry_p * (1 - TP_PCT)
-                if hi >= sl_price:
-                    exit_p, reason = sl_price, 'sl'
-                elif lo <= tp_price:
-                    exit_p, reason = tp_price, 'tp'
-
-            if exit_p is None and bars_held >= max_bars:
-                exit_p, reason = cl, 'max_hold'
-            if exit_p is None and i == n - 2:
-                exit_p, reason = cl, 'end_of_data'
-
-            if exit_p is not None:
+                bars_held = i - entry_i
+                hi, lo, cl = highs[i], lows[i], closes[i]
+                exit_p = None; reason = None
                 if side == 'buy':
-                    gross = (exit_p - entry_p) / entry_p
+                    sl_price = entry_p * (1 - SL_PCT)
+                    tp_price = entry_p * (1 + TP_PCT)
+                    if lo <= sl_price:
+                        exit_p, reason = sl_price, 'sl'
+                    elif hi >= tp_price:
+                        exit_p, reason = tp_price, 'tp'
                 else:
-                    gross = (entry_p - exit_p) / entry_p
-                net = gross - (FEE + SLIP) * 2
-                notional = min(CAPITAL * RISK_PCT / SL_PCT, CAPITAL * LEVERAGE)
-                pnl = notional * net
-                trades.append({
-                    'symbol': symbol, 'side': side,
-                    'entry_ts': entry_ts, 'exit_ts': ts_arr[i],
-                    'entry_price': entry_p, 'exit_price': exit_p,
-                    'pnl': round(pnl, 4), 'reason': reason,
-                    'bars': bars_held,
-                })
-                in_pos = False
-        i += 1
-    return trades
+                    sl_price = entry_p * (1 + SL_PCT)
+                    tp_price = entry_p * (1 - TP_PCT)
+                    if hi >= sl_price:
+                        exit_p, reason = sl_price, 'sl'
+                    elif lo <= tp_price:
+                        exit_p, reason = tp_price, 'tp'
+
+                if exit_p is None and bars_held >= MAX_BARS_15M:
+                    exit_p, reason = cl, 'max_hold'
+                if exit_p is None and i == n - 2:
+                    exit_p, reason = cl, 'end_of_data'
+
+                if exit_p is not None:
+                    gross = (exit_p - entry_p)/entry_p if side == 'buy' else (entry_p - exit_p)/entry_p
+                    net = gross - (FEE + SLIP) * 2
+                    notional = min(CAPITAL * RISK_PCT / SL_PCT, CAPITAL * LEVERAGE)
+                    pnl = notional * net
+                    trades.append({
+                        'symbol': symbol, 'side': side,
+                        'entry_ts': entry_ts, 'exit_ts': ts_arr[i],
+                        'entry_price': entry_p, 'exit_price': exit_p,
+                        'pnl': round(pnl, 4), 'reason': reason, 'bars': bars_held,
+                    })
+                    in_pos = False
+            i += 1
+        out[variant] = trades
+    return out
 
 # ── Stats ────────────────────────────────────────────────────
 def stats(trades):
@@ -296,43 +350,49 @@ def stats(trades):
 # ── Shard runner ─────────────────────────────────────────────
 def run_shard(shard_idx):
     symbols = ALL_SYMBOLS[shard_idx::NUM_SHARDS]
-    result = {'shard': shard_idx, 'symbols': symbols, 'timeframes': {}}
+    result = {'shard': shard_idx, 'symbols': symbols, 'variants': {}}
+    trades_by_variant = {v: [] for v in VARIANTS}
+    with_data = []
 
-    for tf in TIMEFRAMES:
-        t0 = time.time()
-        with_data = []
-        all_trades = []
+    t0 = time.time()
 
-        def work(sym):
-            candles = fetch_symbol(sym, tf)
-            if len(candles) >= MIN_BARS:
-                trades = backtest(sym, candles, tf)
-                return sym, len(candles), trades
-            return sym, len(candles), []
+    def work(sym):
+        c15 = fetch_symbol(sym, ENTRY_TF)
+        c4h = fetch_symbol(sym, CONFIRM_TF)
+        if len(c15) >= MIN_BARS:
+            res = backtest_symbol(sym, c15, c4h)
+            return sym, True, res
+        return sym, False, {'baseline': [], 'confirmed': []}
 
-        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = [ex.submit(work, s) for s in symbols]
-            for fut in as_completed(futs):
-                sym, n_candles, trades = fut.result()
-                if n_candles >= MIN_BARS:
-                    with_data.append(sym)
-                all_trades.extend(trades)
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = [ex.submit(work, s) for s in symbols]
+        for fut in as_completed(futs):
+            sym, has_data, res = fut.result()
+            if has_data:
+                with_data.append(sym)
+            for v in VARIANTS:
+                trades_by_variant[v].extend(res[v])
 
-        result['timeframes'][tf] = {
-            'with_data': with_data,
-            'trades': all_trades,
-            'stats': stats(all_trades),
-            'elapsed': round(time.time() - t0, 1),
+    for v in VARIANTS:
+        result['variants'][v] = {
+            'trades': trades_by_variant[v],
+            'stats': stats(trades_by_variant[v]),
         }
-        print(f"shard {shard_idx} [{tf}]: {len(with_data)}/{len(symbols)} coins, "
-              f"{len(all_trades)} trades, {result['timeframes'][tf]['elapsed']}s")
+    result['with_data'] = with_data
+    result['elapsed'] = round(time.time() - t0, 1)
+
+    print(f"shard {shard_idx}: {len(with_data)}/{len(symbols)} coins, "
+          f"baseline={len(trades_by_variant['baseline'])} trades, "
+          f"confirmed={len(trades_by_variant['confirmed'])} trades, "
+          f"{result['elapsed']}s")
 
     with open(f'shard_{shard_idx}.json', 'w') as f:
         json.dump(result, f)
 
 # ── Merge ────────────────────────────────────────────────────
 def merge_shards():
-    merged = {tf: {'with_data': [], 'trades': []} for tf in TIMEFRAMES}
+    merged = {v: [] for v in VARIANTS}
+    with_data_all = []
     total_symbols_attempted = 0
 
     for i in range(NUM_SHARDS):
@@ -343,18 +403,16 @@ def merge_shards():
             print(f"WARNING: shard_{i}.json missing")
             continue
         total_symbols_attempted += len(d['symbols'])
-        for tf in TIMEFRAMES:
-            td = d['timeframes'][tf]
-            merged[tf]['with_data'].extend(td['with_data'])
-            merged[tf]['trades'].extend(td['trades'])
+        with_data_all.extend(d['with_data'])
+        for v in VARIANTS:
+            merged[v].extend(d['variants'][v]['trades'])
 
     report = {}
-    for tf in TIMEFRAMES:
-        s = stats(merged[tf]['trades'])
-        report[tf] = {
-            'with_data_count': len(merged[tf]['with_data']),
+    for v in VARIANTS:
+        report[v] = {
+            'with_data_count': len(with_data_all),
             'symbols_attempted': total_symbols_attempted,
-            'stats': s,
+            'stats': stats(merged[v]),
         }
 
     with open('backtest_report.json', 'w') as f:
@@ -362,20 +420,21 @@ def merge_shards():
 
     lines = []
     lines.append("=" * 70)
-    lines.append("G MAX — MULTI-TIMEFRAME BACKTEST SUMMARY")
+    lines.append("G MAX — 4H TREND CONFIRMATION GATE BACKTEST")
     lines.append(f"Period: {START_YM[0]}-{START_YM[1]:02d} to {END_YM[0]}-{END_YM[1]:02d}")
+    lines.append(f"Entry TF: {ENTRY_TF} | Confirm TF: {CONFIRM_TF}")
     lines.append(f"Leverage: {LEVERAGE}x | TP: {TP_PCT*100:.1f}% | SL: {SL_PCT*100:.1f}%")
     lines.append(f"Coins attempted: {total_symbols_attempted}")
     lines.append("=" * 70)
 
-    if all(report[tf]['with_data_count'] == 0 for tf in TIMEFRAMES):
-        lines.append("\n❌ ERROR: 0 symbols returned data across all timeframes.")
-        lines.append("Likely a geo-block on data.binance.vision from the runner region.")
-        lines.append("Backtest aborted — no results to report.")
+    if all(report[v]['with_data_count'] == 0 for v in VARIANTS):
+        lines.append("\n❌ ERROR: 0 symbols returned data. Likely geo-block on runner.")
     else:
-        for tf in TIMEFRAMES:
-            r = report[tf]; s = r['stats']
-            lines.append(f"\n── {tf.upper()} ──────────────────────────────")
+        for v in VARIANTS:
+            r = report[v]; s = r['stats']
+            label = 'BASELINE (15m only, no HTF gate)' if v == 'baseline' \
+                    else 'CONFIRMED (15m entries gated by 4H trend agreement)'
+            lines.append(f"\n── {label} ──────────────────────────────")
             lines.append(f"Coins with data: {r['with_data_count']}/{r['symbols_attempted']}")
             lines.append(f"Total trades:    {s['total']}")
             lines.append(f"Win rate:        {s['win_rate']}%")
@@ -389,23 +448,28 @@ def merge_shards():
             lines.append(f"RECOMMENDATION:  {'✅ USABLE' if usable else '❌ NOT USABLE'} "
                          f"(needs PF>=1.5 and WR>=42%)")
 
-            lines.append(f"\nTop 50 coins by net PnL ({tf}):")
+            lines.append(f"\nTop 50 coins by net PnL ({v}):")
             ranked = sorted(s['per_coin'].items(), key=lambda x: x[1]['pnl'], reverse=True)[:50]
             for sym, d in ranked:
                 lines.append(f"  {sym:<20} trades={d['n']:<4} wr={d['wr']:>6}%  pnl=${d['pnl']}")
 
-            lines.append(f"\nMonthly PnL ({tf}):")
+            lines.append(f"\nMonthly PnL ({v}):")
             for ym in sorted(s['monthly'].keys()):
                 m = s['monthly'][ym]
                 lines.append(f"  {ym}: pnl=${round(m['pnl'],2):<10} n={m['n']:<4} w={m['w']}")
 
         lines.append("\n" + "=" * 70)
-        lines.append("VERDICT — which timeframe to trade:")
-        best = max(TIMEFRAMES, key=lambda tf: report[tf]['stats']['profit_factor']
-                   if report[tf]['stats']['total'] >= 30 else -1)
-        lines.append(f"Highest profit factor with sufficient sample (30+ trades): {best.upper()}")
-        lines.append("Review win rate, drawdown, and trade count together before deciding —")
-        lines.append("a timeframe with very few trades can show an inflated PF by chance.")
+        lines.append("VERDICT:")
+        b = report['baseline']['stats']; c = report['confirmed']['stats']
+        lines.append(f"Baseline:  {b['total']} trades, PF {b['profit_factor']}, net ${b['net_pnl']}")
+        lines.append(f"Confirmed: {c['total']} trades, PF {c['profit_factor']}, net ${c['net_pnl']}")
+        if c['total'] < 30:
+            lines.append("NOTE: confirmed variant has under 30 trades — treat its PF with caution,")
+            lines.append("small sample sizes can swing PF a lot by chance.")
+        if c['profit_factor'] > b['profit_factor']:
+            lines.append("The 4H trend gate IMPROVED profit factor — filters out counter-trend entries.")
+        else:
+            lines.append("The 4H trend gate did NOT improve profit factor vs baseline in this window.")
 
     with open('backtest_summary.txt', 'w') as f:
         f.write('\n'.join(lines))
