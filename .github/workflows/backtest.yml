@@ -1,4 +1,4 @@
-name: G Max VAR_D Volume Filter Backtest
+name: G Max Multi-Timeframe Backtest
 
 on:
   workflow_dispatch:
